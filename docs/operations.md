@@ -68,6 +68,45 @@ credentials.
    rates: repeated 403s with a valid token indicate a caller probing another
    tenant or an endpoint outside its role.
 
+## Gateway service adapter and attester keys
+
+`praetore-gateway-demo` starts only with an adapter named in
+`PRAETORE_GATEWAY_ADAPTER`: `sandbox`, `http` or `local-demo`. There is no
+default; without the variable (or with an empty value) the service exits
+before it connects to PostgreSQL. `local-demo` is valid only when it is set
+explicitly.
+
+The evidence attester and the execution attester keys are read at startup
+from two files:
+
+- `PRAETORE_GATEWAY_EVIDENCE_ATTESTER_KEY_FILE`
+- `PRAETORE_GATEWAY_EXECUTION_ATTESTER_KEY_FILE`
+
+Each file holds a 32-byte Ed25519 secret as 64 lowercase hexadecimal
+characters, optionally followed by one newline. The file is opened without
+following a symlink and must be a regular file owned by the service user,
+with no group or other permission bits (`0600` or `0400`), and at most 128
+bytes. The two files must hold different keys; the service refuses to start
+if they are equal. `PRAETORE_GATEWAY_EVIDENCE_ATTESTER_KEY_HEX` and
+`PRAETORE_GATEWAY_EXECUTION_ATTESTER_KEY_HEX` are no longer read: if either
+is set, the service refuses to start and names the variable to remove.
+Legacy baseline adoption (`praetore-gateway-demo migrate` with
+`PRAETORE_ADOPT_LEGACY_BASELINE`) reads the evidence key from the same file
+variable.
+
+Execution receipts carry the key id `execution-attester-<public key hex>`.
+The compliance package of `praetore-console` and `praetore-verify outcomes`
+take this key as a JSON pin `{"schema_version":1,"key_id":"execution-attester-<public key hex>","public_key_hex":"<public key hex>"}`:
+record the public key when the key is generated and write the pin from it.
+The key id in each signed attestation names the public key it claims, so a
+pin taken from there shows consistency with that key, not that it is this
+gateway's. For `praetore run`, `praetore init` writes `execution-pin.json`
+(key id `local-demo-<public key hex>`); `praetore execution-pin <directory>`
+writes it for a directory initialized before.
+Generate each key with a CSPRNG, for example
+`umask 077 && openssl rand -hex 32 > evidence-attester.key`, and deliver the
+files through the secret manager of the gateway workload.
+
 ## Approver keys
 
 Human-approval public keys are bound to tenants with
@@ -139,6 +178,31 @@ With the `http` and `sandbox` adapters the gateway requires
    [`runtime-security-scaffold.md`](runtime-security-scaffold.md).
 5. In tests and incident replay, use a fixed clock and preserve the exact
    timestamp supplied to evaluation.
+
+## Execution attestation failure after dispatch
+
+The gateway signs the execution attestation after the adapter returns. If
+signing fails at that point (for example the trusted clock is unavailable or
+the execution attester cannot sign), the effect may already have been applied
+but no outcome is recorded:
+
+- the journal row stays `dispatched`, with no output and no terminal
+  attestation, and the adapter's output is not kept;
+- the HTTP API answers `503` with `authorization_unavailable` (trusted clock)
+  or `execution_state_unavailable` (signer), and no receipt;
+- the request is not dispatched again: the dispatch claim is consumed, and
+  the same signed request cannot be submitted again (its request ID is
+  already consumed).
+
+This is fail-closed: nothing is retried and no receipt claims an outcome. To
+close the row, restore the clock or the signer, fence every worker that could
+still dispatch the execution, and run `Gateway::reconcile` for its execution
+key. Reconcile asks the adapter's read-only reconciliation: `Applied` is
+recorded as `confirmed` with its output, `NotApplied` as `failed`
+(`effect_failed`), and `Unknown` as `outcome_unknown`. Reconcile signs too, so
+it fails the same way while the clock or the signer is unavailable. Alert on
+rows that stay `dispatched`, and treat their effect as unknown until reconcile
+records one.
 
 ## Production profile checks
 
@@ -292,7 +356,12 @@ observation time, which `claim_dispatch` passes in the transaction-local
 setting `praetore.dispatch_observed_at`. The database clock is deliberately
 not used: the gateway's injected, trusted clock decides expiry (and is signed
 into expiration receipts), and the database clock may be skewed relative to
-it. A dispatch without the setting is refused.
+it. A dispatch without the setting is refused. The 0012 trigger runs only on
+UPDATE: when its comment says it protects against "code paths that skip the
+check", that covers the `approved_pending_dispatch -> dispatched` update.
+Rows inserted directly in a later state are refused by the BEFORE INSERT
+triggers of `0021_journal_insert_rules`. The 0012 file is kept
+byte-identical because its checksum is recorded in existing databases.
 
 Migrations are forward-only, including `0013_dispatch_refused` and
 `0014_closed_execution_row_lock`. There is no down migration; rolling one
@@ -990,6 +1059,131 @@ export of a database whose adoption record it signed then fails, because
 `journal-export --tenant` verifies that record before it references the
 database head (`docs/proposals/journal-chain-jsonl.md`).
 
+### Tenant journal in ranges
+
+A whole tenant chain export holds at most 4096 entries and 8 MiB; with
+receipts of about 2.6 KB the size bound comes first, at roughly 3,100
+receipts, and `praetore journal-export --tenant` then fails and names
+ranges. Export a longer chain in ranges, as for safety chains:
+`--from-seq 0 --limit N` writes the first range (`--limit` defaults to and
+is at most 4096; a range also ends before 8 MiB) and prints
+`next_from_seq`, which is `null` after the last range. Each later range
+(`--from-seq <next_from_seq>`) starts with its anchor: the full line of the
+receipt at `seq` N - 1, in the order of the whole export (`chain_seq`,
+below), whose link is the head of the previous range.
+The exporter reads the receipts before the range, in one read-only
+snapshot, to compute that link. Verify each later range with `--range
+--expected-anchor <head of the previous range>`; the anchor's signature is
+checked and it is not counted. `--from-seq` counts receipts only. In a
+database without storage records, the last range's head equals the head of
+the tenant's whole-chain export. In a database with storage records, the
+whole-chain export opens with a `database_head` line at `seq` 0 and ranges
+do not, so the same receipt has `seq` N + 1 there and N in a range: the
+head of a range and the head of the whole-chain export are then not
+interchangeable. Anchor the last range's head, outside the operator's
+control, as the head of the ranges, and compare it only with heads of
+ranges.
+
+Limits of ranges:
+
+- A range chains receipts only, from `seq` 0 for the first receipt, and has
+  no database reference: when the database has storage records, the ranges
+  of a tenant are not linked like its whole-chain export, and the database
+  chain is exported and verified on its own (`--database`).
+- Each range is verified alone: an `evidence_id` repeated from an earlier
+  range is not detected. Only a whole-chain verification sees every receipt.
+- Rows that were out of commit order before migration 0024 keep that
+  order (see below): a head anchored over a prefix that such a row later
+  changed cannot be reproduced; after a mismatch, export again from
+  `--from-seq 0`.
+
+```sh
+praetore journal-export --tenant <uuid> --attester-pin attester-public-key.hex \
+  --from-seq 0 --limit 3000 --output part-0.jsonl
+praetore journal-export --tenant <uuid> --attester-pin attester-public-key.hex \
+  --from-seq <next_from_seq> --limit 3000 --output part-1.jsonl
+praetore-verify journal --journal part-0.jsonl --attester-pin attester-public-key.hex \
+  --expected-head <head of part-0> --format json
+praetore-verify journal --journal part-1.jsonl --attester-pin attester-public-key.hex \
+  --range --expected-anchor <head of part-0> --format json
+```
+
+Storage: about 3.7 KB per action in the database for receipts of about
+2.6 KB, before migration 0024. One run of the ignored test
+`postgres_cli_journal_export_tenant_ranges_of_10000_receipts` (PostgreSQL
+16, 10,000 test receipts of 2,581 bytes of evidence JSON on average, padded
+with random hex) grew `pg_total_relation_size` by 37,322,752 bytes: for
+example 32,464,896 for `praetore.execution_journal`, 3,104,768 for
+`praetore.execution_journal_events` and 1,753,088 for
+`praetore.replay_claims`. The figures depend on the receipts and on
+PostgreSQL's compression of them. In the same run the default `--limit`
+ranges held 3,131 and 3,129 receipts, ended by the 8 MiB bound. With
+migration 0024 one run of the same test grew it by 38,535,168 bytes:
+33,021,952 for `praetore.execution_journal` (with `chain_seq` and its
+unique index), and 557,056 for `praetore.journal_positions`, which holds
+one row per tenant; that size is the dead row versions of 10,000 updates
+made in one transaction, which VACUUM makes reusable.
+
+### Order of a tenant chain (migration 0024)
+
+The chain of a tenant follows the order in which its journal rows commit.
+Every row takes its tenant's next position, `execution_journal.chain_seq`,
+in the transaction that writes it: a trigger takes the position from
+`praetore.journal_positions` and holds that row lock until the transaction
+commits, so the writers of one tenant are serialized and a snapshot that
+sees a position sees every earlier one. A transaction that rolls back
+returns its position, so there is no gap. The `seq` of a receipt in a
+tenant chain or range is its `chain_seq`.
+
+Until 0024 the order came from `created_at`, which `clock_timestamp()` sets
+when the row is inserted while the row becomes visible only when its
+transaction commits. A transaction that inserted before another and
+committed after it, or a step back of the database clock, placed a row in
+front of rows already exported: every later `seq` moved, the next range's
+anchor no longer matched `--expected-anchor`, and a head anchored over that
+prefix could no longer be reproduced. For rows written after the migration
+this is resolved, and exporting only settled history is no longer needed.
+
+- Rows written before 0024 were numbered in the order exports used until
+  then (`created_at`, `request_id`, `agent_id`): every whole-chain export
+  and every range of an existing journal is the same, byte for byte, as
+  before the migration, and a head anchored before it is still reproduced.
+  Rows that were already out of commit order before the migration keep
+  that order; they cannot be reordered without changing heads that may
+  already be anchored.
+- `chain_seq` is immutable: the runtime role cannot update it, a value that
+  an INSERT sends is replaced by the trigger, and an UPDATE by the schema
+  owner fails. An export fails, naming the expected and the found
+  position, when the positions of a tenant do not run from 0 without a gap:
+  a row deleted from the middle of the chain, or a position written by
+  hand that jumps. The check sees only gaps and jumps. Deleting the newest
+  rows of a tenant, or all of them, leaves the remaining positions
+  contiguous and is not detected, and neither is a consistent renumbering
+  by whoever can write to the database.
+- This does not make the journal tamper-proof: whoever can write to the
+  database (the schema owner, a superuser) can still rewrite rows and
+  positions consistently. Only a head anchored outside the operator's
+  control shows such a change, or the loss of the newest rows.
+- Writers of one tenant wait for each other from the journal INSERT to the
+  COMMIT; writers of different tenants do not. The journal INSERT is the
+  last statement before that COMMIT.
+- The gateway writes the journal row in a READ COMMITTED transaction,
+  whatever `default_transaction_isolation` the database sets: under
+  REPEATABLE READ or SERIALIZABLE, a writer that waited for another writer
+  of its tenant would fail with a serialization error when the other
+  commits.
+- Applying 0024 holds ACCESS EXCLUSIVE on `praetore.execution_journal`
+  until the migration commits: every reader and writer of the journal
+  waits, and the time grows with the number of rows. Apply it with every
+  gateway stopped, or in a maintenance window. In one run on an Apple M1
+  (8 GB, PostgreSQL 16.15), the migration's SQL took 409 ms on 10,000 rows
+  of 10 tenants, and the whole runner, with its schema checks, 548 ms;
+  that is one measurement, not a capacity figure.
+- Manual rollback: `docs/rollback/0024-journal-commit-order-position.sql`.
+  It also takes ACCESS EXCLUSIVE on the journal (with a `lock_timeout` of
+  5 s), so run it with every gateway stopped too. It drops the column and
+  the table, so exports order rows by `created_at` again.
+
 Planned, when evidence sets 04 and 05 are re-recorded with HighAssurance
 receipts (required before 2027-01-29, when their authorities and issuer pins
 expire): `--require-decision-time` becomes the default, with an explicit
@@ -1041,6 +1235,34 @@ the receipt of a held approval: `requires_approval`,
 any other v5 shape fails with `RECEIPT_INVALID`. Verifiers up to 0.3.3
 reject v5 and `approved_claim_expired` with `RECEIPT_INVALID`. Like
 `evidence`, this is historical verification only (`current_authorization=false`).
+
+`praetore-verify outcomes --outcomes approvals.jsonl --journal journal.jsonl
+--attester-pin attester.hex --execution-pin execution-pin.json --approver-pin
+approver-pin.json --format json` verifies many records at once: a tenant's
+human decisions, approval-expiration receipts and execution receipts (one
+signed record per line, the `approvals.jsonl` of the console's compliance
+package), against the tenant's journal chain, which it verifies first like
+`journal`. Execution and approver pins are JSON documents
+`{"schema_version":1,"key_id":...,"public_key_hex":...}` (the format of
+`approver-pin.json` from `praetore init`), repeatable up to 16 each. Each
+decision must carry the challenge derived from its journal receipt and verify
+against the approver pin its `approver_key_id` names; each expiration and
+execution receipt must verify against the execution pin its key id names; the
+evidence inside an execution receipt must be the journal's receipt for that
+request; the records of one request must agree (a dispatched held request was
+approved, `approval_rejected` has a reject decision). The command reports
+`counts`, `held` (every held request of the journal with its `outcome`) and
+`held_by_outcome`. The records are not chained: a removed record leaves no
+trace, so the output does not show that the file is complete; an approved
+or executed request can show as `pending`, `approved_pending_dispatch` or
+`not_dispatched`. The order of the lines is not verified: the outcomes do
+not depend on it. A pin that verified no record does not fail the command:
+it is reported in `unused_execution_pins` or `unused_approver_pins`. The
+file may hold at most 32 MiB and 20,480 lines (`OUTCOMES_TOO_LARGE`). Pin only the
+journal tenant's approvers: the gateway ties each approver to a tenant, the
+pin format does not. An execution receipt written before migration 0023,
+whose output digest the database did not check, fails if it does not match
+its output. Historical verification only (`current_authorization=false`).
 
 A receipt that verifies is not always final: a later receipt for the same
 request can record another state. The verifier reports `details.final` and
@@ -1118,6 +1340,17 @@ The signature proves that `SHA256SUMS` was produced by this repository's
 (`--certificate-github-workflow-sha`); it does not prove who pushed the tag
 (check the signed tag with `git verify-tag`). The macOS binaries are not
 signed or notarized.
+
+The published v0.3.6 release was built from commit
+`27ceddbbd295162ca351ea5dfa47fe8bb37315a3`. Pass that literal value as
+`--certificate-github-workflow-sha` when you do not have a clone.
+`git rev-parse` needs one. Installing from that release, as described in
+the repository README and in
+[Install from the v0.3.6 release](install-prebuilt.md), treats this
+`cosign` check as optional. Those pages require the SHA256 digest. The
+signature check still needs `cosign` installed. When it succeeds, it proves
+the same thing as the command above for tag `v0.3.6` at that commit. It
+does not prove who pushed the tag.
 
 CI runs the same check with `scripts/verify-release-signature.sh`, with
 retries. On a tag it checks the release it just published, and any failure fails

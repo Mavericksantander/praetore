@@ -33,15 +33,24 @@ mod policy_classify;
 mod policy_safety_manifest;
 mod safety_export;
 mod secret_file;
+#[cfg(test)]
+mod sibling_binary;
 
 const POLICY_FILE: &str = "policy.json";
 const ISSUER_PIN_FILE: &str = "issuer-pin.json";
 const ISSUER_KEY_FILE: &str = "issuer.key";
 const EVIDENCE_KEY_FILE: &str = "evidence-attester.key";
+/// The evidence attester's public key: 64 lowercase hex characters, the
+/// `--attester-pin` format of `praetore journal-export`. No secret.
+const ATTESTER_PIN_FILE: &str = "attester-public-key.hex";
 const EXECUTION_KEY_FILE: &str = "execution-attester.key";
 const CONFIG_FILE: &str = "config.json";
 const APPROVER_KEY_FILE: &str = "approver.key";
 const APPROVER_PIN_FILE: &str = "approver-pin.json";
+/// Public pin of the execution key, in the format of [`APPROVER_PIN_FILE`]:
+/// the compliance package (`PRAETORE_CONSOLE_EXECUTION_PIN_FILES`) and
+/// `praetore-verify outcomes --execution-pin` read it.
+const EXECUTION_PIN_FILE: &str = "execution-pin.json";
 const LOCAL_APPROVER_ID: &str = "local-approver";
 /// Bearer token the demo agent (`praetore demo`) presents to the gateway.
 const AGENT_TOKEN_FILE: &str = "agent-api.token";
@@ -136,6 +145,15 @@ struct LocalExecutionSigner {
 }
 
 impl LocalExecutionSigner {
+    /// The public pin of this key: its key id and public key, no secret.
+    fn pin(&self) -> ApproverPin {
+        ApproverPin {
+            schema_version: 1,
+            key_id: self.key_id.clone(),
+            public_key_hex: hex::encode(self.signing_key.verifying_key().to_bytes()),
+        }
+    }
+
     fn from_secret(secret: &[u8; 32]) -> Self {
         let signing_key = SigningKey::from_bytes(secret);
         let key_id = format!(
@@ -209,6 +227,16 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             let directory = required_argument(&mut args, "directory")?;
             ensure_no_arguments(args)?;
             doctor(Path::new(&directory))
+        }
+        "attester-pin" => {
+            let directory = required_argument(&mut args, "directory")?;
+            ensure_no_arguments(args)?;
+            export_attester_pin(Path::new(&directory))
+        }
+        "execution-pin" => {
+            let directory = required_argument(&mut args, "directory")?;
+            ensure_no_arguments(args)?;
+            export_execution_pin(Path::new(&directory))
         }
         "run" => {
             let directory = required_argument(&mut args, "directory")?;
@@ -362,6 +390,8 @@ fn print_usage() {
            praetore init <directory> [--port <port>] [--sandbox-root <absolute dir> | --dev-cooperative-exec]\n\
              (--dev-cooperative-exec: development only, no guarantee; the agent may run effects itself)\n\
            praetore doctor <directory>\n\
+           praetore execution-pin <directory>   (writes execution-pin.json if init did not; never overwrites)\n\
+           praetore attester-pin <directory>    (writes attester-public-key.hex if init did not; never overwrites)\n\
            praetore run <directory> [--adopt-legacy-baseline]\n\
            praetore demo <directory> set <key> <value>\n\
            praetore demo <directory> write <path> <content>   (needs sandbox_root)\n\
@@ -370,6 +400,7 @@ fn print_usage() {
            praetore reject <directory> <request_id> --approver <id> [--agent <agent_id>] [--yes]\n\
            praetore dispatch <directory> <request_id> [--agent <agent_id>]\n\
            praetore journal-export (--receipts-dir <dir> | --tenant <uuid> | --database) --attester-pin <hex file> [--attester-pin <hex file> ...] --output <new file>\n\
+           praetore journal-export --tenant <uuid> --attester-pin <hex file> [--attester-pin <hex file> ...] --from-seq <n> [--limit <m>] --output <new file>\n\
            praetore journal-export --safety --tenant <uuid> --source <id> --ingest-pin <hex file> [--ingest-pin <hex file> ...] [--source-pins <jsonl>] [--from-seq <n> [--limit <m>]] --output <new file>\n\
              (one safety chain of praetore-safety-ingest; reads PRAETORE_SAFETY_DATABASE_URL)\n\
            praetore policy classify --policy <path>   (proposes action_classes; never writes)\n\
@@ -486,6 +517,8 @@ fn initialize_with_options(
         &directory.join(APPROVER_PIN_FILE),
         &serde_json::to_vec_pretty(&approver_pin)?,
     )?;
+    write_execution_pin(directory, &execution_key_bytes)?;
+    write_attester_pin(directory, &evidence_key_bytes)?;
 
     println!("Initialized local demo at {}", directory.display());
     println!("Human approver id: {LOCAL_APPROVER_ID}");
@@ -494,6 +527,68 @@ fn initialize_with_options(
     println!("Then run: praetore doctor {}", directory.display());
     println!(
         "The loopback HTTP API requires the generated {AGENT_TOKEN_FILE} / {APPROVER_TOKEN_FILE} bearer tokens; this demo is not production key custody."
+    );
+    Ok(())
+}
+
+/// Writes [`EXECUTION_PIN_FILE`] from the execution secret; never
+/// overwrites.
+fn write_execution_pin(
+    directory: &Path,
+    execution_secret: &[u8; 32],
+) -> Result<ApproverPin, Box<dyn std::error::Error>> {
+    let pin = LocalExecutionSigner::from_secret(execution_secret).pin();
+    let path = directory.join(EXECUTION_PIN_FILE);
+    write_private_file(&path, &serde_json::to_vec_pretty(&pin)?)
+        .map_err(|error| format!("could not create {}: {error}", path.display()))?;
+    Ok(pin)
+}
+
+/// `praetore execution-pin <directory>`: writes the execution key's public
+/// pin for a directory initialized before `init` wrote it. Reads the secret
+/// itself, so nobody handles it; refuses to overwrite.
+fn export_execution_pin(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let secret = read_secret(directory, EXECUTION_KEY_FILE)?;
+    let pin = write_execution_pin(directory, &secret)?;
+    println!(
+        "Wrote {} (key_id {}). It holds only the public key.",
+        directory.join(EXECUTION_PIN_FILE).display(),
+        pin.key_id
+    );
+    Ok(())
+}
+
+/// Writes [`ATTESTER_PIN_FILE`] from the evidence attester secret; never
+/// overwrites.
+fn write_attester_pin(
+    directory: &Path,
+    evidence_secret: &[u8; 32],
+) -> Result<String, Box<dyn std::error::Error>> {
+    let public = hex::encode(
+        EvidenceAttesterKey::from_secret_bytes(evidence_secret)
+            .public_key()?
+            .as_bytes(),
+    );
+    let path = directory.join(ATTESTER_PIN_FILE);
+    write_private_file(&path, public.as_bytes())
+        .map_err(|error| format!("could not create {}: {error}", path.display()))?;
+    Ok(public)
+}
+
+/// `praetore attester-pin <directory>`: writes the evidence attester's
+/// public pin for a directory initialized before `init` wrote it. Reads the
+/// secret itself, so nobody handles it; refuses to overwrite.
+fn export_attester_pin(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let secret = read_secret(directory, EVIDENCE_KEY_FILE).map_err(|error| {
+        format!(
+            "could not read {}: {error}",
+            directory.join(EVIDENCE_KEY_FILE).display()
+        )
+    })?;
+    write_attester_pin(directory, &secret)?;
+    println!(
+        "Wrote {}. It holds only the public key.",
+        directory.join(ATTESTER_PIN_FILE).display()
     );
     Ok(())
 }
@@ -1804,6 +1899,7 @@ fn http_client() -> Result<reqwest::blocking::Client, reqwest::Error> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::sibling_binary::{locate_sibling_binary, sibling_binary};
     use std::collections::BTreeMap;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
@@ -2035,6 +2131,122 @@ mod tests {
         for bad in ["", "Local", "a b", "x;drop", "../key", &"a".repeat(65)] {
             assert!(!valid_approver_id(bad), "{bad:?} must be rejected");
         }
+    }
+
+    #[test]
+    fn init_writes_the_execution_pin_and_execution_pin_rewrites_it_only_when_missing() {
+        let directory = env::temp_dir().join(format!("praetore-cli-test-{}", Uuid::new_v4()));
+        initialize(&directory, 8080).unwrap();
+        let written = fs::read_to_string(directory.join(EXECUTION_PIN_FILE)).unwrap();
+        let pin: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let secret = read_secret(&directory, EXECUTION_KEY_FILE).unwrap();
+        let public = hex::encode(SigningKey::from_bytes(&secret).verifying_key().to_bytes());
+        assert_eq!(
+            pin,
+            serde_json::json!({
+                "schema_version": 1,
+                "key_id": format!("local-demo-{public}"),
+                "public_key_hex": public,
+            })
+        );
+        // The key id is the one the gateway signs with.
+        assert_eq!(
+            pin["key_id"],
+            LocalExecutionSigner::from_secret(&secret).key_id()
+        );
+        // Public only: the secret is not in it, and the secret file is
+        // untouched.
+        assert!(!written.contains(&hex::encode(secret)));
+        assert_eq!(read_secret(&directory, EXECUTION_KEY_FILE).unwrap(), secret);
+        // Never overwritten.
+        assert!(export_execution_pin(&directory).is_err());
+        assert_eq!(
+            fs::read_to_string(directory.join(EXECUTION_PIN_FILE)).unwrap(),
+            written
+        );
+        // A directory initialized before init wrote it gets the same file.
+        fs::remove_file(directory.join(EXECUTION_PIN_FILE)).unwrap();
+        export_execution_pin(&directory).unwrap();
+        assert_eq!(
+            fs::read_to_string(directory.join(EXECUTION_PIN_FILE)).unwrap(),
+            written
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn init_writes_the_attester_pin_and_it_verifies_that_attester_s_evidence() {
+        use praetore_core::{Decision, Evidence};
+        use praetore_replay_postgres::journal_export::parse_attester_pin;
+        let directory = env::temp_dir().join(format!("praetore-cli-test-{}", Uuid::new_v4()));
+        initialize(&directory, 8080).unwrap();
+        let written = fs::read_to_string(directory.join(ATTESTER_PIN_FILE)).unwrap();
+        // Exactly the `--attester-pin` format: 64 lowercase hex and a newline.
+        assert_eq!(written.len(), 65);
+        assert!(written.ends_with('\n'));
+        assert!(
+            written
+                .trim_end()
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        );
+        let pin = parse_attester_pin(&written).unwrap();
+        let secret = read_secret(&directory, EVIDENCE_KEY_FILE).unwrap();
+        assert!(!written.contains(&hex::encode(secret)));
+        // Evidence signed with the attester key `praetore run` loads from
+        // evidence-attester.key verifies against the pin; another key's
+        // pin does not.
+        let agent = AgentKeyPair::from_secret_bytes(&[0x31; 32]).identity(AgentId::new());
+        let authority = Authority::new(agent.id.clone(), "cli-test", vec!["demo:write".into()]);
+        let action = Action::new(
+            "demo:set_value",
+            Some("demo-state".into()),
+            serde_json::json!({}),
+        )
+        .unwrap()
+        .with_capability("demo:write");
+        let mut evidence = Evidence::new_with_context(
+            Uuid::new_v4(),
+            agent,
+            authority,
+            action,
+            Decision::allow("regla", praetore_core::DecidedBy::rule("regla")),
+            None,
+            std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        evidence.bind_policy_digest("cd".repeat(32)).unwrap();
+        evidence
+            .sign(&EvidenceAttesterKey::from_secret_bytes(&secret))
+            .unwrap();
+        assert!(evidence.verify_attester_signature(&pin).is_ok());
+        let other = EvidenceAttesterKey::from_secret_bytes(&[0x77; 32])
+            .public_key()
+            .unwrap();
+        assert!(evidence.verify_attester_signature(&other).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn attester_pin_rewrites_the_pin_only_when_missing_and_needs_the_key() {
+        let directory = env::temp_dir().join(format!("praetore-cli-test-{}", Uuid::new_v4()));
+        initialize(&directory, 8080).unwrap();
+        let path = directory.join(ATTESTER_PIN_FILE);
+        let written = fs::read_to_string(&path).unwrap();
+        // Never overwritten.
+        assert!(export_attester_pin(&directory).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), written);
+        // A directory initialized before init wrote it gets the same file.
+        fs::remove_file(&path).unwrap();
+        export_attester_pin(&directory).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), written);
+        // Without evidence-attester.key: an error naming it, and no pin.
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(directory.join(EVIDENCE_KEY_FILE)).unwrap();
+        let error = export_attester_pin(&directory).unwrap_err().to_string();
+        assert!(error.contains(EVIDENCE_KEY_FILE), "{error}");
+        assert!(!path.exists());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -4623,22 +4835,37 @@ mod tests {
         }
     }
 
-    /// A binary of this workspace built next to the test executable
-    /// (`cargo build -p praetore-cli -p praetore-verify --locked`).
-    fn sibling_binary(name: &str) -> PathBuf {
-        let path = env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-        assert!(
-            path.is_file(),
-            "{} is missing: run `cargo build -p praetore-cli -p praetore-verify --locked` first",
-            path.display()
+    #[test]
+    fn sibling_binary_finds_the_uplifted_artifact_from_the_1_99_and_1_100_layouts() {
+        let root = temp_path("sibling-layout");
+        fs::create_dir_all(&root).unwrap();
+        let debug = root.join("debug");
+        fs::create_dir_all(&debug).unwrap();
+        let bin = debug.join(format!("praetore-verify{}", std::env::consts::EXE_SUFFIX));
+        fs::write(&bin, []).unwrap();
+
+        let v199 = debug.join("deps").join("praetore-abc");
+        fs::create_dir_all(v199.parent().unwrap()).unwrap();
+        fs::write(&v199, []).unwrap();
+        assert_eq!(
+            locate_sibling_binary(&v199, "praetore-verify").as_deref(),
+            Some(bin.as_path())
         );
-        path
+
+        let v1100 = debug
+            .join("build")
+            .join("praetore-cli")
+            .join("89b3229a21bd5c5c")
+            .join("out")
+            .join("praetore-89b3229a21bd5c5c");
+        fs::create_dir_all(v1100.parent().unwrap()).unwrap();
+        fs::write(&v1100, []).unwrap();
+        assert_eq!(
+            locate_sibling_binary(&v1100, "praetore-verify").as_deref(),
+            Some(bin.as_path())
+        );
+
+        fs::remove_dir_all(&root).unwrap();
     }
 
     /// The CLI's local HTTP API over the fixture's gateway and real

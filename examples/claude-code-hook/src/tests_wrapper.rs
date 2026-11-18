@@ -51,10 +51,23 @@ impl Project {
 
     /// Runs the wrapper with `shell`; returns (exit code, stdout).
     fn run(&self, shell: &str, project_dir: bool) -> (Option<i32>, String) {
+        self.run_with_bin(shell, project_dir, None)
+    }
+
+    /// [`Self::run`] with `PRAETORE_HOOK_BIN` set to `bin`, or unset.
+    fn run_with_bin(
+        &self,
+        shell: &str,
+        project_dir: bool,
+        bin: Option<&str>,
+    ) -> (Option<i32>, String) {
         let mut command = Command::new(shell);
+        command.arg(wrapper());
+        match bin {
+            Some(bin) => command.env("PRAETORE_HOOK_BIN", bin),
+            None => command.env_remove("PRAETORE_HOOK_BIN"),
+        };
         command
-            .arg(wrapper())
-            .env_remove("PRAETORE_HOOK_BIN")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -186,5 +199,64 @@ fn wrapper_passes_a_successful_decision_through() {
     let silent = Project::new("silent", b"#!/bin/sh\ncat >/dev/null\n");
     for shell in shells() {
         assert_eq!(silent.run(shell, true), (Some(0), String::new()), "{shell}");
+    }
+}
+
+/// `PRAETORE_HOOK_BIN`, when not empty, must name an absolute path to an
+/// executable regular file: a relative path, a directory and a
+/// non-executable file are denied without running anything; an absolute
+/// executable file is run. Empty means unset (the installed binary).
+#[test]
+fn wrapper_bounds_the_binary_override() {
+    let decision = r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"override"}}"#;
+    let project = Project::new(
+        "override",
+        b"#!/bin/sh
+cat >/dev/null
+exit 9
+",
+    );
+    let other = project.root.join("other-hook");
+    fs::write(
+        &other,
+        format!(
+            "#!/bin/sh
+cat >/dev/null
+printf '%s\\n' '{decision}'\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&other, fs::Permissions::from_mode(0o700)).unwrap();
+    let not_executable = project.root.join("not-executable");
+    fs::write(&not_executable, b"#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&not_executable, fs::Permissions::from_mode(0o600)).unwrap();
+    let directory = project.root.join(".claude/bin");
+    for shell in shells() {
+        // Relative, even when it resolves to the installed binary.
+        for relative in [".claude/bin/praetore-claude-hook", "praetore-claude-hook"] {
+            assert_deny(
+                &format!("relative {relative:?} under {shell}"),
+                project.run_with_bin(shell, true, Some(relative)),
+                "PRAETORE_HOOK_BIN must be an absolute path",
+            );
+        }
+        for path in [&directory, &not_executable] {
+            assert_deny(
+                &format!("{} under {shell}", path.display()),
+                project.run_with_bin(shell, true, Some(path.to_str().unwrap())),
+                "not set up",
+            );
+        }
+        // Empty is unset: the installed binary runs (and exits 9).
+        assert_deny(
+            &format!("empty under {shell}"),
+            project.run_with_bin(shell, true, Some("")),
+            "exit status 9",
+        );
+        // An absolute executable file is what runs: the override, not the
+        // installed binary.
+        let (code, stdout) = project.run_with_bin(shell, true, Some(other.to_str().unwrap()));
+        assert_eq!(code, Some(0), "{shell}");
+        assert_eq!(stdout, format!("{decision}\n"), "{shell}");
     }
 }

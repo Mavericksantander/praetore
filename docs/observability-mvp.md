@@ -43,8 +43,9 @@ other host requires `sslmode=verify-full` and `sslrootcert` (see
 [PostgreSQL adapter](operations.md#postgresql-adapter)). The API never connects
 to PostgreSQL from the browser.
 
-Apply migrations in numeric order through
-`0008_tenant_row_level_security.sql`.
+Apply every migration in numeric order (on this tree, `0001` through
+`0022_awaiting_approval_state.sql`), with the migration role described in
+[Migrations](operations.md#migrations).
 Grant the service role schema usage and SELECT only on the tenant, journal identity,
 digest, status, evidence, and timestamp columns, plus event identity/status/
 timestamp/sequence columns. Do not grant it access to `output_json`; output availability
@@ -54,14 +55,24 @@ uses explicit read-only repeatable-read transactions for list/detail queries.
 The service code contains no mutation SQL. PostgreSQL ownership and superuser
 roles can override database controls, so the process must not use an owner,
 superuser, or role with write grants.
-At startup the service runs `verify_runtime_role` on its connection and
-refuses to start if the role is an owner, superuser, `BYPASSRLS`, can
-CREATE in `praetore`, holds DELETE/TRUNCATE/UPDATE/TRIGGER/REFERENCES, or
-if triggers or row-level security could be switched off for the session.
-The check runs once, at startup.
+At startup the service runs `verify_observe_role_with` on its connection,
+a read-only role check, and refuses to start if the role is an owner,
+superuser, `BYPASSRLS` or `CREATEROLE`, can CREATE in `praetore`, is a member
+of `praetore_runtime` (the gateway's runtime credential),
+`praetore_safety_ingest` or `praetore_safety_audit`, holds any INSERT,
+UPDATE, DELETE, TRUNCATE, REFERENCES or TRIGGER privilege on a `praetore`
+table, or SELECT on anything beyond the columns granted below, or if
+triggers or row-level security could be switched off for the session. It
+also runs the database-wide checks of the gateway's runtime check (settings,
+grants, ownership, memberships). The check runs once, at startup. Give the
+service its own credential: the gateway's runtime credential does not start
+it.
 
 Minimal role grant shape (run as the schema owner; choose login and password
-management out of band):
+management out of band). The login is `praetore_observe` itself or, with
+`praetore_observe` created `NOLOGIN`, a login role granted
+`praetore_observe`; the checks accept these grants only to
+`praetore_observe`. No migration creates this role.
 
 ```sql
 CREATE ROLE praetore_observe LOGIN;

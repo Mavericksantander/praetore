@@ -116,6 +116,19 @@ pub struct JournalReport {
     /// ([`ChainError::TenantMismatch`] otherwise). `None` for a database
     /// chain and for a chain whose receipts carry no tenant.
     pub tenant_id: Option<Uuid>,
+    /// For a range ([`verify_journal_range`]): its anchor and first `seq`.
+    /// `None` for a whole chain.
+    pub range: Option<JournalRange>,
+}
+
+/// Where a verified range sits in its chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JournalRange {
+    /// The link of the anchor, the receipt just before the range: the head
+    /// of the previous range.
+    pub anchor: ChainLink,
+    /// The `seq` of the range's first entry (the anchor's `seq` plus one).
+    pub start: u64,
 }
 
 /// What a tenant chain's database reference must match: a head, and the
@@ -173,6 +186,9 @@ pub enum ChainError {
     /// The receipt's authority names another tenant than the earlier
     /// receipts of the chain (or one names a tenant and another none).
     TenantMismatch { line: u64 },
+    /// A range's anchor (the receipt just before it) does not link to the
+    /// expected head of the previous range.
+    AnchorMismatch { actual: ChainLink },
 }
 
 impl ChainError {
@@ -194,7 +210,7 @@ impl ChainError {
             Self::MissingSignature { .. } => "AUTH_FAIL",
             Self::Evidence { error, .. } => error.code(),
             Self::PolicyMismatch { .. } => "POLICY_MISMATCH",
-            Self::HeadMismatch { .. } => "JOURNAL_HEAD_MISMATCH",
+            Self::HeadMismatch { .. } | Self::AnchorMismatch { .. } => "JOURNAL_HEAD_MISMATCH",
         }
     }
 }
@@ -244,6 +260,11 @@ impl fmt::Display for ChainError {
                 f,
                 "entry {line}: receipt authority names another tenant than the earlier \
                  receipts of this chain"
+            ),
+            Self::AnchorMismatch { actual } => write!(
+                f,
+                "the range's anchor links to {actual}, not to the expected head of the previous \
+                 range"
             ),
             Self::PolicyNotApplicable => write!(
                 f,
@@ -319,6 +340,9 @@ struct ChainState<'k> {
     attesters: Vec<(String, &'k VerifiedPublicKey)>,
     policy: Option<&'k RecordedPolicy>,
     seq: u64,
+    /// `seq` of the first counted entry: 0, or the line after a range's
+    /// anchor. The entry limit applies from here.
+    start: u64,
     prev: ChainLink,
     seen: HashSet<Uuid>,
     seen_records: HashSet<Uuid>,
@@ -329,6 +353,8 @@ struct ChainState<'k> {
     signed_by: BTreeMap<String, u64>,
     /// Tenant of the first receipt (`Some(None)`: it names no tenant).
     tenant: Option<Option<Uuid>>,
+    /// Per pinned key, in pin order: whether it verified an entry.
+    used: Vec<bool>,
 }
 
 impl<'k> ChainState<'k> {
@@ -340,6 +366,7 @@ impl<'k> ChainState<'k> {
                 .collect(),
             policy,
             seq: 0,
+            start: 0,
             prev: ChainLink::GENESIS,
             seen: HashSet::new(),
             seen_records: HashSet::new(),
@@ -348,6 +375,14 @@ impl<'k> ChainState<'k> {
             receipts: 0,
             database_head: None,
             tenant: None,
+            used: vec![false; attesters.len()],
+        }
+    }
+
+    /// Records that `key` verified an entry.
+    fn mark_used(&mut self, key: &VerifiedPublicKey) {
+        if let Some(index) = self.attesters.iter().position(|(_, pinned)| *pinned == key) {
+            self.used[index] = true;
         }
     }
 
@@ -361,7 +396,7 @@ impl<'k> ChainState<'k> {
     }
 
     fn next_line(&self) -> Result<u64, ChainError> {
-        if self.seq as usize >= MAX_CHAIN_ENTRIES {
+        if (self.seq - self.start) as usize >= MAX_CHAIN_ENTRIES {
             return Err(ChainError::TooLarge);
         }
         Ok(self.seq)
@@ -384,6 +419,7 @@ impl<'k> ChainState<'k> {
         record
             .verify(attester)
             .map_err(|error| ChainError::Record { line, error })?;
+        self.mark_used(attester);
         if !self.seen_records.insert(record.record_id) {
             return Err(ChainError::DuplicateRecordId {
                 line,
@@ -410,12 +446,27 @@ impl<'k> ChainState<'k> {
         Ok(())
     }
 
-    /// Checks one receipt at the current position and advances the chain.
-    fn append(&mut self, evidence: &Evidence) -> Result<(), ChainError> {
-        let line = self.next_line()?;
-        if self.kind == Kind::Database {
-            return Err(ChainError::MixedKinds { line });
-        }
+    /// A range's anchor: the receipt at `seq` after `prev`, the last entry
+    /// of the previous range. Its signature is checked against the pins and
+    /// its link is where the range continues; it is not counted.
+    fn resume(&mut self, seq: u64, prev: ChainLink, evidence: &Evidence) -> Result<(), ChainError> {
+        let start = seq
+            .checked_add(1)
+            .ok_or(ChainError::Malformed { line: seq })?;
+        self.seq = seq;
+        self.prev = prev;
+        self.check_signature(seq, evidence)?;
+        self.seen.insert(evidence.evidence_id);
+        self.tenant = Some(evidence.authority.tenant_id());
+        self.prev = link(seq, &prev, evidence)?;
+        self.seq = start;
+        self.start = start;
+        self.kind = Kind::Tenant;
+        Ok(())
+    }
+
+    /// The receipt is signed by the pinned key its key id names.
+    fn check_signature(&mut self, line: u64, evidence: &Evidence) -> Result<(), ChainError> {
         if evidence.attester_signature.is_none() {
             return Err(ChainError::MissingSignature { line });
         }
@@ -437,6 +488,17 @@ impl<'k> ChainState<'k> {
         evidence
             .verify_attester_signature(attester)
             .map_err(|error| ChainError::Evidence { line, error })?;
+        self.mark_used(attester);
+        Ok(())
+    }
+
+    /// Checks one receipt at the current position and advances the chain.
+    fn append(&mut self, evidence: &Evidence) -> Result<(), ChainError> {
+        let line = self.next_line()?;
+        if self.kind == Kind::Database {
+            return Err(ChainError::MixedKinds { line });
+        }
+        self.check_signature(line, evidence)?;
         if !self.seen.insert(evidence.evidence_id) {
             return Err(ChainError::DuplicateEvidenceId {
                 line,
@@ -512,18 +574,33 @@ impl<'k> ChainExporter<'k> {
         }
     }
 
+    /// A range of a tenant chain (`praetore journal-export --tenant
+    /// --from-seq`): its first line is the anchor, the receipt at `seq`
+    /// after `prev` (the last entry of the previous range), checked against
+    /// the pins but not counted; the entries pushed next continue at
+    /// `seq + 1`. [`MAX_CHAIN_ENTRIES`] counts from there; [`MAX_CHAIN_BYTES`]
+    /// includes the anchor line.
+    pub fn resume_after(
+        attesters: &'k [VerifiedPublicKey],
+        seq: u64,
+        prev: ChainLink,
+        anchor: &Evidence,
+    ) -> Result<Self, ChainError> {
+        let mut exporter = Self::with_attesters(attesters);
+        let line = receipt_line(seq, &prev, anchor)?;
+        exporter.state.resume(seq, prev, anchor)?;
+        exporter.push_line(&line)?;
+        Ok(exporter)
+    }
+
+    /// Fails with [`ChainError::TooLarge`], leaving the chain as it was,
+    /// when the line would take the output over [`MAX_CHAIN_BYTES`].
     pub fn push(&mut self, evidence: &Evidence) -> Result<(), ChainError> {
-        let seq = self.state.seq;
-        let prev = self.state.prev;
-        let json = evidence
-            .to_json()
-            .map_err(|error| ChainError::Evidence { line: seq, error })?;
-        self.state.append(evidence)?;
-        // `to_json` is canonical compact JSON (no newline); `prev` is hex.
-        let line = format!("{{\"seq\":{seq},\"prev\":\"{prev}\",\"evidence\":{json}}}\n");
+        let line = receipt_line(self.state.seq, &self.state.prev, evidence)?;
         if self.output.len() + line.len() > MAX_CHAIN_BYTES {
             return Err(ChainError::TooLarge);
         }
+        self.state.append(evidence)?;
         self.output.push_str(&line);
         Ok(())
     }
@@ -560,11 +637,34 @@ impl<'k> ChainExporter<'k> {
         Ok(())
     }
 
+    /// Positions, in the order given to [`Self::with_attesters`], of the
+    /// pinned keys that verified no entry pushed so far.
+    pub fn unused_attesters(&self) -> Vec<usize> {
+        self.state
+            .used
+            .iter()
+            .enumerate()
+            .filter(|(_, used)| !**used)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
     /// Returns the JSONL text and its head. Fails if no receipt was pushed.
     pub fn finish(self) -> Result<(String, ChainHead), ChainError> {
         let head = self.state.head()?;
         Ok((self.output, head))
     }
+}
+
+/// One receipt line. `to_json` is canonical compact JSON (no newline);
+/// `prev` is hex.
+fn receipt_line(seq: u64, prev: &ChainLink, evidence: &Evidence) -> Result<String, ChainError> {
+    let json = evidence
+        .to_json()
+        .map_err(|error| ChainError::Evidence { line: seq, error })?;
+    Ok(format!(
+        "{{\"seq\":{seq},\"prev\":\"{prev}\",\"evidence\":{json}}}\n"
+    ))
 }
 
 #[derive(Deserialize)]
@@ -656,10 +756,122 @@ pub fn verify_journal_report(
     expected_head: Option<&ChainLink>,
     expected_database_head: Option<&ExpectedDatabaseHead>,
 ) -> Result<JournalReport, ChainError> {
+    verify_journal_inner(
+        text,
+        attesters,
+        policy,
+        expected_head,
+        expected_database_head,
+        None,
+    )
+}
+
+/// [`verify_journal_report`] that also returns the verified receipts, in
+/// chain order (none for a database chain). For checks that need the
+/// receipts themselves, such as binding approval and execution receipts to
+/// the requests of the chain.
+pub fn verify_journal_receipts(
+    text: &str,
+    attesters: &[VerifiedPublicKey],
+    expected_head: Option<&ChainLink>,
+) -> Result<(JournalReport, Vec<Evidence>), ChainError> {
+    let mut receipts = Vec::new();
+    let report = verify_journal_inner(
+        text,
+        attesters,
+        None,
+        expected_head,
+        None,
+        Some(&mut receipts),
+    )?;
+    Ok((report, receipts))
+}
+
+/// Verifies one range of a tenant chain, as `praetore journal-export
+/// --tenant --from-seq N` writes it: the first line is the **anchor**, the
+/// receipt at `seq` N - 1 (the last entry of the previous range), and the
+/// rest are the range, from `seq` N. The anchor's signature is checked
+/// against the pins and its link is where the range must continue; it is
+/// not counted. With `expected_anchor`, that link must equal it: pass the
+/// head of the previous range to chain the ranges. Every other check of
+/// [`verify_journal_report`] applies to the range's receipts, except that an
+/// `evidence_id` repeated from an earlier range is not detected (only a
+/// whole-chain verification sees every receipt). A range carries no
+/// database reference.
+///
+/// Without `expected_anchor`, the range is not linked to anything before
+/// it; without `expected_head`, a truncated range (a prefix) still verifies.
+pub fn verify_journal_range(
+    text: &str,
+    attesters: &[VerifiedPublicKey],
+    policy: Option<&RecordedPolicy>,
+    expected_anchor: Option<&ChainLink>,
+    expected_head: Option<&ChainLink>,
+) -> Result<JournalReport, ChainError> {
     if text.len() > MAX_CHAIN_BYTES {
         return Err(ChainError::TooLarge);
     }
+    let (anchor_line, rest) = text.split_once('\n').ok_or(ChainError::Empty)?;
+    let line = 0;
+    if anchor_line.is_empty() || anchor_line.contains('\r') {
+        return Err(ChainError::Malformed { line });
+    }
+    let entry: Entry<'_> =
+        serde_json::from_str(anchor_line).map_err(|_| ChainError::Malformed { line })?;
+    let (Some(evidence), None, None) = (entry.evidence, entry.record, entry.database_head) else {
+        return Err(ChainError::Malformed { line });
+    };
+    let prev = ChainLink::from_hex(entry.prev).ok_or(ChainError::Malformed { line })?;
+    let evidence = Evidence::from_json(evidence.get()).map_err(|error| ChainError::Evidence {
+        line: entry.seq,
+        error,
+    })?;
     let mut state = ChainState::new(attesters, policy);
+    state.resume(entry.seq, prev, &evidence)?;
+    let anchor = state.prev;
+    if let Some(expected) = expected_anchor
+        && *expected != anchor
+    {
+        return Err(ChainError::AnchorMismatch { actual: anchor });
+    }
+    let mut report = verify_lines(rest, state, policy, expected_head, None, None)?;
+    report.range = Some(JournalRange {
+        anchor,
+        start: entry.seq + 1,
+    });
+    Ok(report)
+}
+
+fn verify_journal_inner(
+    text: &str,
+    attesters: &[VerifiedPublicKey],
+    policy: Option<&RecordedPolicy>,
+    expected_head: Option<&ChainLink>,
+    expected_database_head: Option<&ExpectedDatabaseHead>,
+    receipts: Option<&mut Vec<Evidence>>,
+) -> Result<JournalReport, ChainError> {
+    if text.len() > MAX_CHAIN_BYTES {
+        return Err(ChainError::TooLarge);
+    }
+    let state = ChainState::new(attesters, policy);
+    verify_lines(
+        text,
+        state,
+        policy,
+        expected_head,
+        expected_database_head,
+        receipts,
+    )
+}
+
+fn verify_lines(
+    text: &str,
+    mut state: ChainState<'_>,
+    policy: Option<&RecordedPolicy>,
+    expected_head: Option<&ChainLink>,
+    expected_database_head: Option<&ExpectedDatabaseHead>,
+    mut receipts: Option<&mut Vec<Evidence>>,
+) -> Result<JournalReport, ChainError> {
     let mut rest = text;
     while !rest.is_empty() {
         let line = state.seq;
@@ -681,6 +893,9 @@ pub fn verify_journal_report(
                 let evidence = Evidence::from_json(evidence.get())
                     .map_err(|error| ChainError::Evidence { line, error })?;
                 state.append(&evidence)?;
+                if let Some(receipts) = receipts.as_mut() {
+                    receipts.push(evidence);
+                }
             }
             (None, Some(record), None) => {
                 let record = StorageRecord::from_json(record.get())
@@ -732,6 +947,7 @@ pub fn verify_journal_report(
         summary,
         signed_by: state.signed_by,
         tenant_id: state.tenant.flatten(),
+        range: None,
     })
 }
 
@@ -759,6 +975,51 @@ mod tests {
             exporter.push_record(&sample_record(attester)).unwrap();
         }
         exporter.finish().unwrap()
+    }
+
+    /// A pin that verified nothing is reported; one that verified a record
+    /// or a receipt is not.
+    #[test]
+    fn verify_journal_receipts_returns_the_verified_receipts_in_order() {
+        let (report, receipts) =
+            verify_journal_receipts(SET_03_CHAIN, &[set_03_pin()], None).unwrap();
+        assert_eq!(
+            report,
+            verify_journal_report(SET_03_CHAIN, &[set_03_pin()], None, None, None).unwrap()
+        );
+        assert_eq!(receipts.len() as u64, report.summary.head.entries.get());
+        for (line, evidence) in SET_03_CHAIN.lines().zip(&receipts) {
+            let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(
+                entry["evidence"]["evidence_id"],
+                evidence.evidence_id.to_string()
+            );
+        }
+        // A broken chain returns nothing.
+        let broken = SET_03_CHAIN.replacen("\"seq\":1", "\"seq\":7", 1);
+        assert!(verify_journal_receipts(&broken, &[set_03_pin()], None).is_err());
+    }
+
+    #[test]
+    fn the_exporter_reports_pins_that_verified_no_entry() {
+        let attester = EvidenceAttesterKey::from_secret_bytes(&[7; 32]);
+        let stranger = EvidenceAttesterKey::from_secret_bytes(&[8; 32]);
+        let pins = [
+            stranger.public_key().unwrap(),
+            attester.public_key().unwrap(),
+        ];
+        let mut exporter = ChainExporter::with_attesters(&pins);
+        assert_eq!(exporter.unused_attesters(), vec![0, 1]);
+        exporter.push_record(&sample_record(&attester)).unwrap();
+        assert_eq!(exporter.unused_attesters(), vec![0]);
+        let current = [set_03_pin(), pins[0].clone()];
+        let mut receipts = ChainExporter::with_attesters(&current);
+        let line = SET_03_CHAIN.lines().next().unwrap();
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        receipts
+            .push(&Evidence::from_json(&value["evidence"].to_string()).unwrap())
+            .unwrap();
+        assert_eq!(receipts.unused_attesters(), vec![1]);
     }
 
     #[test]
@@ -968,6 +1229,8 @@ mod tests {
                 .push(&Evidence::from_json(&value["evidence"].to_string()).unwrap())
                 .unwrap();
         }
+        // Only the current key signed a receipt: the old pin is unused here.
+        assert_eq!(exporter.unused_attesters(), vec![0]);
         let (tenant, head) = exporter.finish().unwrap();
         let expected = ExpectedDatabaseHead {
             head: database_head.head,
@@ -1039,5 +1302,205 @@ mod tests {
         assert_eq!(error.code(), "INVALID_REQUEST");
         // A tenant chain still compares the policy of every receipt.
         verify_journal(SET_03_CHAIN, &set_03_pin(), Some(&policy), None, None).unwrap();
+    }
+
+    /// Set 03's receipts cut at `cut`: the first range from genesis, and
+    /// the second from `cut` with the receipt at `cut - 1` as its anchor.
+    fn two_ranges(cut: usize) -> (String, ChainHead, String, ChainHead, ChainHead) {
+        let pins = [set_03_pin()];
+        let (full, receipts) = verify_journal_receipts(SET_03_CHAIN, &pins, None).unwrap();
+        let mut first = ChainExporter::with_attesters(&pins);
+        let mut prev = ChainLink::GENESIS;
+        let mut anchor_prev = prev;
+        for (seq, evidence) in receipts[..cut].iter().enumerate() {
+            first.push(evidence).unwrap();
+            anchor_prev = prev;
+            prev = receipt_link(seq as u64, &prev, evidence).unwrap();
+        }
+        let (first_text, first_head) = first.finish().unwrap();
+        let mut second =
+            ChainExporter::resume_after(&pins, cut as u64 - 1, anchor_prev, &receipts[cut - 1])
+                .unwrap();
+        for evidence in &receipts[cut..] {
+            second.push(evidence).unwrap();
+        }
+        let (second_text, second_head) = second.finish().unwrap();
+        (
+            first_text,
+            first_head,
+            second_text,
+            second_head,
+            full.summary.head,
+        )
+    }
+
+    #[test]
+    fn two_ranges_verify_chained_and_end_at_the_whole_chain_s_head() {
+        let pins = [set_03_pin()];
+        let (first, first_head, second, second_head, whole) = two_ranges(10);
+        // The first range is a plain chain: the whole chain's first lines.
+        assert_eq!(
+            first,
+            SET_03_CHAIN
+                .lines()
+                .take(10)
+                .map(|line| format!("{line}\n"))
+                .collect::<String>()
+        );
+        verify_journal_report(&first, &pins, None, Some(&first_head.head), None).unwrap();
+        // The second starts with its anchor, the first range's last line.
+        assert_eq!(second.lines().next(), first.lines().last());
+        assert_eq!(
+            second.lines().skip(1).collect::<Vec<_>>(),
+            SET_03_CHAIN.lines().skip(10).collect::<Vec<_>>()
+        );
+        let report = verify_journal_range(
+            &second,
+            &pins,
+            None,
+            Some(&first_head.head),
+            Some(&whole.head),
+        )
+        .unwrap();
+        assert_eq!(
+            report.range,
+            Some(JournalRange {
+                anchor: first_head.head,
+                start: 10
+            })
+        );
+        assert_eq!(report.summary.head, whole);
+        assert_eq!(second_head, whole);
+        // The anchor is not counted.
+        assert_eq!(
+            report.signed_by.values().sum::<u64>(),
+            whole.entries.get() - 10
+        );
+        // A range is not a whole chain: it does not start at seq 0.
+        assert!(verify_journal_report(&second, &pins, None, None, None).is_err());
+    }
+
+    #[test]
+    fn a_range_with_a_wrong_anchor_fails() {
+        let pins = [set_03_pin()];
+        let (first, first_head, second, _, _) = two_ranges(10);
+        // Chained to another head.
+        let (_, earlier, _, _, _) = two_ranges(9);
+        let error =
+            verify_journal_range(&second, &pins, None, Some(&earlier.head), None).unwrap_err();
+        assert!(
+            matches!(error, ChainError::AnchorMismatch { actual } if actual == first_head.head)
+        );
+        assert_eq!(error.code(), "JOURNAL_HEAD_MISMATCH");
+        // An anchor whose prev was changed links elsewhere.
+        let anchor: serde_json::Value =
+            serde_json::from_str(second.lines().next().unwrap()).unwrap();
+        let altered = second.replacen(anchor["prev"].as_str().unwrap(), &"ab".repeat(32), 1);
+        assert!(matches!(
+            verify_journal_range(&altered, &pins, None, Some(&first_head.head), None),
+            Err(ChainError::AnchorMismatch { .. })
+        ));
+        // An anchor that is not the line before the range breaks the link.
+        let skipped = format!(
+            "{}\n{}",
+            first.lines().nth(8).unwrap(),
+            second.split_once('\n').unwrap().1
+        );
+        assert!(matches!(
+            verify_journal_range(&skipped, &pins, None, None, None),
+            Err(ChainError::BrokenLink { line: 9 })
+        ));
+        // An anchor signed by a key that is not pinned.
+        let stranger = [EvidenceAttesterKey::from_secret_bytes(&[8; 32])
+            .public_key()
+            .unwrap()];
+        assert!(verify_journal_range(&second, &stranger, None, None, None).is_err());
+        // No range after the anchor.
+        let only_anchor = format!("{}\n", second.lines().next().unwrap());
+        assert!(matches!(
+            verify_journal_range(&only_anchor, &pins, None, None, None),
+            Err(ChainError::Empty)
+        ));
+    }
+
+    #[test]
+    fn a_truncated_range_fails() {
+        let pins = [set_03_pin()];
+        let (_, first_head, second, second_head, _) = two_ranges(10);
+        // The last entry dropped: the range's own head no longer matches.
+        let mut lines: Vec<&str> = second.lines().collect();
+        lines.pop();
+        let dropped = lines
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        assert!(matches!(
+            verify_journal_range(
+                &dropped,
+                &pins,
+                None,
+                Some(&first_head.head),
+                Some(&second_head.head)
+            ),
+            Err(ChainError::HeadMismatch { .. })
+        ));
+        // Cut in the middle of its last line.
+        let cut = &second[..second.len() - 40];
+        assert!(matches!(
+            verify_journal_range(cut, &pins, None, Some(&first_head.head), None),
+            Err(ChainError::Malformed { .. })
+        ));
+        // A truncated first range is not the next range's anchor.
+        let (first, _, _, _, _) = two_ranges(10);
+        let mut first_lines: Vec<&str> = first.lines().collect();
+        first_lines.pop();
+        let short_first = first_lines
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        let short_head = verify_journal_report(&short_first, &pins, None, None, None)
+            .unwrap()
+            .summary
+            .head;
+        assert!(matches!(
+            verify_journal_range(&second, &pins, None, Some(&short_head.head), None),
+            Err(ChainError::AnchorMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_range_holds_receipts_only() {
+        let attester = EvidenceAttesterKey::from_secret_bytes(&[7; 32]);
+        let pins = [set_03_pin(), attester.public_key().unwrap()];
+        let (_, _, second, _, _) = two_ranges(10);
+        // A database reference or a storage record inside a range fails.
+        let (records, _) = database_chain(&attester, 1);
+        let record_line: serde_json::Value =
+            serde_json::from_str(records.lines().next().unwrap()).unwrap();
+        let anchor = second.lines().next().unwrap();
+        let anchor_value: serde_json::Value = serde_json::from_str(anchor).unwrap();
+        let first_head = verify_journal_range(&second, &pins, None, None, None)
+            .unwrap()
+            .range
+            .unwrap()
+            .anchor;
+        let mixed = format!(
+            "{anchor}\n{}\n",
+            serde_json::json!({
+                "seq": anchor_value["seq"].as_u64().unwrap() + 1,
+                "prev": first_head.to_hex(),
+                "record": record_line["record"],
+            })
+        );
+        assert!(matches!(
+            verify_journal_range(&mixed, &pins, None, None, None),
+            Err(ChainError::MixedKinds { .. })
+        ));
+        // A storage record cannot be the anchor.
+        let record_anchor = format!("{}{}", records, second.split_once('\n').unwrap().1);
+        assert!(matches!(
+            verify_journal_range(&record_anchor, &pins, None, None, None),
+            Err(ChainError::Malformed { line: 0 })
+        ));
     }
 }

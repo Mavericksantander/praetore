@@ -1,6 +1,8 @@
 //! Evaluates one MCP `tools/call` with the PRÆTORE HighAssurance engine and
 //! appends the attested evidence to the receipts journal.
 
+use crate::journal::{JournalError, VerifiedLine};
+use crate::shown::Show;
 use crate::store::{self, ACTION_TYPE, AUDIENCE, CAPABILITY, Home, LoadedHome};
 use praetore_core::{
     Action, AgentIdentity, AgentKeyPair, Authority, AuthorizationRequest, ClassifiedAction,
@@ -13,7 +15,6 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeSet, HashSet},
     fs,
-    io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -28,6 +29,10 @@ pub const PROXY_CONTEXT_KEY: &str = "praetore.proxy";
 /// Context key recording, for each argument a `PathPrefix` rule covers, the
 /// value the client sent, the value it resolves to and the check result.
 pub const PATH_CHECK_CONTEXT_KEY: &str = "praetore.path_check";
+/// Context key naming, in the receipt of a call forwarded with a local
+/// approval, the approval id it consumed. It is signed with the intent, so
+/// the receipts journal records which approval each forwarded call used.
+pub const APPROVAL_CONTEXT_KEY: &str = "praetore.approval_id";
 /// Value the engine sees instead of a path that does not resolve to itself.
 /// It is not absolute, so core's `PathPrefix` treats it as unsafe: it
 /// matches every DENY / REQUIRE_APPROVAL `PathPrefix` rule and no ALLOW one.
@@ -75,7 +80,12 @@ pub struct Verdict {
     pub rule_ids: Vec<String>,
     pub reason: String,
     /// Whether the evidence reached the journal (fsynced).
-    pub journaled: Result<PathBuf, String>,
+    pub journaled: Result<PathBuf, JournalError>,
+    /// Set when enforce consumed one local approval and the call may be
+    /// forwarded once. The engine outcome stays `RequireApproval`.
+    pub consumed_approval: Option<String>,
+    /// Client-facing text when the call stays held for approval.
+    pub hold_message: Option<String>,
 }
 
 /// Why a `tools/call` got no verdict.
@@ -259,6 +269,7 @@ pub struct Gate {
     authority: Authority,
     policy_digest: String,
     mode: Mode,
+    home: Home,
     journal: Journal,
     /// Parameter keys used by `PathPrefix` conditions (T-014).
     path_keys: BTreeSet<String>,
@@ -1032,7 +1043,8 @@ impl Gate {
             authority,
             policy_digest,
             mode,
-            journal: Journal::new(home.receipts_dir()),
+            home: home.clone(),
+            journal: Journal::new(home),
             path_keys,
             path_prefixes,
         })
@@ -1082,6 +1094,17 @@ impl Gate {
 
     /// Evaluates and returns the attested evidence without journaling it.
     pub fn evaluate_evidence(&self, server: &str, params: &Value) -> Result<Evidence, GateError> {
+        self.evaluate_evidence_with(server, params, None)
+    }
+
+    /// [`Gate::evaluate_evidence`], with `approval_id` signed into the
+    /// context under [`APPROVAL_CONTEXT_KEY`] when it is `Some`.
+    pub fn evaluate_evidence_with(
+        &self,
+        server: &str,
+        params: &Value,
+        approval_id: Option<&str>,
+    ) -> Result<Evidence, GateError> {
         // G7: classify first. A declared Safety call stops here with no
         // evaluation and no receipt; an unclassified one is refused by the
         // engine with a signed DENY, without evaluating any rule.
@@ -1123,6 +1146,7 @@ impl Gate {
                 )
                 .map_err(failed)?,
                 None,
+                None,
             )?;
             return self.engine.refuse_unclassified(request).map_err(failed);
         }
@@ -1136,6 +1160,7 @@ impl Gate {
             AuthorizationRequest::new(self.agent.clone(), self.authority.clone(), action)
                 .map_err(failed)?,
             path_check,
+            approval_id,
         )?;
         self.engine.evaluate(request).map_err(failed)
     }
@@ -1145,6 +1170,7 @@ impl Gate {
         &self,
         request: AuthorizationRequest<A>,
         path_check: Option<Value>,
+        approval_id: Option<&str>,
     ) -> Result<AuthorizationRequest<A>, GateError> {
         let mut request = request
             .with_context(MODE_CONTEXT_KEY, Value::String(self.mode.as_str().into()))
@@ -1154,6 +1180,9 @@ impl Gate {
             );
         if let Some(record) = path_check {
             request = request.with_context(PATH_CHECK_CONTEXT_KEY, record);
+        }
+        if let Some(id) = approval_id {
+            request = request.with_context(APPROVAL_CONTEXT_KEY, Value::String(id.to_owned()));
         }
         let now = OffsetDateTime::now_utc();
         request
@@ -1196,12 +1225,64 @@ pub const UNCLASSIFIED_TOOL_ACTION_TYPE: &str = "praetore-mcp unclassified tool 
 impl Evaluator for Gate {
     fn evaluate(&mut self, server: &str, params: &Value) -> Result<Verdict, GateError> {
         let evidence = self.evaluate_evidence(server, params)?;
-        let journaled = self.journal.append(&evidence);
-        Ok(verdict_from(&evidence, journaled))
+        if self.mode != Mode::Enforce
+            || evidence.decision.outcome != DecisionOutcome::RequireApproval
+        {
+            let journaled = self.journal.record(&evidence);
+            return Ok(verdict_from(&evidence, journaled));
+        }
+        let sign_forward = |approval_id: &str| {
+            self.evaluate_evidence_with(server, params, Some(approval_id))
+                .map_err(|error| error.to_string())
+        };
+        let journal = |evidence: &Evidence| self.journal.record(evidence);
+        use crate::approvals::HoldOrForward;
+        Ok(
+            match crate::approvals::on_require_approval(
+                &self.home,
+                server,
+                params,
+                &evidence,
+                &sign_forward,
+                &journal,
+            ) {
+                HoldOrForward::Forward {
+                    approval_id,
+                    evidence,
+                    journaled,
+                } => {
+                    let mut verdict = verdict_from(&evidence, Ok(journaled));
+                    verdict.consumed_approval = Some(approval_id);
+                    verdict
+                }
+                HoldOrForward::Hold { journaled, message } => {
+                    let mut verdict = verdict_from(&evidence, Ok(journaled));
+                    verdict.hold_message = Some(message);
+                    verdict
+                }
+                HoldOrForward::Failed {
+                    evidence,
+                    journaled,
+                    error,
+                } => {
+                    let ok = journaled.is_ok();
+                    let mut verdict = verdict_from(&evidence, journaled);
+                    // A receipt that is not journaled blocks the call on its
+                    // own; the proxy says so.
+                    if ok {
+                        verdict.hold_message = Some(format!(
+                            "This tool call was not executed. Local approval could not be recorded ({error}). Evidence id: {}",
+                            evidence.evidence_id
+                        ));
+                    }
+                    verdict
+                }
+            },
+        )
     }
 }
 
-pub fn verdict_from(evidence: &Evidence, journaled: Result<PathBuf, String>) -> Verdict {
+pub fn verdict_from(evidence: &Evidence, journaled: Result<PathBuf, JournalError>) -> Verdict {
     let outcome = evidence.decision.outcome;
     Verdict {
         unclassified: outcome == DecisionOutcome::Deny
@@ -1220,18 +1301,27 @@ pub fn verdict_from(evidence: &Evidence, journaled: Result<PathBuf, String>) -> 
             .collect(),
         reason: evidence.decision.reason.clone(),
         journaled,
+        consumed_approval: None,
+        hold_message: None,
     }
 }
 
 /// Hash-linked JSONL journal: `receipts/<UTC date>.jsonl`, one chained
 /// entry per line (see [`crate::journal`]), fsynced after each write.
+/// A short or failed write is truncated back to the previous length
+/// (`journal_io`), so the receipt is not persisted.
 pub struct Journal {
     dir: PathBuf,
+    /// `verify` on this journal's home, for the errors that send there.
+    verify: String,
 }
 
 impl Journal {
-    pub fn new(dir: PathBuf) -> Self {
-        Self { dir }
+    pub fn new(home: &Home) -> Self {
+        Self {
+            dir: home.receipts_dir(),
+            verify: crate::commands::command("verify", &home.root),
+        }
     }
 
     pub fn path_for(&self, now: OffsetDateTime) -> PathBuf {
@@ -1244,58 +1334,49 @@ impl Journal {
         ))
     }
 
-    pub fn append(&self, evidence: &Evidence) -> Result<PathBuf, String> {
+    /// Journals `evidence` as the next entry. The line is built and read
+    /// back ([`VerifiedLine`]) before anything is written.
+    pub fn record(&self, evidence: &Evidence) -> Result<PathBuf, JournalError> {
         #[cfg(test)]
         tests::JOURNAL_APPENDS.with(|appends| appends.set(appends.get() + 1));
-        let evidence_json = evidence
-            .to_json()
-            .map_err(|e| format!("cannot serialize evidence: {e}"))?;
-        store::ensure_dir(&self.dir, false)?;
+        let unavailable = JournalError::Unavailable;
+        store::ensure_dir(&self.dir, false).map_err(unavailable)?;
         // Held until the entry is on disk: the position read below must
         // still be the end of the journal when the line is written.
-        let _lock = crate::journal::JournalLock::acquire(&self.dir)?;
-        let (path, position) =
-            crate::journal::next_append(&self.dir, self.path_for(OffsetDateTime::now_utc()))?;
+        let _lock = crate::journal::JournalLock::acquire(&self.dir).map_err(unavailable)?;
+        let (path, position) = crate::journal::next_append(
+            &self.dir,
+            self.path_for(OffsetDateTime::now_utc()),
+            &self.verify,
+        )
+        .map_err(unavailable)?;
         if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
-            return Err(format!(
+            return Err(unavailable(format!(
                 "{} is a symlink; refusing to append",
-                path.display()
-            ));
+                path.shown()
+            )));
         }
-        let line = crate::journal::chained_line(&position, &evidence_json);
-        append_line(&path, line.as_bytes())
-            .map_err(|e| format!("cannot append to {}: {e}", path.display()))?;
+        let line = VerifiedLine::new(&position, evidence).map_err(JournalError::Unverifiable)?;
+        Self::append(&path, &line).map_err(unavailable)?;
         Ok(path)
+    }
+
+    /// Appends one line. The journal lock keeps concurrent wrappers (one
+    /// per server) from interleaving. The shared helper rolls a short or
+    /// failed write back to the previous length.
+    fn append(path: &Path, line: &VerifiedLine) -> Result<(), String> {
+        crate::journal_io::append_journal_file(path, line.as_bytes())
+            .map_err(|e| format!("cannot append to {}: {e}", path.shown()))
     }
 }
 
-fn append_line(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut options = fs::OpenOptions::new();
-    options.append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options
-            .mode(0o600)
-            .custom_flags(crate::journal::nofollow_flag());
-    }
-    // Creating the daily file adds an entry to the directory: fsync the
-    // directory too, or a crash could lose the file with its receipts.
-    let (mut file, created) = match options.open(path) {
-        Ok(file) => (file, false),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            (options.create_new(true).open(path)?, true)
-        }
-        Err(error) => return Err(error),
-    };
-    // One write per line; the journal lock keeps concurrent wrappers (one
-    // per server) from interleaving.
-    file.write_all(bytes)?;
-    file.sync_data()?;
-    if created && let Some(dir) = path.parent() {
-        crate::fsutil::sync_dir(dir)?;
-    }
-    Ok(())
+#[cfg(test)]
+pub(crate) fn seed_one_receipt(home: &Home) -> PathBuf {
+    let gate = Gate::load(home, Mode::Observe).unwrap();
+    let evidence = gate
+        .evaluate_evidence("s", &json!({"name": "echo", "arguments": {"n": 1}}))
+        .unwrap();
+    gate.journal.record(&evidence).unwrap()
 }
 
 #[cfg(test)]
@@ -1320,6 +1401,19 @@ mod tests {
             .with_action_class("safety:halt", ActionClass::Safety)
             .with_action_class("safety:stop_all", ActionClass::Safety);
         policy.id = policy_id.to_owned();
+        // `init` writes no rules (default deny); the control call needs one.
+        policy.rules.push(
+            praetore_core::PolicyRule::new(
+                "allow-read-file",
+                store::ACTION_TYPE,
+                praetore_core::PolicyEffect::Allow,
+            )
+            .with_capability(store::CAPABILITY)
+            .with_parameter_condition(praetore_core::PolicyCondition::exact(
+                "tool",
+                json!("read_file"),
+            )),
+        );
         fs::write(home.policy(), serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
         let receipts = home.receipts_dir();
         let _ = fs::remove_dir_all(&receipts);
@@ -1511,7 +1605,7 @@ mod tests {
 
         let same = |path: PathBuf| {
             let (check, resolved) = resolve_path(&text(&path));
-            assert_eq!(check, PathCheck::Same, "{}", path.display());
+            assert_eq!(check, PathCheck::Same, "{}", path.shown());
             assert_eq!(resolved.as_deref(), Some(text(&path).as_str()));
         };
         same(sandbox.join("file"));
@@ -1543,7 +1637,7 @@ mod tests {
                 resolve_path(&text(&path)),
                 (PathCheck::Unresolved, None),
                 "{}",
-                path.display()
+                path.shown()
             );
         }
     }
@@ -1793,7 +1887,7 @@ mod tests {
                 check(&path),
                 (UNRESOLVED_PATH.to_owned(), "ambiguous".to_owned()),
                 "{}",
-                path.display()
+                path.shown()
             );
         }
         for path in [
@@ -1806,7 +1900,7 @@ mod tests {
                 check(&path),
                 (text(&path), "same".to_owned()),
                 "{}",
-                path.display()
+                path.shown()
             );
         }
     }
@@ -2446,7 +2540,7 @@ mod tests {
     fn apfs_case_and_normalization_behaviour() {
         let (_temp, root) = canonical_tempdir();
         let mode = dir_insensitivity(&text(&root));
-        eprintln!("APFS: dir_insensitivity({}) = {mode:?}", root.display());
+        eprintln!("APFS: dir_insensitivity({}) = {mode:?}", root.shown());
         assert!(mode.normalization);
 
         // realpath(3) returns the stored spelling of existing entries.
@@ -2517,7 +2611,7 @@ mod tests {
     fn linux_case_sensitive_filesystems_do_not_fold() {
         let (_temp, root) = canonical_tempdir();
         let mode = dir_insensitivity(&text(&root));
-        eprintln!("linux: dir_insensitivity({}) = {mode:?}", root.display());
+        eprintln!("linux: dir_insensitivity({}) = {mode:?}", root.shown());
         let rules = prefixes(&[&text(&root.join("secret"))]);
         let keys = BTreeSet::from(["arguments.path".to_owned()]);
         let upper = text(&root.join("SECRET"));
@@ -2619,7 +2713,7 @@ mod tests {
                     for n in 0..10 {
                         let params = json!({"name": "echo", "arguments": {"w": writer, "n": n}});
                         let evidence = gate.evaluate_evidence("s", &params).unwrap();
-                        gate.journal.append(&evidence).unwrap();
+                        gate.journal.record(&evidence).unwrap();
                     }
                 })
             })
@@ -2643,23 +2737,126 @@ mod tests {
         assert!(crate::fsutil::sync_dir(&temp.path().join("missing")).is_err());
         // A new daily file is created and the directory synced with it.
         let path = temp.path().join("2026-01-01.jsonl");
-        append_line(&path, b"x\n").unwrap();
-        append_line(&path, b"y\n").unwrap();
+        crate::journal_io::append_journal_file(&path, b"x\n").unwrap();
+        crate::journal_io::append_journal_file(&path, b"y\n").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"x\ny\n");
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             // The daily file is opened with O_NOFOLLOW.
             let link = temp.path().join("2026-01-02.jsonl");
             std::os::unix::fs::symlink(&path, &link).unwrap();
-            assert!(append_line(&link, b"z\n").is_err());
+            assert!(crate::journal_io::append_journal_file(&link, b"z\n").is_err());
             assert_eq!(fs::read(&path).unwrap(), b"x\ny\n");
         }
     }
 
+    /// The writer reads a line back before writing it: a receipt that does
+    /// not pass its own integrity check when re-read is refused, nothing
+    /// reaches the file, and the next receipt is appended as usual.
+    #[test]
+    fn a_receipt_that_does_not_read_back_is_not_written() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = Home::new(temp.path().join("home"));
+        store::init(&home).unwrap();
+        let gate = Gate::load(&home, Mode::Observe).unwrap();
+        let params = json!({"name": "echo", "arguments": {"n": 1}});
+        let first = gate.evaluate_evidence("s", &params).unwrap();
+        let path = gate.journal.record(&first).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        // A receipt changed after it was signed cannot even be serialized.
+        let mut broken = gate.evaluate_evidence("s", &params).unwrap();
+        broken.decision.reason.push('!');
+        let error = gate.journal.record(&broken).unwrap_err();
+        assert!(matches!(error, JournalError::Unverifiable(_)), "{error:?}");
+        assert_eq!(fs::read(&path).unwrap(), before, "nothing was written");
+
+        // A float that prints as text which parses to another float: the
+        // receipt serializes, and only reading the line back finds it.
+        // Whether this f64 is one depends on how serde_json is built
+        // (without `float_roundtrip` it is), so ask the parser.
+        let float = 99.99999999999999_f64;
+        let drifts = serde_json::from_str::<f64>(&float.to_string()).unwrap() != float;
+        let evidence = gate
+            .evaluate_evidence("s", &json!({"name": "echo", "arguments": {"n": float}}))
+            .unwrap();
+        let recorded = gate.journal.record(&evidence);
+        if drifts {
+            assert!(
+                matches!(&recorded, Err(JournalError::Unverifiable(reason)) if reason.contains("EVIDENCE_FAIL")),
+                "{recorded:?}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), before, "nothing was written");
+        } else {
+            recorded.unwrap();
+            fs::write(&path, &before).unwrap();
+        }
+
+        let next = gate.evaluate_evidence("s", &params).unwrap();
+        gate.journal.record(&next).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 2);
+    }
+
+    /// The position a verified line computes for the entry after it is the
+    /// one the next append reads from the file.
+    #[test]
+    fn a_verified_line_knows_where_the_next_entry_goes() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = Home::new(temp.path().join("home"));
+        store::init(&home).unwrap();
+        let gate = Gate::load(&home, Mode::Observe).unwrap();
+        let evidence = gate
+            .evaluate_evidence("s", &json!({"name": "echo", "arguments": {"n": 1}}))
+            .unwrap();
+        let line = VerifiedLine::new(&crate::journal::Position::FIRST, &evidence).unwrap();
+        assert_eq!(*line.position(), crate::journal::Position::FIRST);
+        let path = gate.journal.record(&evidence).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), line.as_bytes());
+        let (_, position) =
+            crate::journal::next_append(&home.receipts_dir(), path.clone(), "verify").unwrap();
+        assert_eq!(position, *line.next());
+    }
+
     #[test]
     fn journal_file_name_is_utc_date() {
-        let journal = Journal::new(PathBuf::from("/r"));
+        let journal = Journal::new(&Home::new(PathBuf::from("/")));
         let at = OffsetDateTime::from_unix_timestamp(1_780_000_000).unwrap();
-        assert_eq!(journal.path_for(at), PathBuf::from("/r/2026-05-28.jsonl"));
+        assert_eq!(
+            journal.path_for(at),
+            PathBuf::from("/receipts/2026-05-28.jsonl")
+        );
+    }
+
+    /// A writer that stores 180 bytes of a 401-byte line and then stops.
+    /// The receipts file stays at its previous length and `verify` still passes.
+    #[test]
+    fn receipt_journal_short_write_keeps_previous_length() {
+        fail_receipt_append(
+            crate::journal_io::FaultMode::Short,
+            std::io::ErrorKind::StorageFull,
+        );
+    }
+
+    /// Same prefix, then `StorageFull` (ENOSPC) after the file has grown.
+    #[test]
+    fn receipt_journal_enospc_keeps_previous_length() {
+        fail_receipt_append(
+            crate::journal_io::FaultMode::StorageFull,
+            std::io::ErrorKind::StorageFull,
+        );
+    }
+
+    fn fail_receipt_append(mode: crate::journal_io::FaultMode, kind: std::io::ErrorKind) {
+        let (_temp, home) = crate::journal_io::temp_home();
+        let path = seed_one_receipt(&home);
+        let original = fs::read(&path).unwrap();
+        assert!(original.ends_with(b"\n"));
+        let mut writer =
+            crate::journal_io::FaultyFile::open(&path, crate::journal_io::PROBE_ROOM, mode)
+                .unwrap();
+        let error =
+            crate::journal_io::commit_journal_line(&mut writer, &crate::journal_io::line_of_401())
+                .unwrap_err();
+        crate::journal_io::assert_journal_intact(&home, &path, &original, &writer, &error, kind);
     }
 }

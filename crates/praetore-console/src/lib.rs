@@ -1,12 +1,34 @@
 //! Local operator console for a PRÆTORE journal.
 //!
 //! A separate surface from `praetore-observe`: loopback, a session file the
-//! page never shows, and receipts retold in plain language. It does not
-//! approve, dispatch, or export a compliance package.
+//! page never shows, and receipts retold in plain language (D1). With an
+//! approver configured it also shows the approvals inbox (D2): the console
+//! signs the operator's decision on this computer, as `praetore approve`
+//! does, and the gateway verifies, records and dispatches it. With a policy
+//! file and attester pins configured it also builds the compliance package
+//! (D3), read only: the tenant's signed journal, the policy and its digest,
+//! the pins, `SHA256SUMS` and instructions for a third party.
+//!
+//! The inbox requires that policy and those pins: a pending request is shown
+//! and offered only when its evidence is signed by one of the pins and
+//! records the local policy's digest. With pins, the history also checks the
+//! attester signature (not the current policy); without them it checks the
+//! integrity hash only.
 
+mod aprobador;
+mod bandeja;
+mod codigos;
+mod confianza;
 mod historia;
 mod lectura;
+mod paquete;
 mod sesion;
+#[cfg(test)]
+mod tests_bandeja;
+#[cfg(test)]
+mod tests_i18n;
+#[cfg(test)]
+mod tests_paquete;
 
 use axum::{
     Json, Router,
@@ -15,28 +37,120 @@ use axum::{
     http::{HeaderMap, HeaderValue, Request, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
+};
+use bandeja::{INBOX_LIMIT, PendingFacts, References};
+use codigos::{
+    AgentView, ApiMessage, MessageCode, Notice, Placeholder, ShownText, Situation, Story,
+    utc_instant,
 };
 use historia::{
     ListRequest, NOTICE, RawQuery, ReceiptFacts, agent_label, page_window, prepare_detail_query,
-    prepare_query, readable_time, situation, story, visible_target, visible_wanted,
+    prepare_query, situation, story, visible_target, visible_wanted,
 };
 use serde::Serialize;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use uuid::Uuid;
 
+pub use aprobador::{
+    ActOutcome, ApprovalGateway, ApproverConfigError, ApproverSigner, GatewayReply,
+    HttpApprovalGateway, parse_gateway_address, read_token_file,
+};
+pub use bandeja::{PendingKind, PendingRef};
+pub use confianza::{EvidenceTrust, PINS_VARIABLE, POLICY_VARIABLE, TrustError, require_for_inbox};
 pub use historia::{NamesError, parse_agent_names};
 pub use lectura::PostgresHistory;
+pub use paquete::{
+    CompliancePack, JournalExportStore, MAX_ATTESTER_PINS, PACK_DIR, PACK_FILENAME,
+    PackConfigError, PackError, PackSettings,
+};
 pub use sesion::LocalSession;
 
 const INDEX_HTML: &str = include_str!("../ui/index.html");
 const APP_JS: &str = include_str!("../ui/app.js");
+const I18N_JS: &str = include_str!("../ui/i18n.js");
+const HORA_JS: &str = include_str!("../ui/hora.js");
 const APP_CSS: &str = include_str!("../ui/styles.css");
+
+/// The page's catalogs, one per language it offers. Presentation only:
+/// nothing the console signs, records or exports reads them.
+const CATALOGS: [(&str, &str); 3] = [
+    ("es", include_str!("../ui/i18n/es.json")),
+    ("en", include_str!("../ui/i18n/en.json")),
+    ("pt", include_str!("../ui/i18n/pt.json")),
+];
 
 pub struct ConsoleState {
     store: Arc<dyn HistoryStore>,
     session: LocalSession,
     names: HashMap<Uuid, String>,
+    inbox: Option<Inbox>,
+    /// D3. Present only with a policy file and attester pins.
+    pack: Option<Arc<CompliancePack>>,
+    /// One package is built at a time: each holds the shared database
+    /// client for the whole export.
+    pack_gate: Arc<tokio::sync::Semaphore>,
+    /// The instant a package is built at: the wall clock, except in tests
+    /// that need two downloads built at the same second.
+    pack_clock: Arc<dyn Fn() -> time::OffsetDateTime + Send + Sync>,
+    address: SocketAddr,
+    /// `Host` values the console answers to (DNS rebinding).
+    hosts: Vec<String>,
+    /// `http://host:port` values a mutating request may come from.
+    origins: Vec<String>,
+    /// Code of the opening link printed in the terminal: single use, five
+    /// minutes at most. It travels in the URL fragment and is redeemed once
+    /// for a session token (see `open_session`).
+    opener: sesion::Opener,
+    /// Where opening links go: the console's stderr by default.
+    printer: Arc<dyn Fn(&str) + Send + Sync>,
+}
+
+const DEFAULT_ADDRESS: &str = "127.0.0.1:8090";
+
+/// D2. Present only when the console has an approver key, its gateway token
+/// and the gateway address.
+pub struct Inbox {
+    store: Arc<dyn InboxStore>,
+    gateway: Arc<dyn ApprovalGateway>,
+    signer: Arc<ApproverSigner>,
+    /// Attester pins and local policy: checked when listing and again just
+    /// before signing.
+    trust: EvidenceTrust,
+    references: References,
+}
+
+impl Inbox {
+    pub fn new(
+        store: Arc<dyn InboxStore>,
+        gateway: Arc<dyn ApprovalGateway>,
+        signer: ApproverSigner,
+        trust: EvidenceTrust,
+    ) -> Self {
+        Self {
+            store,
+            gateway,
+            signer: Arc::new(signer),
+            trust,
+            references: References::default(),
+        }
+    }
+}
+
+pub trait InboxStore: Send + Sync + 'static {
+    /// Pending requests whose evidence `trust` admits; the others are only
+    /// counted in `unreadable`.
+    fn pending(&self, trust: &EvidenceTrust) -> Result<InboxPage, HistoryError>;
+}
+
+pub struct InboxPage {
+    pub items: Vec<PendingFacts>,
+    /// Pending rows whose receipt does not check out (integrity, attester
+    /// pins or local policy). Never offered.
+    pub unreadable: u32,
+    /// More rows wait than one read returns.
+    pub truncated: bool,
+    pub agents: Vec<Uuid>,
 }
 
 impl std::fmt::Debug for ConsoleState {
@@ -90,11 +204,88 @@ impl ConsoleState {
         session: LocalSession,
         names: HashMap<Uuid, String>,
     ) -> Self {
-        Self {
+        let mut state = Self {
             store,
             session,
             names,
+            inbox: None,
+            pack: None,
+            pack_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            pack_clock: Arc::new(time::OffsetDateTime::now_utc),
+            address: DEFAULT_ADDRESS.parse().expect("fixed address"),
+            hosts: Vec::new(),
+            origins: Vec::new(),
+            opener: sesion::Opener::new(sesion::MAX_OPENING_TTL),
+            printer: Arc::new(|link: &str| {
+                eprintln!(
+                    "Abre la consola en este computador con este enlace (vale una vez, 5 minutos):\n  {link}"
+                );
+            }),
+        };
+        state.set_address(state.address);
+        state
+    }
+
+    /// The console's own address: the page and its actions are answered
+    /// only under it (and `localhost` on the same port for 127.0.0.1).
+    pub fn with_address(mut self, address: SocketAddr) -> Self {
+        self.set_address(address);
+        self
+    }
+
+    fn set_address(&mut self, address: SocketAddr) {
+        self.address = address;
+        self.hosts = vec![address.to_string()];
+        if address.ip() == std::net::IpAddr::from([127, 0, 0, 1]) {
+            self.hosts.push(format!("localhost:{}", address.port()));
         }
+        self.origins = self
+            .hosts
+            .iter()
+            .map(|host| format!("http://{host}"))
+            .collect();
+    }
+
+    /// At most five minutes; shorter in tests.
+    pub fn with_opening_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.opener = sesion::Opener::new(ttl);
+        self
+    }
+
+    /// Where opening links are written. Default: stderr, which under systemd
+    /// ends up in the journal.
+    pub fn with_link_printer(mut self, printer: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        self.printer = Arc::new(printer);
+        self
+    }
+
+    /// Issues a new single-use opening link, writes it to the printer and
+    /// returns it. Any earlier link stops working.
+    pub fn issue_opening_link(&self) -> Option<String> {
+        let link = self.link_for(self.opener.issue()?);
+        (self.printer)(&link);
+        Some(link)
+    }
+
+    fn link_for(&self, code: String) -> String {
+        format!("http://{}/#abrir={code}", self.address)
+    }
+
+    pub fn with_inbox(mut self, inbox: Inbox) -> Self {
+        self.inbox = Some(inbox);
+        self
+    }
+
+    pub fn with_compliance_pack(mut self, pack: CompliancePack) -> Self {
+        self.pack = Some(Arc::new(pack));
+        self
+    }
+
+    /// Builds every package at `at` instead of the wall clock.
+    #[cfg(test)]
+    pub(crate) fn with_pack_clock(mut self, at: time::OffsetDateTime) -> Self {
+        self.pack_clock = Arc::new(move || at);
+        self
     }
 
     pub fn router(self) -> Router {
@@ -106,15 +297,32 @@ impl ConsoleState {
         let api = Router::new()
             .route("/historial", get(list_receipts))
             .route("/historial/{numero}", get(receipt_detail))
+            .route("/bandeja", get(list_inbox))
+            .route("/bandeja/{referencia}/aprobar", post(approve))
+            .route("/bandeja/{referencia}/rechazar", post(reject))
+            .route("/bandeja/{referencia}/ejecutar", post(execute))
+            .route("/paquete", get(download_pack))
+            .route("/paquete/estado", get(pack_status))
             .route_layer(middleware::from_fn_with_state(
                 Arc::clone(&state),
                 require_session,
             ));
+        // Redeeming the opening code mints the session token; it must run
+        // without a token (it is how the page gets one), so it sits outside
+        // the require_session layer but still under require_own_host.
+        let open = Router::new().route("/sesion", post(open_session));
         Router::new()
             .route("/", get(index))
             .route("/app.js", get(app_js))
+            .route("/i18n.js", get(i18n_js))
+            .route("/hora.js", get(hora_js))
+            .route("/i18n/{archivo}", get(catalog))
             .route("/styles.css", get(app_css))
-            .nest("/api", api)
+            .nest("/api", api.merge(open))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                require_own_host,
+            ))
             .with_state(state)
     }
 }
@@ -124,18 +332,58 @@ async fn require_session(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let cookie = request
+    let authorization = request
         .headers()
-        .get(header::COOKIE)
+        .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    if state.session.accepts(cookie) {
+    if !state.session.accepts(authorization) {
+        return api_message(StatusCode::UNAUTHORIZED, MessageCode::SessionRequired);
+    }
+    next.run(request).await
+}
+
+/// Refuses a request whose `Host` is not the console's own address: a page
+/// whose name was re-pointed at 127.0.0.1 (DNS rebinding) reads nothing.
+async fn require_own_host(
+    State(state): State<Arc<ConsoleState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let mut values = request.headers().get_all(header::HOST).iter();
+    let host = match (values.next(), values.next()) {
+        (Some(value), None) => value.to_str().ok(),
+        _ => None,
+    };
+    if host.is_some_and(|host| state.hosts.iter().any(|own| own == host)) {
         next.run(request).await
     } else {
-        api_message(
-            StatusCode::UNAUTHORIZED,
-            "Hay que abrir esta página en este computador.",
-        )
+        api_message(StatusCode::MISDIRECTED_REQUEST, MessageCode::WrongHost)
     }
+}
+
+/// Header the console page sends on every action. A page from another
+/// origin cannot add it without a preflight the console never answers.
+pub const ACTION_HEADER: &str = "x-praetore-consola";
+
+/// A mutation must come from the console's own page: exact `Origin`, the
+/// action header, and, when the browser sends it, `Sec-Fetch-Site:
+/// same-origin`. This runs on top of the session token (`require_session`).
+fn same_page(state: &ConsoleState, headers: &HeaderMap) -> bool {
+    let single = |name: &str| {
+        let mut values = headers.get_all(name).iter();
+        match (values.next(), values.next()) {
+            (Some(value), None) => value.to_str().ok(),
+            _ => None,
+        }
+    };
+    let origin_ok = single(header::ORIGIN.as_str())
+        .is_some_and(|origin| state.origins.iter().any(|allowed| allowed == origin));
+    let marker_ok = single(ACTION_HEADER) == Some("1");
+    let fetch_site_ok = match headers.get("sec-fetch-site") {
+        None => true,
+        Some(value) => value.as_bytes() == b"same-origin",
+    };
+    origin_ok && marker_ok && fetch_site_ok
 }
 
 async fn list_receipts(
@@ -198,21 +446,268 @@ async fn receipt_detail(
         Err(error) => return storage_error(error),
     };
     let Some(facts) = page.receipts.first() else {
-        return api_message(StatusCode::NOT_FOUND, "Ese recibo no está.");
+        return api_message(StatusCode::NOT_FOUND, MessageCode::ReceiptGone);
     };
     api_json(
         StatusCode::OK,
         DetailView {
             aviso: NOTICE,
-            cuando: readable_time(facts.created_at),
-            actualizado: readable_time(facts.updated_at),
+            cuando_utc: utc_instant(facts.created_at),
+            actualizado_utc: utc_instant(facts.updated_at),
             agente: agent_label(facts.agent_id, &state.names, &page.agents),
             queria: visible_wanted(facts),
             sobre: visible_target(facts),
-            situacion: situation(facts).phrase(),
+            situacion: situation(facts),
             relato: story(facts),
         },
     )
+}
+
+const INBOX_OFF: MessageCode = MessageCode::InboxOff;
+const INBOX_NOTICE: Notice = Notice::InboxHowItWorks;
+
+async fn list_inbox(State(state): State<Arc<ConsoleState>>) -> Response {
+    let Some(inbox) = &state.inbox else {
+        return api_message(StatusCode::SERVICE_UNAVAILABLE, INBOX_OFF);
+    };
+    let store = Arc::clone(&inbox.store);
+    let trust = inbox.trust.clone();
+    let page = match tokio::task::spawn_blocking(move || store.pending(&trust)).await {
+        Ok(Ok(page)) => page,
+        Ok(Err(error)) => return storage_error(error),
+        Err(_) => return storage_error(HistoryError::Unavailable),
+    };
+    let now = time::OffsetDateTime::now_utc();
+    let mut solicitudes = Vec::with_capacity(page.items.len());
+    let mut vencidas = 0u32;
+    for facts in &page.items {
+        // A window that closed is not offered: the gateway would refuse it,
+        // and it records the expiry when it next sees the request.
+        if facts.expires_at <= now {
+            vencidas += 1;
+            continue;
+        }
+        let awaiting = facts.kind == PendingKind::AwaitingApproval;
+        let Some(referencia) = inbox.references.reference_for(facts) else {
+            return storage_error(HistoryError::Unavailable);
+        };
+        solicitudes.push(InboxItemView {
+            referencia,
+            situacion: facts.kind.situation(),
+            pedida_utc: utc_instant(facts.created_at),
+            agente: agent_label(facts.key.agent_id, &state.names, &page.agents),
+            queria: if facts.wanted.is_empty() {
+                ShownText::placeholder(Placeholder::NotShown)
+            } else {
+                ShownText::text(historia::quoted_text(&facts.wanted))
+            },
+            sobre: facts.target.as_deref().map_or_else(
+                || ShownText::placeholder(Placeholder::NoTarget),
+                |target| ShownText::text(historia::quoted_text(target)),
+            ),
+            // The page counts the time left from this and its own clock:
+            // informational only, the gateway decides with its clock.
+            vale_hasta_utc: utc_instant(facts.expires_at),
+            parametros: facts
+                .parameters
+                .iter()
+                .flatten()
+                .map(|parameter| match &parameter.value {
+                    bandeja::ParameterValue::Text(valor) => ParameterView {
+                        clave: parameter.key.clone(),
+                        valor: Some(valor.clone()),
+                        lista: None,
+                    },
+                    bandeja::ParameterValue::List(lista) => ParameterView {
+                        clave: parameter.key.clone(),
+                        valor: None,
+                        lista: Some(lista.clone()),
+                    },
+                })
+                .collect(),
+            parametros_visibles: facts.parameters.is_some(),
+            puede_aprobar: awaiting && facts.parameters.is_some(),
+            puede_rechazar: awaiting,
+            puede_ejecutar: facts.kind == PendingKind::ApprovedPendingExecution,
+            nota: (awaiting && facts.parameters.is_none())
+                .then_some(ApiMessage::new(PARAMETERS_TOO_BIG)),
+        });
+    }
+    api_json(
+        StatusCode::OK,
+        InboxView {
+            aviso: INBOX_NOTICE,
+            solicitudes,
+            vencidas,
+            ilegibles: page.unreadable,
+            hay_mas: page.truncated,
+            limite: INBOX_LIMIT,
+        },
+    )
+}
+
+const PACK_OFF: MessageCode = MessageCode::PackOff;
+
+/// D3: read only. Asked for by the console's own page (the action header,
+/// and `Sec-Fetch-Site: same-origin` when the browser sends it), so another
+/// local page cannot make the console build packages. The package is built
+/// whole in memory; on any failure the page gets a plain message and no
+/// file.
+async fn download_pack(State(state): State<Arc<ConsoleState>>, headers: HeaderMap) -> Response {
+    if !same_page_read(&headers) {
+        return api_message(StatusCode::FORBIDDEN, MessageCode::PackPageOnly);
+    }
+    let Some(pack) = state.pack.clone() else {
+        return api_message(StatusCode::SERVICE_UNAVAILABLE, PACK_OFF);
+    };
+    let Ok(permit) = Arc::clone(&state.pack_gate).try_acquire_owned() else {
+        return api_message(StatusCode::TOO_MANY_REQUESTS, PackError::Busy.api_message());
+    };
+    let signer = state.inbox.as_ref().map(|inbox| Arc::clone(&inbox.signer));
+    let now = (state.pack_clock)();
+    let built = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        paquete::generate(&pack, signer.as_deref(), now)
+    })
+    .await;
+    let bytes = match built {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(error)) => return api_message(StatusCode::SERVICE_UNAVAILABLE, error.api_message()),
+        Err(_) => {
+            return api_message(
+                StatusCode::SERVICE_UNAVAILABLE,
+                PackError::Archive.api_message(),
+            );
+        }
+    };
+    let mut response = (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/gzip".to_owned()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{PACK_FILENAME}\""),
+            ),
+        ],
+        bytes,
+    )
+        .into_response();
+    set_security_headers(response.headers_mut());
+    response
+}
+
+/// Whether the page should offer the package at all.
+async fn pack_status(State(state): State<Arc<ConsoleState>>) -> Response {
+    #[derive(Serialize)]
+    struct PackStatus {
+        configurado: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mensaje: Option<ApiMessage>,
+    }
+    let configurado = state.pack.is_some();
+    api_json(
+        StatusCode::OK,
+        PackStatus {
+            configurado,
+            mensaje: (!configurado).then_some(ApiMessage::new(PACK_OFF)),
+        },
+    )
+}
+
+/// A read the page asks for with `fetch`: same-origin GETs carry no
+/// `Origin`, so only the action header and `Sec-Fetch-Site` are checked.
+fn same_page_read(headers: &HeaderMap) -> bool {
+    let mut values = headers.get_all(ACTION_HEADER).iter();
+    let marker_ok =
+        matches!((values.next(), values.next()), (Some(value), None) if value.as_bytes() == b"1");
+    let fetch_site_ok = match headers.get("sec-fetch-site") {
+        None => true,
+        Some(value) => value.as_bytes() == b"same-origin",
+    };
+    marker_ok && fetch_site_ok
+}
+
+async fn approve(
+    state: State<Arc<ConsoleState>>,
+    headers: HeaderMap,
+    referencia: Path<String>,
+) -> Response {
+    let what = Act::Decide(praetore_gateway::HumanApprovalOutcome::Approve);
+    act(state, headers, referencia, what).await
+}
+
+async fn reject(
+    state: State<Arc<ConsoleState>>,
+    headers: HeaderMap,
+    referencia: Path<String>,
+) -> Response {
+    let what = Act::Decide(praetore_gateway::HumanApprovalOutcome::Reject);
+    act(state, headers, referencia, what).await
+}
+
+async fn execute(
+    state: State<Arc<ConsoleState>>,
+    headers: HeaderMap,
+    referencia: Path<String>,
+) -> Response {
+    act(state, headers, referencia, Act::Dispatch).await
+}
+
+#[derive(Clone, Copy)]
+enum Act {
+    Decide(praetore_gateway::HumanApprovalOutcome),
+    Dispatch,
+}
+
+async fn act(
+    State(state): State<Arc<ConsoleState>>,
+    headers: HeaderMap,
+    Path(referencia): Path<String>,
+    what: Act,
+) -> Response {
+    let Some(inbox) = &state.inbox else {
+        return api_message(StatusCode::SERVICE_UNAVAILABLE, INBOX_OFF);
+    };
+    if !same_page(&state, &headers) {
+        return api_message(StatusCode::FORBIDDEN, MessageCode::ActionPageOnly);
+    }
+    let Some(pending) = inbox.references.resolve(&referencia) else {
+        return api_message(StatusCode::NOT_FOUND, MessageCode::RequestGone);
+    };
+    if matches!(
+        what,
+        Act::Decide(praetore_gateway::HumanApprovalOutcome::Approve)
+    ) && !pending.approvable
+    {
+        return api_json(
+            StatusCode::OK,
+            ActOutcome {
+                situacion: codigos::OutcomeState::Unchanged,
+                mensaje: ApiMessage::new(PARAMETERS_TOO_BIG),
+                puede_ejecutar: false,
+            },
+        );
+    }
+    let gateway = Arc::clone(&inbox.gateway);
+    let signer = Arc::clone(&inbox.signer);
+    let trust = inbox.trust.clone();
+    let result = tokio::task::spawn_blocking(move || match what {
+        Act::Decide(outcome) => {
+            aprobador::decide(gateway.as_ref(), &signer, &trust, &pending, outcome)
+        }
+        Act::Dispatch => aprobador::dispatch(gateway.as_ref(), &pending),
+    })
+    .await;
+    match result {
+        Ok(outcome) => api_json(StatusCode::OK, outcome),
+        Err(_) => {
+            tracing::error!(failure = "gateway_worker", "console action failed");
+            api_message(
+                StatusCode::SERVICE_UNAVAILABLE,
+                MessageCode::OutcomeUnknownCheckHistory,
+            )
+        }
+    }
 }
 
 async fn read_page(
@@ -237,16 +732,16 @@ fn receipt_view(
 ) -> ReceiptView {
     ReceiptView {
         abrir,
-        cuando: readable_time(facts.created_at),
+        cuando_utc: utc_instant(facts.created_at),
         agente: agent_label(facts.agent_id, names, agents),
         queria: visible_wanted(facts),
         sobre: visible_target(facts),
-        situacion: situation(facts).phrase(),
+        situacion: situation(facts),
     }
 }
 
 fn bad_query() -> Response {
-    api_message(StatusCode::BAD_REQUEST, "Esa consulta no se entiende.")
+    api_message(StatusCode::BAD_REQUEST, MessageCode::BadQuery)
 }
 
 fn storage_error(error: HistoryError) -> Response {
@@ -259,20 +754,84 @@ fn storage_error(error: HistoryError) -> Response {
     );
     api_message(
         StatusCode::SERVICE_UNAVAILABLE,
-        "No se pudo leer el registro.",
+        MessageCode::JournalUnreadable,
     )
 }
 
-async fn index(State(state): State<Arc<ConsoleState>>) -> Response {
-    let mut response = static_response(StatusCode::OK, "text/html; charset=utf-8", INDEX_HTML);
-    if let Ok(cookie) = HeaderValue::from_str(&state.session.cookie_header()) {
-        response.headers_mut().insert(header::SET_COOKIE, cookie);
+/// The page holds no secret. The opening code travels in the URL fragment
+/// (`#abrir=`), which the browser never sends to the server; the page reads
+/// it and redeems it over `POST /api/sesion`. Asking for the page never
+/// issues a link: only the operator does (see `issue_opening_link`).
+async fn index() -> Response {
+    static_response(StatusCode::OK, "text/html; charset=utf-8", INDEX_HTML)
+}
+
+#[derive(serde::Deserialize)]
+struct OpenRequest {
+    codigo: String,
+}
+
+#[derive(Serialize)]
+struct OpenReply {
+    token: String,
+}
+
+/// Redeems the single-use opening code and mints the session token, returned
+/// once in the body for the page to keep in `sessionStorage`. No cookie is
+/// set. It must come from the console's own page (`Origin`, the action
+/// header, and `Sec-Fetch-Site` when the browser sends it).
+async fn open_session(
+    State(state): State<Arc<ConsoleState>>,
+    headers: HeaderMap,
+    payload: Result<Json<OpenRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if !same_page(&state, &headers) {
+        return api_message(StatusCode::FORBIDDEN, MessageCode::OpeningPageOnly);
     }
-    response
+    let Ok(Json(payload)) = payload else {
+        return api_message(StatusCode::BAD_REQUEST, MessageCode::OpeningUnreadable);
+    };
+    if payload.codigo.len() > 128 || !state.opener.redeem(&payload.codigo) {
+        tracing::warn!(failure = "opening_code", "console opening link refused");
+        return api_message(StatusCode::UNAUTHORIZED, MessageCode::OpeningRefused);
+    }
+    let Some(token) = state.session.issue() else {
+        return api_message(
+            StatusCode::SERVICE_UNAVAILABLE,
+            MessageCode::SessionUnavailable,
+        );
+    };
+    api_json(StatusCode::OK, OpenReply { token })
 }
 
 async fn app_js() -> Response {
     static_response(StatusCode::OK, "text/javascript; charset=utf-8", APP_JS)
+}
+
+async fn i18n_js() -> Response {
+    static_response(StatusCode::OK, "text/javascript; charset=utf-8", I18N_JS)
+}
+
+async fn hora_js() -> Response {
+    static_response(StatusCode::OK, "text/javascript; charset=utf-8", HORA_JS)
+}
+
+/// `GET /i18n/{es,en,pt}.json`: one of the embedded catalogs, with the same
+/// headers as the scripts. The name is only compared with the fixed list;
+/// it never becomes a file path. Anything else is 404.
+async fn catalog(Path(archivo): Path<String>) -> Response {
+    match catalog_for(&archivo) {
+        Some(body) => static_response(StatusCode::OK, "application/json; charset=utf-8", body),
+        None => static_response(StatusCode::NOT_FOUND, "text/plain; charset=utf-8", ""),
+    }
+}
+
+fn catalog_for(archivo: &str) -> Option<&'static str> {
+    let language = archivo.strip_suffix(".json")?;
+    CATALOGS
+        .iter()
+        .find(|(code, _)| *code == language)
+        .map(|(_, body)| *body)
 }
 
 async fn app_css() -> Response {
@@ -291,18 +850,23 @@ fn api_json<T: Serialize>(status: StatusCode, body: T) -> Response {
     response
 }
 
-fn api_message(status: StatusCode, mensaje: &'static str) -> Response {
-    api_json(status, Message { mensaje })
+fn api_message(status: StatusCode, mensaje: impl Into<ApiMessage>) -> Response {
+    api_json(
+        status,
+        Message {
+            mensaje: mensaje.into(),
+        },
+    )
 }
 
 #[derive(Serialize)]
 struct Message {
-    mensaje: &'static str,
+    mensaje: ApiMessage,
 }
 
 #[derive(Serialize)]
 struct ListView {
-    aviso: &'static str,
+    aviso: Notice,
     total: i64,
     pagina: u32,
     paginas: u32,
@@ -312,30 +876,81 @@ struct ListView {
 #[derive(Serialize)]
 struct ReceiptView {
     abrir: u64,
-    cuando: String,
-    agente: String,
-    queria: String,
-    sobre: String,
-    situacion: &'static str,
+    cuando_utc: String,
+    agente: AgentView,
+    queria: ShownText,
+    sobre: ShownText,
+    situacion: Situation,
 }
 
 #[derive(Serialize)]
 struct DetailView {
-    aviso: &'static str,
-    cuando: String,
-    actualizado: String,
-    agente: String,
-    queria: String,
-    sobre: String,
-    situacion: &'static str,
-    relato: &'static str,
+    aviso: Notice,
+    cuando_utc: String,
+    actualizado_utc: String,
+    agente: AgentView,
+    queria: ShownText,
+    sobre: ShownText,
+    situacion: Situation,
+    relato: Story,
 }
+
+#[derive(Serialize)]
+struct InboxView {
+    aviso: Notice,
+    solicitudes: Vec<InboxItemView>,
+    /// Pending in the journal, window already closed: not offered.
+    vencidas: u32,
+    /// Pending in the journal, receipt does not check out: not offered.
+    ilegibles: u32,
+    /// Older requests wait beyond what one read shows.
+    hay_mas: bool,
+    /// How many requests one read shows.
+    limite: u32,
+}
+
+#[derive(Serialize)]
+struct InboxItemView {
+    referencia: String,
+    situacion: Situation,
+    pedida_utc: String,
+    agente: AgentView,
+    queria: ShownText,
+    sobre: ShownText,
+    vale_hasta_utc: String,
+    /// `clave: valor` lines, keys sorted. Empty with `parametros_visibles`
+    /// false when they do not fit the inbox.
+    parametros: Vec<ParameterView>,
+    parametros_visibles: bool,
+    puede_aprobar: bool,
+    puede_rechazar: bool,
+    puede_ejecutar: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nota: Option<ApiMessage>,
+}
+
+#[derive(Serialize)]
+struct ParameterView {
+    clave: String,
+    /// A text (quoted), a number, `sí`/`no`, `(nulo)` or `(objeto vacío)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    valor: Option<String>,
+    /// A list, each element apart (possibly empty).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lista: Option<Vec<String>>,
+}
+
+const PARAMETERS_TOO_BIG: MessageCode = MessageCode::ParametersNotShown;
 
 fn set_security_headers(headers: &mut HeaderMap) {
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
     );
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
@@ -428,10 +1043,11 @@ mod tests {
 
     fn authed(uri: &str) -> Request<Body> {
         Request::builder()
+            .header(header::HOST, "127.0.0.1:8090")
             .uri(uri)
             .header(
-                header::COOKIE,
-                format!("{}={}", sesion::COOKIE_NAME, hex::encode([0x11; 32])),
+                header::AUTHORIZATION,
+                format!("Bearer {}", hex::encode([0x11; 32])),
             )
             .body(Body::empty())
             .unwrap()
@@ -489,42 +1105,129 @@ mod tests {
         assert!(validate_bind_address("0.0.0.0:8090".parse().unwrap()).is_err());
     }
 
+    fn open_request(code: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .header(header::HOST, "127.0.0.1:8090")
+            .header(header::ORIGIN, "http://127.0.0.1:8090")
+            .header(ACTION_HEADER, "1")
+            .header(header::CONTENT_TYPE, "application/json")
+            .uri("/api/sesion")
+            .body(Body::from(format!("{{\"codigo\":\"{code}\"}}")))
+            .unwrap()
+    }
+
     #[tokio::test]
-    async fn the_page_does_not_ask_for_a_token_and_sets_a_local_cookie() {
-        let (app, _) = app(Vec::new());
-        let response = app
+    async fn the_page_hands_out_a_token_from_the_hash_link_only_once() {
+        let printed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = printed.clone();
+        let state = ConsoleState::new(
+            Arc::new(MemoryHistory {
+                receipts: Vec::new(),
+                reads: AtomicUsize::new(0),
+            }),
+            LocalSession::random().unwrap(),
+            HashMap::new(),
+        )
+        .with_link_printer(move |link| sink.lock().unwrap().push(link.to_owned()));
+        let link = state.issue_opening_link().unwrap();
+        assert_eq!(*printed.lock().unwrap(), vec![link.clone()]);
+        // The code travels in the URL fragment, never the query string.
+        let code = link.split_once("/#abrir=").unwrap().1.to_owned();
+        assert!(link.starts_with("http://127.0.0.1:8090/#abrir="));
+        assert!(!link.contains("?abrir="));
+        assert!(Uuid::parse_str(&code).is_err());
+        assert!(!code.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let app = state.router();
+        let page = |uri: String| {
+            Request::builder()
+                .header(header::HOST, "127.0.0.1:8090")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap()
+        };
+        // Asking for the page never sets a cookie: there is no session cookie.
+        for uri in ["/".to_owned(), "/?abrir=otro".to_owned()] {
+            let plain = app.clone().oneshot(page(uri.clone())).await.unwrap();
+            assert_eq!(plain.status(), StatusCode::OK, "{uri}");
+            assert!(plain.headers().get(header::SET_COOKIE).is_none(), "{uri}");
+        }
+        // A wrong code is refused and no token comes back.
+        let wrong = app
             .clone()
-            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .oneshot(open_request(&format!("{code}x")))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let cookie = response
-            .headers()
-            .get(header::SET_COOKIE)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_owned();
-        assert!(cookie.contains("HttpOnly"));
-        assert!(cookie.contains("SameSite=Strict"));
-        let secret = hex::encode([0x11; 32]);
-        assert!(cookie.contains(&secret));
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+        // Redeeming the real code once mints a token; no cookie is set.
+        let opened = app.clone().oneshot(open_request(&code)).await.unwrap();
+        assert_eq!(opened.status(), StatusCode::OK);
+        assert!(opened.headers().get(header::SET_COOKIE).is_none());
+        let body: Value = serde_json::from_str(&body_text(opened).await).unwrap();
+        let token = body["token"].as_str().unwrap().to_owned();
+        assert_eq!(token.len(), 64);
+        // The token works for a read.
+        let read = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .header(header::HOST, "127.0.0.1:8090")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .uri("/api/historial")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.status(), StatusCode::OK);
+        // The code is single use: a second redemption yields nothing.
+        let again = app.clone().oneshot(open_request(&code)).await.unwrap();
+        assert_eq!(again.status(), StatusCode::UNAUTHORIZED);
+        let response = app.clone().oneshot(page("/".to_owned())).await.unwrap();
         let html = body_text(response).await;
-        assert!(!html.contains(&secret));
-        assert!(html.contains("Historial"));
-        assert!(html.contains(NOTICE));
-        assert!(html.contains("pendiente de aprobación"));
-        assert!(html.contains("aprobado, pendiente de ejecución"));
+        assert!(!html.contains(&token));
+        // Spanish stays the page's initial text, so it reads even without a
+        // catalog; each text carries its key.
+        let es = crate::tests_i18n::es;
+        assert!(html.contains(&format!(">{}</h2>", es("history.title"))));
+        assert!(html.contains(&format!(">{}</h1>", es("inbox.title"))));
+        assert!(html.contains(&es("notice.receipt_not_authorization")));
+        assert!(html.contains("<html lang=\"es\">"));
+        // The filter sends codes; the option shows the words.
+        for situation in [
+            Situation::AwaitingApproval,
+            Situation::ApprovedPendingExecution,
+        ] {
+            let code = situation.code();
+            assert!(
+                html.contains(&format!(
+                    "<option value=\"{code}\" data-i18n=\"situation.{code}\">{}</option>",
+                    es(&format!("situation.{code}"))
+                )),
+                "{code}"
+            );
+        }
+        // The language selector, each name in its own language.
+        for option in [
+            "<option value=\"es\" lang=\"es\">Español</option>",
+            "<option value=\"en\" lang=\"en\">English</option>",
+            "<option value=\"pt\" lang=\"pt-BR\">Português</option>",
+        ] {
+            assert!(html.contains(option), "{option}");
+        }
+        assert!(html.contains("<script type=\"module\" src=\"app.js\"></script>"));
+        assert!(!html.contains("<script>"));
         assert!(!html.to_lowercase().contains("bearer"));
         assert!(!html.contains("password"));
         assert!(!html.contains("RFC"));
         assert!(!html.contains("UUID"));
-        assert!(!html.contains("awaiting_approval"));
-        assert!(!html.to_lowercase().contains("aprobar"));
-        assert!(!html.contains("descargar"));
+        // The only download is D3's compliance package.
+        assert_eq!(html.matches("<button").count(), 5, "{html}");
+        assert!(html.contains(">Descargar paquete de compliance</button>"));
         let script = app
             .oneshot(
                 Request::builder()
+                    .header(header::HOST, "127.0.0.1:8090")
                     .uri("/app.js")
                     .body(Body::empty())
                     .unwrap(),
@@ -532,27 +1235,315 @@ mod tests {
             .await
             .unwrap();
         let script = body_text(script).await;
-        assert!(!script.contains("innerHTML"));
-        assert!(!script.contains("POST"));
-        assert!(!script.contains(&secret));
-        assert!(!script.contains(sesion::COOKIE_NAME));
+        assert!(script.contains(ACTION_HEADER));
+        // The token is kept in sessionStorage (per-origin, port included),
+        // sent as Authorization, never in localStorage or a cookie.
+        assert!(script.contains("sessionStorage"));
+        assert!(script.contains("Authorization"));
+        assert!(script.contains("history.replaceState"));
+        assert!(!script.contains("praetore_consola"));
+        // localStorage holds the language choice only, never the session.
+        let uses: Vec<&str> = script.split("localStorage.").skip(1).collect();
+        assert_eq!(uses.len(), 2, "{uses:?}");
+        for usage in uses {
+            assert!(
+                usage.starts_with("getItem(LLAVE_IDIOMA)")
+                    || usage.starts_with("setItem(LLAVE_IDIOMA, valor)"),
+                "{}",
+                &usage[..40.min(usage.len())]
+            );
+        }
+        assert!(I18N_JS.contains("export const LLAVE_IDIOMA = \"praetore_idioma\";"));
+        // No request carries the language.
+        assert!(!script.to_lowercase().contains("accept-language"));
+        for script in [script.as_str(), I18N_JS, HORA_JS] {
+            assert!(!script.contains("innerHTML"));
+            assert!(!script.contains("outerHTML"));
+            assert!(!script.contains("insertAdjacentHTML"));
+            assert!(!script.contains("createContextualFragment"));
+            assert!(!script.contains("DOMParser"));
+            assert!(!script.contains("setHTML"));
+            assert!(!script.contains("srcdoc"));
+            assert!(!script.contains("eval("));
+            assert!(!script.contains("new Function"));
+            assert!(!script.contains("document.write"));
+            assert!(!script.contains("document.cookie"));
+        }
+    }
+
+    fn plain_get(uri: &str) -> Request<Body> {
+        Request::builder()
+            .header(header::HOST, "127.0.0.1:8090")
+            .header(header::ACCEPT_LANGUAGE, "pt-BR,pt;q=0.9")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// The catalogs are served like the scripts: fixed bytes, the same
+    /// security headers, no cookie, no session needed. Only es, en and pt;
+    /// the name is compared with that list and never read as a path.
+    #[tokio::test]
+    async fn the_catalogs_are_served_like_the_scripts_and_nothing_else_is() {
+        let (app, store) = app(Vec::new());
+        let script = app.clone().oneshot(plain_get("/app.js")).await.unwrap();
+        let expected: Vec<(String, String)> = [
+            header::CACHE_CONTROL,
+            header::X_CONTENT_TYPE_OPTIONS,
+            header::REFERRER_POLICY,
+            header::CONTENT_SECURITY_POLICY,
+        ]
+        .iter()
+        .map(|name| {
+            (
+                name.to_string(),
+                script.headers()[name].to_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+        assert!(
+            expected
+                .iter()
+                .any(|(_, value)| value.contains("script-src 'self'"))
+        );
+        for (language, catalog) in CATALOGS {
+            let response = app
+                .clone()
+                .oneshot(plain_get(&format!("/i18n/{language}.json")))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{language}");
+            for (name, value) in &expected {
+                assert_eq!(
+                    response.headers()[name.as_str()],
+                    value.as_str(),
+                    "{language} {name}"
+                );
+            }
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "application/json; charset=utf-8"
+            );
+            assert!(response.headers().get(header::SET_COOKIE).is_none());
+            assert!(response.headers().get(header::CONTENT_LANGUAGE).is_none());
+            assert!(response.headers().get(header::VARY).is_none());
+            let body = body_text(response).await;
+            assert_eq!(body, catalog);
+            serde_json::from_str::<Value>(&body).unwrap();
+        }
+        for script in ["/i18n.js", "/hora.js"] {
+            let response = app.clone().oneshot(plain_get(script)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{script}");
+            for (name, value) in &expected {
+                assert_eq!(
+                    response.headers()[name.as_str()],
+                    value.as_str(),
+                    "{script}"
+                );
+            }
+        }
+        for uri in [
+            "/i18n/de.json",
+            "/i18n/../es.json",
+            "/i18n/..%2Fes.json",
+            "/i18n/%2E%2E%2Fes.json",
+            "/i18n/es",
+            "/i18n/es.json.json",
+            "/i18n/ES.json",
+            "/i18n/es.json%00",
+            "/i18n/.json",
+            "/i18n/",
+            "/i18n",
+            "/i18n/es.json/",
+            "/i18n/pt-BR.json",
+            "/ui/i18n/es.json",
+        ] {
+            let response = app.clone().oneshot(plain_get(uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+            assert!(
+                response.headers().get(header::SET_COOKIE).is_none(),
+                "{uri}"
+            );
+            let body = body_text(response).await;
+            assert!(!body.contains("situation."), "{uri}");
+        }
+        // `de` and `es.json` in the route's own terms: not names it serves.
+        assert_eq!(catalog_for("de"), None);
+        assert_eq!(catalog_for("es"), None);
+        assert_eq!(catalog_for("es.json.json"), None);
+        assert_eq!(catalog_for(""), None);
+        assert_eq!(catalog_for("../es.json"), None);
+        assert_eq!(catalog_for("es.json"), Some(CATALOGS[0].1));
+        assert_eq!(store.reads.load(Ordering::SeqCst), 0);
+    }
+
+    fn read_with_token(token: &str) -> Request<Body> {
+        Request::builder()
+            .header(header::HOST, "127.0.0.1:8090")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .uri("/api/historial")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_expired_link_mints_no_token_and_tokens_do_not_cross_runs() {
+        let printed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = printed.clone();
+        let first = ConsoleState::new(
+            Arc::new(MemoryHistory {
+                receipts: Vec::new(),
+                reads: AtomicUsize::new(0),
+            }),
+            LocalSession::random().unwrap(),
+            HashMap::new(),
+        )
+        .with_opening_ttl(std::time::Duration::ZERO)
+        .with_link_printer(move |link| sink.lock().unwrap().push(link.to_owned()));
+        let expired = first.issue_opening_link().unwrap();
+        let first = Arc::new(first);
+        let app = ConsoleState::router_from(Arc::clone(&first));
+        let code = expired.split_once("/#abrir=").unwrap().1.to_owned();
+        // The opening link already expired: redeeming it mints no token.
+        let refused = app.clone().oneshot(open_request(&code)).await.unwrap();
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        assert!(refused.headers().get(header::SET_COOKIE).is_none());
+        assert_eq!(printed.lock().unwrap().len(), 1);
+
+        // A token minted in this run opens this run.
+        let token = first.session.issue().unwrap();
+        let ok = app.clone().oneshot(read_with_token(&token)).await.unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        // That same token does not open a fresh run (a new, independent store).
+        let restarted = ConsoleState::new(
+            Arc::new(MemoryHistory {
+                receipts: Vec::new(),
+                reads: AtomicUsize::new(0),
+            }),
+            LocalSession::random().unwrap(),
+            HashMap::new(),
+        )
+        .router();
+        let stale = restarted.oneshot(read_with_token(&token)).await.unwrap();
+        assert_eq!(stale.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_opening_leaves_the_code_live() {
+        let state = ConsoleState::new(
+            Arc::new(MemoryHistory {
+                receipts: Vec::new(),
+                reads: AtomicUsize::new(0),
+            }),
+            LocalSession::random().unwrap(),
+            HashMap::new(),
+        );
+        let link = state.issue_opening_link().unwrap();
+        let code = link.split_once("/#abrir=").unwrap().1.to_owned();
+        let app = state.router();
+        let attempt = |origin: Option<&str>, marker: bool| {
+            let mut builder = Request::builder()
+                .method("POST")
+                .header(header::HOST, "127.0.0.1:8090")
+                .header(header::CONTENT_TYPE, "application/json")
+                .uri("/api/sesion");
+            if let Some(origin) = origin {
+                builder = builder.header(header::ORIGIN, origin);
+            }
+            if marker {
+                builder = builder.header(ACTION_HEADER, "1");
+            }
+            builder
+                .body(Body::from(format!("{{\"codigo\":\"{code}\"}}")))
+                .unwrap()
+        };
+        let missing_origin = app.clone().oneshot(attempt(None, true)).await.unwrap();
+        assert_eq!(missing_origin.status(), StatusCode::FORBIDDEN);
+        let foreign = app
+            .clone()
+            .oneshot(attempt(Some("http://127.0.0.1:1"), true))
+            .await
+            .unwrap();
+        assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+        let missing_marker = app
+            .clone()
+            .oneshot(attempt(Some("http://127.0.0.1:8090"), false))
+            .await
+            .unwrap();
+        assert_eq!(missing_marker.status(), StatusCode::FORBIDDEN);
+        // same_page runs before redeem, so these refusals leave the code live.
+        let opened = app.clone().oneshot(open_request(&code)).await.unwrap();
+        assert_eq!(opened.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&body_text(opened).await).unwrap();
+        assert_eq!(body["token"].as_str().unwrap().len(), 64);
+    }
+
+    #[tokio::test]
+    async fn with_pins_a_receipt_signed_by_another_attester_does_not_take_the_page_down() {
+        let (json, agent_id, request_id) = signed_evidence();
+        let mut foreign = Evidence::from_json(&json).unwrap();
+        foreign
+            .sign(&EvidenceAttesterKey::from_secret_bytes(&[0x33; 32]))
+            .unwrap();
+        let pins = [EvidenceAttesterKey::from_secret_bytes(&[0x32; 32])
+            .public_key()
+            .unwrap()];
+        let row = |evidence_json: String, request_id: Uuid, moment: &str| {
+            facts_from_columns(
+                JournalColumns {
+                    created_at: at(moment),
+                    updated_at: at(moment),
+                    agent_id,
+                    request_id,
+                    authorization: AuthorizationStatus::Allowed,
+                    execution: ExecutionStatus::Executed,
+                    attested: Some(AttestedExecution::Executed),
+                    reason: None,
+                    evidence_json,
+                },
+                Some(&pins),
+            )
+        };
+        let receipts = vec![
+            row(json, request_id, "2026-10-24T15:04:00Z"),
+            row(
+                foreign.to_json().unwrap(),
+                Uuid::from_u128(70),
+                "2026-10-23T15:04:00Z",
+            ),
+        ];
+        let (app, _) = app(receipts);
+        let response = app.oneshot(authed("/api/historial")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let list: Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(list["total"], 2);
+        assert_eq!(list["recibos"][0]["situacion"], "permitted");
+        assert_eq!(
+            list["recibos"][0]["sobre"],
+            json!({"texto": "informe-trimestral"})
+        );
+        assert_eq!(list["recibos"][1]["situacion"], "unreadable");
+        assert_eq!(list["recibos"][1]["sobre"], json!({"codigo": "not_shown"}));
+        assert_eq!(list["recibos"][1]["queria"], json!({"codigo": "not_shown"}));
     }
 
     #[tokio::test]
     async fn history_lists_plain_words_target_and_hides_the_evidence() {
         let (json, agent_id, request_id) = signed_evidence();
-        let pending = facts_from_columns(JournalColumns {
-            created_at: at("2026-10-24T15:04:00Z"),
-            updated_at: at("2026-10-24T15:04:00Z"),
-            agent_id,
-            request_id,
-            authorization: AuthorizationStatus::RequiresApproval,
-            execution: ExecutionStatus::NotDispatched,
-            attested: Some(AttestedExecution::AwaitingApproval),
-            reason: None,
-            evidence_json: json,
-        })
-        .unwrap();
+        let pending = facts_from_columns(
+            JournalColumns {
+                created_at: at("2026-10-24T15:04:00Z"),
+                updated_at: at("2026-10-24T15:04:00Z"),
+                agent_id,
+                request_id,
+                authorization: AuthorizationStatus::RequiresApproval,
+                execution: ExecutionStatus::NotDispatched,
+                attested: Some(AttestedExecution::AwaitingApproval),
+                reason: None,
+                evidence_json: json,
+            },
+            None,
+        );
         let approved = manual(
             "2026-10-23T09:00:00Z",
             4,
@@ -574,43 +1565,53 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let text = body_text(response).await;
         let list: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(list["recibos"][0]["situacion"], "pendiente de aprobación");
-        assert_eq!(list["recibos"][0]["sobre"], "informe-trimestral");
-        assert_eq!(list["recibos"][0]["queria"], "escribir_archivo");
+        assert_eq!(list["recibos"][0]["situacion"], "awaiting_approval");
         assert_eq!(
-            list["recibos"][0]["cuando"],
-            "24 de octubre de 2026, 15:04 UTC"
+            list["recibos"][0]["sobre"],
+            json!({"texto": "informe-trimestral"})
         );
+        assert_eq!(
+            list["recibos"][0]["queria"],
+            json!({"texto": "escribir_archivo"})
+        );
+        // The instant, for the page to word in local time and UTC.
+        assert_eq!(list["recibos"][0]["cuando_utc"], "2026-10-24T15:04:00Z");
         assert_eq!(
             list["recibos"][1]["situacion"],
-            "aprobado, pendiente de ejecución"
+            "approved_pending_execution"
         );
-        assert_eq!(list["recibos"][1]["sobre"], "archivo-viejo");
-        assert_eq!(list["recibos"][2]["situacion"], "denegado");
-        assert!(text.contains(NOTICE));
+        assert_eq!(
+            list["recibos"][1]["sobre"],
+            json!({"texto": "archivo-viejo"})
+        );
+        assert_eq!(list["recibos"][2]["situacion"], "denied");
+        assert_eq!(list["aviso"], "receipt_not_authorization");
         assert!(!text.contains("parameter-secret"));
         assert!(!text.contains("context-secret"));
         assert!(!text.contains("motivo-interno"));
-        assert!(!text.contains("awaiting_approval"));
         assert!(!text.contains(&agent_id.to_string()));
         assert!(!text.contains(&request_id.to_string()));
-        assert!(!text.contains("2026-10-24T"));
         assert!(agent_label_is_plain(&list["recibos"][0]["agente"]));
 
-        let filtered = app
-            .clone()
-            .oneshot(authed(
-                "/api/historial?situacion=pendiente%20de%20aprobaci%C3%B3n",
-            ))
-            .await
-            .unwrap();
-        let filtered: Value = serde_json::from_str(&body_text(filtered).await).unwrap();
+        // The code the page sends and the Spanish phrase it sent before
+        // give the same answer.
+        let mut answers = Vec::new();
+        for uri in [
+            "/api/historial?situacion=awaiting_approval",
+            "/api/historial?situacion=pendiente%20de%20aprobaci%C3%B3n",
+        ] {
+            let response = app.clone().oneshot(authed(uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            answers.push(body_text(response).await);
+        }
+        assert_eq!(answers[0], answers[1]);
+        let filtered: Value = serde_json::from_str(&answers[0]).unwrap();
         assert_eq!(filtered["total"], 1);
-        assert_eq!(filtered["recibos"][0]["sobre"], "informe-trimestral");
         assert_eq!(
-            filtered["recibos"][0]["situacion"],
-            "pendiente de aprobación"
+            filtered["recibos"][0]["sobre"],
+            json!({"texto": "informe-trimestral"})
         );
+        assert_eq!(filtered["recibos"][0]["situacion"], "awaiting_approval");
 
         let pending_execution = app
             .clone()
@@ -623,10 +1624,13 @@ mod tests {
         let pending_execution: Value =
             serde_json::from_str(&body_text(pending_execution).await).unwrap();
         assert_eq!(pending_execution["total"], 1);
-        assert_eq!(pending_execution["recibos"][0]["sobre"], "archivo-viejo");
+        assert_eq!(
+            pending_execution["recibos"][0]["sobre"],
+            json!({"texto": "archivo-viejo"})
+        );
         assert_eq!(
             pending_execution["recibos"][0]["situacion"],
-            "aprobado, pendiente de ejecución"
+            "approved_pending_execution"
         );
 
         let approved_only = app
@@ -645,27 +1649,28 @@ mod tests {
         assert_eq!(detail.status(), StatusCode::OK);
         let detail_text = body_text(detail).await;
         let detail: Value = serde_json::from_str(&detail_text).unwrap();
-        assert_eq!(detail["situacion"], "pendiente de aprobación");
-        assert_eq!(detail["sobre"], "informe-trimestral");
-        assert_eq!(detail["queria"], "escribir_archivo");
+        assert_eq!(detail["situacion"], "awaiting_approval");
+        assert_eq!(detail["sobre"], json!({"texto": "informe-trimestral"}));
+        assert_eq!(detail["queria"], json!({"texto": "escribir_archivo"}));
+        assert_eq!(detail["relato"], "awaiting_approval");
         assert!(
-            detail["relato"]
-                .as_str()
-                .unwrap()
-                .contains("pendiente de aprobación")
+            crate::tests_i18n::es("story.awaiting_approval").contains("pendiente de aprobación")
         );
-        assert_eq!(detail["aviso"], NOTICE);
+        assert_eq!(detail["aviso"], "receipt_not_authorization");
+        assert_eq!(detail["cuando_utc"], "2026-10-24T15:04:00Z");
+        assert_eq!(detail["actualizado_utc"], "2026-10-24T15:04:00Z");
         assert!(!detail_text.contains("parameter-secret"));
         assert!(!detail_text.contains(&agent_id.to_string()));
         assert!(!detail_text.contains(&request_id.to_string()));
-        assert_eq!(store.reads.load(Ordering::SeqCst), 5);
+        assert_eq!(store.reads.load(Ordering::SeqCst), 6);
     }
 
     #[tokio::test]
     async fn technical_filters_and_mutations_are_refused() {
         let (app, store) = app(Vec::new());
         for uri in [
-            "/api/historial?situacion=awaiting_approval",
+            "/api/historial?situacion=unreadable",
+            "/api/historial?situacion=awaiting%20approval",
             "/api/historial?desde=2026-10-24T00:00:00Z&hasta=2026-10-25T00:00:00Z",
             "/api/historial?pagina=0",
             "/api/historial?tenant_id=1",
@@ -684,11 +1689,12 @@ mod tests {
                 .clone()
                 .oneshot(
                     Request::builder()
+                        .header(header::HOST, "127.0.0.1:8090")
                         .method(method)
                         .uri(uri)
                         .header(
-                            header::COOKIE,
-                            format!("{}={}", sesion::COOKIE_NAME, hex::encode([0x11; 32])),
+                            header::AUTHORIZATION,
+                            format!("Bearer {}", hex::encode([0x11; 32])),
                         )
                         .body(Body::from("{}"))
                         .unwrap(),
@@ -705,12 +1711,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_api_requires_the_local_cookie() {
+    async fn the_api_requires_a_session_token() {
         let (app, store) = app(Vec::new());
         let missing = app
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(header::HOST, "127.0.0.1:8090")
                     .uri("/api/historial")
                     .body(Body::empty())
                     .unwrap(),
@@ -720,16 +1727,32 @@ mod tests {
         assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
         assert!(missing.headers().get(header::WWW_AUTHENTICATE).is_none());
         let text = body_text(missing).await;
-        assert!(text.contains("este computador"));
+        assert!(text.contains("\"codigo\":\"session_required\""), "{text}");
+        assert!(crate::tests_i18n::es("message.session_required").contains("este computador"));
         assert!(!text.to_lowercase().contains("bearer"));
+        // A cookie carrying the live token, with no Authorization header, is
+        // refused: there is no ambient cookie path.
+        let live = hex::encode([0x11; 32]);
+        let cookie_only = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .header(header::HOST, "127.0.0.1:8090")
+                    .uri("/api/historial")
+                    .header(header::COOKIE, format!("praetore_consola={live}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cookie_only.status(), StatusCode::UNAUTHORIZED);
+        // A bearer token that this run never minted is refused.
         let wrong = app
             .oneshot(
                 Request::builder()
+                    .header(header::HOST, "127.0.0.1:8090")
                     .uri("/api/historial")
-                    .header(
-                        header::COOKIE,
-                        format!("{}={}", sesion::COOKIE_NAME, "ab".repeat(32)),
-                    )
+                    .header(header::AUTHORIZATION, format!("Bearer {}", "ab".repeat(32)))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -740,10 +1763,8 @@ mod tests {
     }
 
     fn agent_label_is_plain(value: &Value) -> bool {
-        let Some(label) = value.as_str() else {
-            return false;
-        };
-        label.starts_with("Agente") && Uuid::parse_str(label).is_err()
+        // A number for the page to word ("Agente 1"), never an id.
+        value.get("nombre").is_none() && value["numero"].as_u64().is_some_and(|n| n >= 1)
     }
 
     fn signed_evidence() -> (String, Uuid, Uuid) {

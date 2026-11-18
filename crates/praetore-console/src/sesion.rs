@@ -1,17 +1,37 @@
-//! Local session: a key on disk that the browser stores as an HttpOnly cookie.
-//! The console never writes that key into the page.
+//! Local session: a bearer token minted in this process and handed out once
+//! by the single-use opening link. The browser keeps it in `sessionStorage`,
+//! scoped to the opening tab's origin, and sends it as `Authorization:
+//! Bearer`. No ambient session cookie is used. A request without a live token
+//! is refused. Tokens expire, and the opening code is single use.
 
 use std::{
-    fs::{self, OpenOptions},
-    io::{Read, Write},
-    path::Path,
+    fs,
+    io::Read,
+    sync::Mutex,
+    time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
 
-pub const COOKIE_NAME: &str = "praetore_consola";
+/// A minted session token is valid for at most this long; an older one is
+/// refused (the session expires). Each opening mints a fresh token, so in
+/// practice the session also rotates.
+pub const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+
+/// The longest an opening link is valid.
+pub const MAX_OPENING_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// At most this many live tokens at once; the oldest drops first. Bounds
+/// memory and lets a couple of re-opens coexist without unbounded growth.
+const MAX_LIVE_TOKENS: usize = 8;
+
+struct Live {
+    value: [u8; 32],
+    issued: Instant,
+}
 
 pub struct LocalSession {
-    secret: [u8; 32],
+    ttl: Duration,
+    tokens: Mutex<Vec<Live>>,
 }
 
 impl std::fmt::Debug for LocalSession {
@@ -20,185 +40,208 @@ impl std::fmt::Debug for LocalSession {
     }
 }
 
-impl LocalSession {
-    pub fn from_secret(secret: [u8; 32]) -> Self {
-        Self { secret }
+impl Default for LocalSession {
+    fn default() -> Self {
+        Self::new()
     }
+}
 
-    /// Opens an existing 0600 file of 32 bytes, or creates one.
-    pub fn load_or_create(path: &Path) -> Result<Self, SessionError> {
-        match fs::symlink_metadata(path) {
-            Ok(metadata) => read_existing(path, &metadata),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => create(path),
-            Err(_) => Err(SessionError::Io),
+impl LocalSession {
+    pub fn new() -> Self {
+        Self {
+            ttl: SESSION_TTL,
+            tokens: Mutex::new(Vec::new()),
         }
     }
 
-    pub fn cookie_header(&self) -> String {
-        format!(
-            "{COOKIE_NAME}={}; HttpOnly; SameSite=Strict; Path=/",
-            self.cookie_value()
-        )
+    /// A session with no secret kept on disk. The store starts empty: a token
+    /// only exists after the opening link is redeemed.
+    pub fn random() -> Result<Self, SessionError> {
+        Ok(Self::new())
     }
 
-    pub fn cookie_value(&self) -> String {
-        hex::encode(self.secret)
+    /// Seeds the store with one known token, live at the current time.
+    #[doc(hidden)]
+    pub fn from_secret(secret: [u8; 32]) -> Self {
+        let session = Self::new();
+        if let Ok(mut tokens) = session.tokens.lock() {
+            tokens.push(Live {
+                value: secret,
+                issued: Instant::now(),
+            });
+        }
+        session
     }
 
-    pub fn accepts(&self, cookie_header: Option<&str>) -> bool {
-        let Some(header) = cookie_header else {
+    /// Mints a fresh single session token, drops expired ones, and returns it
+    /// as hex. Called only when a live opening code is redeemed.
+    pub fn issue(&self) -> Option<String> {
+        let value = random_bytes()?;
+        let mut tokens = self.tokens.lock().ok()?;
+        let now = Instant::now();
+        tokens.retain(|token| now.duration_since(token.issued) < self.ttl);
+        if tokens.len() >= MAX_LIVE_TOKENS {
+            tokens.remove(0);
+        }
+        tokens.push(Live { value, issued: now });
+        Some(hex::encode(value))
+    }
+
+    /// True when the `Authorization` header carries a live, non-expired token
+    /// minted by this process. No cookie is read.
+    pub fn accepts(&self, authorization: Option<&str>) -> bool {
+        let Some(offered) = authorization.and_then(parse_bearer) else {
             return false;
         };
-        if header.len() > 4096 {
+        let Ok(mut tokens) = self.tokens.lock() else {
             return false;
+        };
+        let now = Instant::now();
+        tokens.retain(|token| now.duration_since(token.issued) < self.ttl);
+        let mut matched = false;
+        for token in tokens.iter() {
+            matched |= bool::from(token.value.as_slice().ct_eq(offered.as_slice()));
         }
-        for part in header.split(';') {
-            let Some((name, value)) = part.trim().split_once('=') else {
-                continue;
-            };
-            if name.trim() != COOKIE_NAME {
-                continue;
-            }
-            let value = value.trim();
-            if value.len() != 64 {
-                return false;
-            }
-            let Ok(bytes) = hex::decode(value) else {
-                return false;
-            };
-            let Ok(bytes) = <[u8; 32]>::try_from(bytes) else {
-                return false;
-            };
-            return bool::from(bytes.as_slice().ct_eq(self.secret.as_slice()));
-        }
-        false
+        matched
     }
+}
+
+/// Parses `Authorization: Bearer <64 hex>` into 32 bytes. Rejects anything
+/// else, including an over-long header.
+fn parse_bearer(header: &str) -> Option<[u8; 32]> {
+    if header.len() > 4096 {
+        return None;
+    }
+    let (scheme, value) = header.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let value = value.trim();
+    if value.len() != 64 {
+        return None;
+    }
+    let bytes = hex::decode(value).ok()?;
+    <[u8; 32]>::try_from(bytes).ok()
 }
 
 #[derive(Debug)]
 pub enum SessionError {
     Io,
-    Permissions,
-    Unsupported,
 }
 
 impl std::fmt::Display for SessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Io => f.write_str("no se pudo leer o crear la sesión local"),
-            Self::Permissions => {
-                f.write_str("la sesión local debe ser un archivo regular con permisos 0600")
-            }
-            Self::Unsupported => {
-                f.write_str("la sesión local de esta consola está hecha para Linux")
-            }
+            Self::Io => f.write_str("no se pudo crear la sesión local"),
         }
     }
 }
 
 impl std::error::Error for SessionError {}
 
-fn read_existing(path: &Path, metadata: &fs::Metadata) -> Result<LocalSession, SessionError> {
-    if !metadata.file_type().is_file() || !mode_is_owner_only(metadata) || metadata.len() != 32 {
-        return Err(SessionError::Permissions);
-    }
-    let mut file = fs::File::open(path).map_err(|_| SessionError::Io)?;
+pub(crate) fn random_bytes() -> Option<[u8; 32]> {
     let mut secret = [0u8; 32];
-    file.read_exact(&mut secret).map_err(|_| SessionError::Io)?;
-    Ok(LocalSession { secret })
+    let mut source = fs::File::open("/dev/urandom").ok()?;
+    source.read_exact(&mut secret).ok()?;
+    Some(secret)
 }
 
-fn create(path: &Path) -> Result<LocalSession, SessionError> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent).map_err(|_| SessionError::Io)?;
-    }
-    let secret = random_bytes()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(|_| SessionError::Io)?;
-        file.write_all(&secret).map_err(|_| SessionError::Io)?;
-        file.sync_all().map_err(|_| SessionError::Io)?;
-        let metadata = file.metadata().map_err(|_| SessionError::Io)?;
-        if !mode_is_owner_only(&metadata) {
-            return Err(SessionError::Permissions);
+/// The opening link's code: single use, valid for at most five minutes.
+pub struct Opener {
+    ttl: Duration,
+    state: Mutex<OpenerState>,
+}
+
+#[derive(Default)]
+struct OpenerState {
+    current: Option<(String, Instant)>,
+}
+
+impl Opener {
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            ttl: ttl.min(MAX_OPENING_TTL),
+            state: Mutex::default(),
         }
-        Ok(LocalSession { secret })
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, secret);
-        Err(SessionError::Unsupported)
+
+    /// A new code; any earlier one stops working.
+    pub fn issue(&self) -> Option<String> {
+        let code = crate::bandeja::random_code()?;
+        let mut state = self.state.lock().ok()?;
+        state.current = Some((code.clone(), Instant::now()));
+        Some(code)
+    }
+
+    /// Consumes the code: true at most once, and only before it expires.
+    pub fn redeem(&self, offered: &str) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let Some((code, issued)) = state.current.as_ref() else {
+            return false;
+        };
+        let matches =
+            code.len() == offered.len() && bool::from(code.as_bytes().ct_eq(offered.as_bytes()));
+        if !matches {
+            return false;
+        }
+        let fresh = issued.elapsed() < self.ttl;
+        state.current = None;
+        fresh
     }
 }
 
-fn random_bytes() -> Result<[u8; 32], SessionError> {
-    let mut secret = [0u8; 32];
-    let mut source = fs::File::open("/dev/urandom").map_err(|_| SessionError::Io)?;
-    source
-        .read_exact(&mut secret)
-        .map_err(|_| SessionError::Io)?;
-    Ok(secret)
-}
-
-fn mode_is_owner_only(metadata: &fs::Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o777 == 0o600
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = metadata;
-        false
-    }
-}
-
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn a_new_session_file_is_owner_only_and_reopens() {
-        let dir =
-            std::env::temp_dir().join(format!("praetore-consola-sesion-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("sesion");
-        let first = LocalSession::load_or_create(&path).unwrap();
-        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-        let header = format!("{COOKIE_NAME}={}", first.cookie_value());
-        let second = LocalSession::load_or_create(&path).unwrap();
-        assert!(second.accepts(Some(&header)));
-        assert!(!second.accepts(None));
-        assert!(!second.accepts(Some(&format!("{COOKIE_NAME}={}", "00".repeat(32)))));
-        let _ = fs::remove_dir_all(&dir);
+    fn a_minted_token_is_accepted_and_a_foreign_one_is_not() {
+        let session = LocalSession::new();
+        assert!(!session.accepts(None));
+        let token = session.issue().unwrap();
+        let header = format!("Bearer {token}");
+        assert!(session.accepts(Some(&header)));
+        // A token minted by another process (another store) does not match.
+        let other = LocalSession::new();
+        let other_token = other.issue().unwrap();
+        assert!(!session.accepts(Some(&format!("Bearer {other_token}"))));
+        // No token at all, or a cookie, is refused.
+        assert!(!session.accepts(Some("Bearer")));
+        assert!(!session.accepts(Some(&format!("praetore_consola={token}"))));
     }
 
     #[test]
-    fn a_world_readable_session_file_is_refused() {
-        let dir = std::env::temp_dir().join(format!(
-            "praetore-consola-permisos-{}",
-            uuid::Uuid::new_v4()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("sesion");
-        fs::write(&path, [9u8; 32]).unwrap();
-        let mut permissions = fs::metadata(&path).unwrap().permissions();
-        permissions.set_mode(0o644);
-        fs::set_permissions(&path, permissions).unwrap();
-        assert!(matches!(
-            LocalSession::load_or_create(&path),
-            Err(SessionError::Permissions)
-        ));
-        let _ = fs::remove_dir_all(&dir);
+    fn an_expired_token_is_refused() {
+        let session = LocalSession {
+            ttl: Duration::ZERO,
+            tokens: Mutex::new(Vec::new()),
+        };
+        let token = session.issue().unwrap();
+        assert!(!session.accepts(Some(&format!("Bearer {token}"))));
+    }
+
+    #[test]
+    fn an_opening_code_works_once_and_only_before_it_expires() {
+        let opener = Opener::new(Duration::from_secs(60));
+        let code = opener.issue().unwrap();
+        assert!(!opener.redeem("otro"));
+        assert!(opener.redeem(&code));
+        assert!(!opener.redeem(&code));
+
+        let expired = Opener::new(Duration::ZERO);
+        let code = expired.issue().unwrap();
+        assert!(!expired.redeem(&code));
+
+        // The TTL is capped at five minutes.
+        assert_eq!(Opener::new(Duration::from_secs(3600)).ttl, MAX_OPENING_TTL);
+
+        // A new code replaces the earlier one.
+        let opener = Opener::new(Duration::from_secs(60));
+        let old = opener.issue().unwrap();
+        let new = opener.issue().unwrap();
+        assert!(!opener.redeem(&old));
+        assert!(opener.redeem(&new));
     }
 }

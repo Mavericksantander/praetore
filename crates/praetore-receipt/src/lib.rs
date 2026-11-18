@@ -16,6 +16,14 @@ use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
+mod approval;
+pub mod outcomes;
+
+pub use approval::{
+    ApprovalChallenge, ApprovalError, ApprovalExpiredReceipt, ExecutionKey, ExpiredOutcome,
+    HumanApprovalDecision, HumanApprovalOutcome,
+};
+
 const ACTION_DIGEST_DOMAIN: &[u8] = b"PRAETORE_EXECUTION_ACTION_V1\0";
 const EXECUTION_ATTESTATION_DOMAIN: &[u8] = b"PRAETORE_EXECUTION_ATTESTATION_V1\0";
 const OUTPUT_DIGEST_DOMAIN: &[u8] = b"PRAETORE_EXECUTION_OUTPUT_V1\0";

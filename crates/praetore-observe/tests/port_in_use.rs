@@ -1,12 +1,34 @@
 //! `praetore-observe` on a port already in use exits with the bind error
 //! (status 1) instead of aborting while it drops its PostgreSQL client on
-//! the runtime thread. Needs `PRAETORE_TEST_DATABASE_URL` (a role that can
-//! CREATE DATABASE and CREATE ROLE).
+//! the runtime thread, and refuses to start with the gateway's runtime
+//! credential. Needs `PRAETORE_TEST_DATABASE_URL` (a role that can CREATE
+//! DATABASE and CREATE ROLE).
 
 use std::{net::TcpListener, process::Command};
 
-/// A scratch database migrated as the admin role, with a LOGIN member of
-/// `praetore_runtime`; the database and the role are dropped on drop.
+/// The read-only grant of docs/observability-mvp.md, to the
+/// `praetore_observe` group (created NOLOGIN when it does not exist).
+const OBSERVE_GRANT: &str = "DO $$ BEGIN CREATE ROLE praetore_observe NOLOGIN; \
+     EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$; \
+     GRANT USAGE ON SCHEMA praetore TO praetore_observe; \
+     GRANT SELECT (tenant_id, agent_id, request_id, request_digest, action_digest, \
+       authorization_status, execution_status, evidence_json, created_at, updated_at) \
+       ON praetore.execution_journal TO praetore_observe; \
+     GRANT SELECT (event_id, tenant_id, agent_id, request_id, from_status, to_status, \
+       occurred_at) ON praetore.execution_journal_events TO praetore_observe;";
+
+/// Which group the scratch login role joins.
+#[derive(Clone, Copy)]
+enum Grant {
+    /// `praetore_observe`, read-only.
+    Observe,
+    /// `praetore_runtime`, the gateway's credential.
+    Runtime,
+}
+
+/// A scratch database migrated as the admin role, with a LOGIN role that
+/// is a member of `praetore_observe` or `praetore_runtime`; the database
+/// and the role are dropped on drop.
 struct Scratch {
     admin_url: String,
     name: String,
@@ -16,7 +38,7 @@ struct Scratch {
 }
 
 impl Scratch {
-    fn create() -> Self {
+    fn create(grant: Grant) -> Self {
         let admin_url = std::env::var("PRAETORE_TEST_DATABASE_URL").unwrap();
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let (name, role) = (
@@ -47,9 +69,11 @@ impl Scratch {
         };
         let mut client = postgres::Client::connect(&scratch.url, postgres::NoTls).unwrap();
         praetore_replay_postgres::apply_migrations(&mut client).unwrap();
-        client
-            .batch_execute(&format!("GRANT praetore_runtime TO {}", scratch.role))
-            .unwrap();
+        let statements = match grant {
+            Grant::Observe => format!("{OBSERVE_GRANT} GRANT praetore_observe TO {}", scratch.role),
+            Grant::Runtime => format!("GRANT praetore_runtime TO {}", scratch.role),
+        };
+        client.batch_execute(&statements).unwrap();
         scratch
     }
 }
@@ -85,7 +109,7 @@ fn assert_reports_port_in_use(output: &std::process::Output) {
 #[test]
 #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
 fn postgres_observe_reports_a_port_in_use() {
-    let scratch = Scratch::create();
+    let scratch = Scratch::create(Grant::Observe);
     let dir = std::env::temp_dir().join(format!("praetore-observe-port-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&dir).unwrap();
     let tokens = dir.join("tokens.json");
@@ -118,5 +142,55 @@ fn postgres_observe_reports_a_port_in_use() {
         "the unset schema owner is warned about"
     );
     drop(taken);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The gateway's runtime credential (a member of `praetore_runtime`, with
+/// INSERT and UPDATE on the journal) is refused at startup, before the
+/// service listens.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_observe_refuses_the_gateway_runtime_role() {
+    let scratch = Scratch::create(Grant::Runtime);
+    let dir = std::env::temp_dir().join(format!("praetore-observe-role-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let tokens = dir.join("tokens.json");
+    std::fs::write(
+        &tokens,
+        serde_json::json!({
+            "schema_version": 1,
+            "tenants": [{
+                "tenant_id": uuid::Uuid::new_v4(),
+                "bearer_token_sha256": "ab".repeat(32),
+            }],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let output = Command::new(env!("CARGO_BIN_EXE_praetore-observe"))
+        .env("PRAETORE_OBSERVE_TENANT_TOKENS_FILE", &tokens)
+        .env("PRAETORE_OBSERVE_DATABASE_URL", &scratch.runtime_url)
+        .env("PRAETORE_OBSERVE_BIND", format!("127.0.0.1:{port}"))
+        .env_remove("PRAETORE_SCHEMA_OWNER")
+        .output()
+        .unwrap();
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(1), "{log}");
+    assert!(log.contains("is a member of praetore_runtime"), "{log}");
+    assert!(!log.contains("listening"), "{log}");
+    assert!(!log.contains("panicked"), "{log}");
+    eprintln!(
+        "refused as expected: {}",
+        log.lines().last().unwrap_or_default()
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }

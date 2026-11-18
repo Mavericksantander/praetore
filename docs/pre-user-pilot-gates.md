@@ -64,7 +64,9 @@ For each target deployment, retain evidence for every applicable item:
 6. **Supply chain and release:** reviewed dependency changes, signed source
    tags, independently verified release checksums/SBOM, protected build
    provenance, action/toolchain pinning policy, and a reproducible release
-   procedure. Current CI does not sign or attest artifacts.
+   procedure. Current CI signs release checksums (`SHA256SUMS`, Sigstore
+   keyless via cosign) only when a `v*` tag is pushed; it does not produce
+   build provenance attestations.
 7. **Adversarial verification:** independent review of the final commit and
    deployment adapter, extended fuzz campaigns, negative end-to-end scenarios,
    concurrency testing, and a documented remediation/exception process.

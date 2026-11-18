@@ -7,7 +7,8 @@
 //! "pendiente de aprobación", "rechazado", and "expirado".
 
 use crate::{
-    HistoryError, HistoryPage, HistoryStore, ListRequest,
+    HistoryError, HistoryPage, HistoryStore, InboxPage, InboxStore, ListRequest,
+    bandeja::{INBOX_LIMIT, PendingColumns, PendingKind, pending_from_columns},
     historia::{JournalColumns, facts_from_columns, parse_journal_timestamp},
 };
 use postgres::{Client, Row};
@@ -21,6 +22,9 @@ use uuid::Uuid;
 pub struct PostgresHistory {
     client: Mutex<Client>,
     tenant_id: Uuid,
+    /// Attester pins the history checks signatures with; `None` checks the
+    /// integrity hash only.
+    attester_pins: Option<Vec<praetore_core::VerifiedPublicKey>>,
 }
 
 impl PostgresHistory {
@@ -35,7 +39,46 @@ impl PostgresHistory {
         Ok(Self {
             client: Mutex::new(client),
             tenant_id,
+            attester_pins: None,
         })
+    }
+
+    /// The history also checks each receipt's attester signature against
+    /// these pins (loaded once at startup).
+    pub fn with_attester_pins(mut self, pins: &[praetore_core::VerifiedPublicKey]) -> Self {
+        self.attester_pins = Some(pins.to_vec());
+        self
+    }
+}
+
+impl crate::paquete::JournalExportStore for PostgresHistory {
+    fn tenant_id(&self) -> Uuid {
+        self.tenant_id
+    }
+
+    /// `praetore journal-export --tenant`'s own code, plus the tenant's
+    /// approval and execution records, on the console's connection: one
+    /// read-only, repeatable-read transaction.
+    fn export_tenant(
+        &self,
+        attesters: &[praetore_core::VerifiedPublicKey],
+    ) -> Result<
+        (
+            praetore_replay_postgres::journal_export::TenantExport,
+            Vec<praetore_receipt::outcomes::Outcome>,
+        ),
+        String,
+    > {
+        let mut client = self
+            .client
+            .lock()
+            .map_err(|_| "console database client poisoned".to_owned())?;
+        praetore_replay_postgres::journal_export::export_tenant_with_outcomes(
+            &mut client,
+            self.tenant_id,
+            attesters,
+        )
+        .map_err(|error| error.to_string())
     }
 }
 
@@ -98,7 +141,7 @@ impl HistoryStore for PostgresHistory {
             .map_err(|_| HistoryError::Unavailable)?;
         let mut receipts = Vec::with_capacity(rows.len());
         for row in rows {
-            let facts = parse_row(row)?;
+            let facts = parse_row(row, self.attester_pins.as_deref())?;
             if query
                 .situation
                 .is_some_and(|wanted| crate::historia::situation(&facts) != wanted)
@@ -126,6 +169,92 @@ impl HistoryStore for PostgresHistory {
         })
     }
 }
+
+impl InboxStore for PostgresHistory {
+    /// Requests that wait for the operator, newest first. Same connection
+    /// and tenant context as the history, in a transaction opened read only;
+    /// nothing is written.
+    fn pending(&self, trust: &crate::EvidenceTrust) -> Result<InboxPage, HistoryError> {
+        let mut client = self.client.lock().map_err(|_| HistoryError::Unavailable)?;
+        let mut transaction = client
+            .transaction()
+            .map_err(|_| HistoryError::Unavailable)?;
+        transaction
+            .batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .map_err(|_| HistoryError::Unavailable)?;
+        set_tenant_context(&mut transaction, self.tenant_id)
+            .map_err(|_| HistoryError::Unavailable)?;
+        let rows = transaction
+            .query(
+                &format!(
+                    "SELECT j.agent_id, j.request_id, j.execution_status, j.evidence_json, \
+                            to_char(j.created_at AT TIME ZONE 'UTC', \
+                                'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') \
+                       FROM praetore.execution_journal j \
+                      WHERE j.tenant_id = $1 AND (({INBOX_SQL})) \
+                      ORDER BY j.created_at DESC, j.agent_id, j.request_id \
+                      LIMIT $2"
+                ),
+                &[&self.tenant_id, &(i64::from(INBOX_LIMIT) + 1)],
+            )
+            .map_err(|_| HistoryError::Unavailable)?;
+        // Newest first: old holds whose window closed (the gateway records
+        // the expiry only when it next sees them) cannot push new ones out.
+        let truncated = rows.len() > INBOX_LIMIT as usize;
+        let mut items = Vec::with_capacity(rows.len());
+        let mut unreadable = 0u32;
+        for row in rows.into_iter().take(INBOX_LIMIT as usize) {
+            let kind = match row.get::<_, String>(2).as_str() {
+                "approved_pending_dispatch" => PendingKind::ApprovedPendingExecution,
+                "not_dispatched" => PendingKind::AwaitingApproval,
+                _ => return Err(HistoryError::Invalid),
+            };
+            let created_at = parse_journal_timestamp(&row.get::<_, String>(4))
+                .map_err(|_| HistoryError::Invalid)?;
+            match pending_from_columns(
+                self.tenant_id,
+                PendingColumns {
+                    created_at,
+                    agent_id: row.get(0),
+                    request_id: row.get(1),
+                    kind,
+                    evidence_json: row.get(3),
+                },
+                trust,
+            ) {
+                Ok(facts) => items.push(facts),
+                // Never offered for a decision. Counted so the page can say so.
+                Err(()) => unreadable += 1,
+            }
+        }
+        let agents = transaction
+            .query(
+                "SELECT DISTINCT agent_id FROM praetore.execution_journal ORDER BY agent_id",
+                &[],
+            )
+            .map_err(|_| HistoryError::Unavailable)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        transaction
+            .commit()
+            .map_err(|_| HistoryError::Unavailable)?;
+        Ok(InboxPage {
+            items,
+            unreadable,
+            truncated,
+            agents,
+        })
+    }
+}
+
+/// Rows the operator can still act on: a hold with no decision yet, or an
+/// approval whose single dispatch has not been claimed.
+const INBOX_SQL: &str = "(j.authorization_status = 'requires_approval' \
+       AND j.execution_status = 'not_dispatched' \
+       AND j.not_dispatched_reason IS NULL) \
+     OR (j.authorization_status = 'requires_approval' \
+       AND j.execution_status = 'approved_pending_dispatch')";
 
 const TIME_FILTER: &str = "($1::timestamptz IS NULL OR j.created_at >= $1) \
      AND ($2::timestamptz IS NULL OR j.created_at < $2)";
@@ -159,7 +288,12 @@ fn situation_sql(situation: crate::historia::Situation) -> &'static str {
     }
 }
 
-fn parse_row(row: Row) -> Result<crate::historia::ReceiptFacts, HistoryError> {
+/// A column the console cannot read is an error; evidence that does not
+/// check out is a receipt marked unreadable.
+fn parse_row(
+    row: Row,
+    pins: Option<&[praetore_core::VerifiedPublicKey]>,
+) -> Result<crate::historia::ReceiptFacts, HistoryError> {
     let authorization = parse_authorization(&row.get::<_, String>(2))?;
     let execution = parse_execution(&row.get::<_, String>(3))?;
     let reason = parse_reason(row.get(4))?;
@@ -168,18 +302,20 @@ fn parse_row(row: Row) -> Result<crate::historia::ReceiptFacts, HistoryError> {
         parse_journal_timestamp(&row.get::<_, String>(6)).map_err(|_| HistoryError::Invalid)?;
     let updated_at =
         parse_journal_timestamp(&row.get::<_, String>(7)).map_err(|_| HistoryError::Invalid)?;
-    facts_from_columns(JournalColumns {
-        created_at,
-        updated_at,
-        agent_id: row.get(0),
-        request_id: row.get(1),
-        authorization,
-        execution,
-        attested,
-        reason,
-        evidence_json: row.get(5),
-    })
-    .map_err(|_| HistoryError::Invalid)
+    Ok(facts_from_columns(
+        JournalColumns {
+            created_at,
+            updated_at,
+            agent_id: row.get(0),
+            request_id: row.get(1),
+            authorization,
+            execution,
+            attested,
+            reason,
+            evidence_json: row.get(5),
+        },
+        pins,
+    ))
 }
 
 fn parse_authorization(value: &str) -> Result<AuthorizationStatus, HistoryError> {
@@ -239,6 +375,15 @@ fn parse_attested(value: Option<String>) -> Result<Option<AttestedExecution>, Hi
 mod tests {
     use super::*;
     use crate::historia::Situation;
+
+    #[test]
+    fn inbox_sql_is_fixed_and_only_names_actionable_rows() {
+        assert!(!INBOX_SQL.contains('$'));
+        assert!(INBOX_SQL.contains("approved_pending_dispatch"));
+        assert!(INBOX_SQL.contains("not_dispatched_reason IS NULL"));
+        assert!(!INBOX_SQL.contains("allowed"));
+        assert!(!INBOX_SQL.contains("denied"));
+    }
 
     #[test]
     fn situation_sql_is_fixed_and_names_awaiting_approval_as_a_hold() {

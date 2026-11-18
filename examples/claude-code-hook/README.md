@@ -539,7 +539,16 @@ si imprime algo que no es un objeto JSON. El binario además convierte un
 pánico durante la autorización en una negación. Lo que el wrapper no cubre
 (el propio `sh` no arranca, o el wrapper muere) lo cubre
 `onFailure: "block"`. No se probó en un Claude Code real: los tests
-(`tests_wrapper`) usan dobles del binario. Para exportar los recibos de una sesión real y verificarlos:
+(`tests_wrapper`) usan dobles del binario.
+
+El wrapper usa `<proyecto>/.claude/bin/praetore-claude-hook`, salvo que
+`PRAETORE_HOOK_BIN` tenga un valor (vacío equivale a no definida). Ese valor
+debe ser una ruta absoluta a un archivo regular ejecutable; una ruta relativa,
+un directorio o un archivo no ejecutable producen una negación sin ejecutar
+nada. Fuera de eso no se comprueba qué binario es: quien controla el entorno
+del proceso del hook elige el binario que decide, igual que con `PATH`.
+
+Para exportar los recibos de una sesión real y verificarlos:
 
 ```sh
 <proyecto>/.claude/bin/praetore-claude-hook export <proyecto>/.claude/praetore <bundle>

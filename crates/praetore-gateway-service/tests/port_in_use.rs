@@ -124,13 +124,15 @@ fn postgres_gateway_service_reports_a_port_in_use() {
         .env("PRAETORE_GATEWAY_DATABASE_URL", &scratch.runtime_url)
         .env("PRAETORE_GATEWAY_MIGRATION_DATABASE_URL", &scratch.url)
         .env(
-            "PRAETORE_GATEWAY_EVIDENCE_ATTESTER_KEY_HEX",
-            hex::encode([7u8; 32]),
+            "PRAETORE_GATEWAY_EVIDENCE_ATTESTER_KEY_FILE",
+            key_file(&dir, "evidence.key", [7; 32]),
         )
         .env(
-            "PRAETORE_GATEWAY_EXECUTION_ATTESTER_KEY_HEX",
-            hex::encode([8u8; 32]),
+            "PRAETORE_GATEWAY_EXECUTION_ATTESTER_KEY_FILE",
+            key_file(&dir, "execution.key", [8; 32]),
         )
+        .env_remove("PRAETORE_GATEWAY_EVIDENCE_ATTESTER_KEY_HEX")
+        .env_remove("PRAETORE_GATEWAY_EXECUTION_ATTESTER_KEY_HEX")
         .env("PRAETORE_GATEWAY_POLICY_FILE", &policy_file)
         .env("PRAETORE_GATEWAY_ISSUER_PIN_FILE", &pin_file)
         .env("PRAETORE_GATEWAY_APPROVER_KEY_ID", "port-in-use-approver")
@@ -142,7 +144,7 @@ fn postgres_gateway_service_reports_a_port_in_use() {
             "PRAETORE_GATEWAY_PORT",
             taken.local_addr().unwrap().port().to_string(),
         )
-        .env_remove("PRAETORE_GATEWAY_ADAPTER")
+        .env("PRAETORE_GATEWAY_ADAPTER", "local-demo")
         .env_remove("PRAETORE_GATEWAY_LISTEN_ADDR")
         .env_remove("PRAETORE_GATEWAY_API_CREDENTIALS_FILE")
         .env_remove("PRAETORE_GATEWAY_APPROVER_BINDINGS_FILE")
@@ -152,4 +154,13 @@ fn postgres_gateway_service_reports_a_port_in_use() {
     assert_reports_port_in_use(&output);
     drop(taken);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// An owner-only attester key file (64 hex characters) in `dir`.
+fn key_file(dir: &std::path::Path, name: &str, key: [u8; 32]) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, hex::encode(key)).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    path
 }

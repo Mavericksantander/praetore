@@ -425,7 +425,8 @@ pub enum RuntimeRoleError {
     /// `praetore_safety_ingest` or holds INSERT on `safety_records`), or the
     /// safety ingester's role can act as the gateway runtime role or holds
     /// a privilege on another `praetore` table (G1, SAF-09.5: ingestion has
-    /// its own credentials).
+    /// its own credentials), or an audit or observe role holds more than
+    /// its read-only grant.
     RoleSeparation(String),
 }
 
@@ -494,7 +495,8 @@ impl fmt::Display for RuntimeRoleError {
             ),
             Self::RoleSeparation(reason) => write!(
                 f,
-                "the gateway runtime role and the safety ingestion role must be separate: {reason}"
+                "the gateway runtime, safety ingestion, audit and observe roles must be \
+                 separate: {reason}"
             ),
             Self::UnexpectedGrant(grants) => write!(
                 f,
@@ -844,6 +846,8 @@ enum RoleKind {
     SafetyIngest,
     /// A read-only export and audit connection (`praetore_safety_audit`).
     SafetyAudit,
+    /// The read-only observability connection (`praetore-observe`).
+    Observe,
 }
 
 /// The checks of [`verify_runtime_role_with`] for the connection of
@@ -901,6 +905,109 @@ pub fn verify_safety_audit_role_with(
     let result = verify_runtime_role_in(&mut transaction, options, RoleKind::SafetyAudit);
     transaction.rollback()?;
     result
+}
+
+/// [`verify_runtime_role_with`] for the connection of `praetore-observe`,
+/// a read-only role: the same session and database-wide checks, and for
+/// its session and current role: not privileged, not an owner, no CREATE
+/// on the schema, not a member of `praetore_runtime`,
+/// `praetore_safety_ingest` or `praetore_safety_audit`, and no privilege
+/// on a `praetore` table other than SELECT on the journal and event columns
+/// that `praetore_observe` is granted (docs/observability-mvp.md). The
+/// gateway's runtime credential is refused.
+pub fn verify_observe_role_with(
+    client: &mut Client,
+    options: &RuntimeRoleOptions,
+) -> Result<(), RuntimeRoleError> {
+    let mut transaction = client.build_transaction().read_only(true).start()?;
+    let schemas: Vec<String> = transaction
+        .query_one(
+            "SELECT pg_catalog.current_schemas(true)::pg_catalog.text[]",
+            &[],
+        )?
+        .get(0);
+    if !options.allow_search_path
+        && let Some(first) = schemas.iter().find(|schema| !schema.starts_with("pg_temp"))
+        && first != "pg_catalog"
+    {
+        return Err(RuntimeRoleError::UnsafeSetting(format!(
+            "search_path that puts {first} before pg_catalog ({})",
+            schemas.join(", ")
+        )));
+    }
+    transaction.batch_execute(&format!(
+        "SET LOCAL search_path = {}",
+        crate::RUNTIME_SEARCH_PATH
+    ))?;
+    let result = verify_runtime_role_in(&mut transaction, options, RoleKind::Observe);
+    transaction.rollback()?;
+    result
+}
+
+/// For the observe role: a member of `praetore_runtime`,
+/// `praetore_safety_ingest` or `praetore_safety_audit`, or the `praetore`
+/// tables on which it holds a privilege beyond SELECT on the observe
+/// columns of `execution_journal` and `execution_journal_events` (up to
+/// ten).
+fn observe_excess(
+    transaction: &mut postgres::Transaction<'_>,
+    role: &str,
+) -> Result<Option<String>, RuntimeRoleError> {
+    let row = transaction.query_one(
+        "WITH observe_columns(rel, col) AS (VALUES \
+             ('execution_journal', 'tenant_id'), ('execution_journal', 'agent_id'), \
+             ('execution_journal', 'request_id'), ('execution_journal', 'request_digest'), \
+             ('execution_journal', 'action_digest'), \
+             ('execution_journal', 'authorization_status'), \
+             ('execution_journal', 'execution_status'), ('execution_journal', 'evidence_json'), \
+             ('execution_journal', 'created_at'), ('execution_journal', 'updated_at'), \
+             ('execution_journal_events', 'event_id'), ('execution_journal_events', 'tenant_id'), \
+             ('execution_journal_events', 'agent_id'), ('execution_journal_events', 'request_id'), \
+             ('execution_journal_events', 'from_status'), \
+             ('execution_journal_events', 'to_status'), \
+             ('execution_journal_events', 'occurred_at')) \
+         SELECT (SELECT g.rolname::pg_catalog.text FROM pg_catalog.pg_roles g \
+                 WHERE (g.rolname OPERATOR(pg_catalog.=) 'praetore_runtime' \
+                        OR g.rolname OPERATOR(pg_catalog.=) 'praetore_safety_ingest' \
+                        OR g.rolname OPERATOR(pg_catalog.=) 'praetore_safety_audit') \
+                   AND pg_catalog.pg_has_role($1, g.oid, 'MEMBER') \
+                 ORDER BY 1 LIMIT 1), \
+                (SELECT pg_catalog.string_agg(entry, ', ' ORDER BY entry) FROM ( \
+                     SELECT pg_catalog.concat('praetore.', c.relname) AS entry \
+                     FROM pg_catalog.pg_class c \
+                     JOIN pg_catalog.pg_namespace n \
+                       ON n.oid OPERATOR(pg_catalog.=) c.relnamespace \
+                     WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore' \
+                       AND (c.relkind OPERATOR(pg_catalog.=) 'r' \
+                            OR c.relkind OPERATOR(pg_catalog.=) 'p' \
+                            OR c.relkind OPERATOR(pg_catalog.=) 'v' \
+                            OR c.relkind OPERATOR(pg_catalog.=) 'm') \
+                       AND (pg_catalog.has_table_privilege($1, c.oid, \
+                                'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER') \
+                            OR pg_catalog.has_any_column_privilege($1, c.oid, \
+                                'INSERT, UPDATE, REFERENCES') \
+                            OR EXISTS (SELECT 1 FROM pg_catalog.pg_attribute att \
+                                WHERE att.attrelid OPERATOR(pg_catalog.=) c.oid \
+                                  AND att.attnum OPERATOR(pg_catalog.>) 0 \
+                                  AND NOT att.attisdropped \
+                                  AND pg_catalog.has_column_privilege($1, c.oid, att.attnum, \
+                                      'SELECT') \
+                                  AND NOT EXISTS (SELECT 1 FROM observe_columns oc \
+                                      WHERE oc.rel OPERATOR(pg_catalog.=) c.relname::pg_catalog.text \
+                                        AND oc.col OPERATOR(pg_catalog.=) \
+                                            att.attname::pg_catalog.text))) \
+                     ORDER BY 1 LIMIT 10) first_entries)",
+        &[&role],
+    )?;
+    if let Some(group) = row.get::<_, Option<String>>(0) {
+        return Ok(Some(format!(
+            "observe role {role} is a member of {group}; praetore-observe needs a read-only \
+             role (praetore_observe, docs/observability-mvp.md)"
+        )));
+    }
+    Ok(row.get::<_, Option<String>>(1).map(|tables| {
+        format!("observe role {role} holds privileges beyond the observe columns on {tables}")
+    }))
 }
 
 /// For an audit role: a member of `praetore_runtime` or
@@ -1125,6 +1232,11 @@ fn verify_runtime_role_in(
             }
             RoleKind::SafetyAudit => {
                 if let Some(reason) = safety_audit_excess(transaction, &role)? {
+                    return Err(RuntimeRoleError::RoleSeparation(reason));
+                }
+            }
+            RoleKind::Observe => {
+                if let Some(reason) = observe_excess(transaction, &role)? {
                     return Err(RuntimeRoleError::RoleSeparation(reason));
                 }
             }

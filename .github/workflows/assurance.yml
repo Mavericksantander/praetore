@@ -118,12 +118,54 @@ jobs:
         run: make demo demo-verify
       - name: Receipt verification demo (DEMO/TEST-ONLY keys)
         run: ./demo/verify-receipt.sh
+      - name: verify is OK only against both heads kept elsewhere (output shown)
+        run: |
+          set -euo pipefail
+          output="$(cargo test --locked -p praetore-mcp --test verify_anchor -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok\. 6 passed" <<<"$output" || { echo "::error::expected the 6 tests of tests/verify_anchor.rs to run and pass"; exit 1; }
+      - name: The journal is exactly the chain that ends at the head (output shown)
+        run: |
+          set -euo pipefail
+          output="$(cargo test --locked -p praetore-mcp --test journal_exact_chain -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok\. 8 passed" <<<"$output" || { echo "::error::expected the 8 tests of tests/journal_exact_chain.rs to run and pass"; exit 1; }
+      - name: Keys reached through a symlink or a hard link are refused (output shown)
+        run: |
+          set -euo pipefail
+          output="$(cargo test --locked -p praetore-mcp --test keys_symlinks -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok\. 5 passed" <<<"$output" || { echo "::error::expected the 5 tests of tests/keys_symlinks.rs to run and pass"; exit 1; }
+      - name: serde_json is built with float_roundtrip in every package that ships it
+        run: scripts/check-float-roundtrip.sh
+      - name: The gate decides on the number the server reads (boundary literals, output shown)
+        run: |
+          set -euo pipefail
+          output="$(cargo test --locked -p praetore-mcp --test numeric_gate -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok\. 2 passed" <<<"$output" || { echo "::error::expected the 2 tests of tests/numeric_gate.rs to run and pass"; exit 1; }
+      - name: Every appended receipt verifies (random floats and literals, output shown)
+        run: |
+          set -euo pipefail
+          output="$(cargo test --locked -p praetore-mcp --test journal_verified_line -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok\. 4 passed" <<<"$output" || { echo "::error::expected the 4 tests of tests/journal_verified_line.rs to run and pass"; exit 1; }
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # A new Expiry::at() call without #[expect] must fail clippy in this
+      # job's environment. tests/lint_guard.rs reads sources and config
+      # files; this also catches lint levels only the build sees (RUSTFLAGS,
+      # .cargo/config.toml, workspace lints, a crate-level allow).
+      - name: Clippy canary (Expiry::at without expect fails)
+        run: scripts/clippy-canary.sh
       - run: cargo fmt --all -- --check
       - run: cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check
       - name: Validate Kubernetes manifest YAML syntax
         run: |
           ruby -e 'require "yaml"; Dir.glob("deploy/kubernetes/**/*.yaml").each { |path| YAML.load_stream(File.read(path)); puts "valid YAML: #{path}" }'
+      - name: Kubernetes policy templates have an ingress and egress default-deny per namespace
+        run: |
+          ruby scripts/check-k8s-default-deny.rb
+          scripts/test-check-k8s-default-deny.sh
       - name: Check changed patch whitespace
         if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
         run: git diff --check ${{ github.event.pull_request.base.sha || github.event.before }}...HEAD
@@ -282,6 +324,31 @@ jobs:
       - run: python -m unittest discover -s packages/praetore-python/tests -v
       - run: ./examples/third-party-verification/verify.sh
 
+  console-page:
+    name: Console page (language and local time)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+      # node:test only, no npm packages. The times are checked with explicit
+      # zones; running under two machine zones shows the result does not
+      # depend on the machine's own.
+      - run: node --version
+      - name: Page tests, machine zone UTC
+        run: TZ=UTC node --test "crates/praetore-console/tests-js/*.test.mjs"
+      - name: Page tests, machine zone Asia/Kolkata
+        run: TZ=Asia/Kolkata node --test "crates/praetore-console/tests-js/*.test.mjs"
+      # The praetore-mcp dashboard page on a stand-in DOM and canvas, fed
+      # with real /api/state answers (tests-js/fixtures/make.sh).
+      - name: Dashboard page tests, machine zone UTC
+        run: TZ=UTC node --test "crates/praetore-mcp/tests-js/*.test.mjs"
+      - name: Dashboard page tests, machine zone Asia/Kolkata
+        run: TZ=Asia/Kolkata node --test "crates/praetore-mcp/tests-js/*.test.mjs"
+
   claude-code-hook-example:
     name: Claude Code hook example (standalone)
     runs-on: ubuntu-latest
@@ -330,28 +397,10 @@ jobs:
           target/release/praetore-verify evidence --evidence examples/verify/evidence.json \
             --attester-pin examples/verify/attester-public-key.hex \
             --issuer-pins examples/verify/issuer-pins.jsonl --require-intent --format json
+      # Exit codes, not a search of the output: a test whose child process
+      # writes to stdout splits the `test ... ok` line. See the script.
       - name: HighAssurance hook tests (output shown)
-        run: |
-          set -euo pipefail
-          output="$(cargo test --manifest-path examples/claude-code-hook/Cargo.toml --locked tests_high_assurance -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
-          echo "$output"
-          grep -Eq "test result: ok\. [0-9]+ passed; 0 failed" <<<"$output" || { echo "::error::the HighAssurance hook tests failed"; exit 1; }
-          for test in every_receipt_records_a_signed_decision_time \
-            declared_safety_tool_gets_no_receipt_and_no_claim \
-            state_without_a_replay_store_is_refused_with_a_pointer_to_init \
-            unavailable_replay_store_fails_closed \
-            unwritable_receipts_journal_denies_and_leaves_an_orphan_claim \
-            tool_use_id_is_signed_and_tampering_fails \
-            same_tool_use_id_twice_is_allowed_and_reported \
-            missing_tool_use_id_is_recorded_as_absent \
-            tool_use_id_is_bounded_and_escaped \
-            guard::replaying_the_same_request_is_refused \
-            guard::guard_reports_unavailable_when_the_store_is \
-            guard::concurrent_claims_of_one_request_succeed_exactly_once \
-            guard::concurrent_hook_calls_each_claim_their_own_request \
-            guard::directory_owned_by_another_user_is_refused; do
-            grep -q "^test tests_high_assurance::$test \.\.\. ok$" <<<"$output" || { echo "::error::$test did not run or failed"; exit 1; }
-          done
+        run: scripts/check-hook-high-assurance-tests.sh
       # SAF-14: two agents sign with different issued identities, and no
       # edit of index.json or of the receipt re-attributes a receipt.
       - name: Per-agent attribution end to end
@@ -425,10 +474,11 @@ jobs:
           for test in \
             "--bin praetore journal_export::tests::postgres_export_reads_only_the_tenant_rows_in_insert_order" \
             "--bin praetore journal_export::tests::postgres_export_as_runtime_role_is_confined_by_row_level_security" \
-            "--bin praetore journal_export::tests::postgres_export_orders_by_created_at_then_request_id_then_agent_id" \
+            "--bin praetore journal_export::tests::postgres_export_orders_by_commit_position_not_created_at" \
             "--test journal_export_postgres postgres_cli_journal_export_tenant_end_to_end" \
             "--test journal_export_postgres postgres_cli_journal_export_after_attester_key_rotation" \
             "--test journal_export_postgres postgres_cli_run_reports_a_port_in_use" \
+            "--test journal_export_postgres postgres_cli_journal_export_tenant_ranges_of_10000_receipts" \
             "--bin praetore journal_export::tests::postgres_database_export_and_tenant_reference" \
             "--bin praetore tests::postgres_find_pending_agent_ignores_hostile_search_path"; do
             read -r flag target name <<<"$test"
@@ -438,6 +488,22 @@ jobs:
             echo "::endgroup::"
             grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::$name did not run"; exit 1; }
           done
+      - name: Console approvals inbox against PostgreSQL and praetore run (P-002 D2)
+        run: |
+          set -euo pipefail
+          name=postgres_console_inbox_approves_dispatches_and_rejects_through_the_gateway
+          output="$(cargo test -p praetore-cli --locked --test console_inbox_postgres -- --ignored --exact "$name" 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::$name did not run"; exit 1; }
+      - name: Console compliance package verified with praetore-verify (P-002 D3)
+        run: |
+          set -euo pipefail
+          # Runs target/debug/praetore-verify, built by an earlier step of
+          # this job.
+          name=postgres_console_compliance_pack_verifies_with_praetore_verify
+          output="$(cargo test -p praetore-cli --locked --test console_inbox_postgres -- --ignored --exact "$name" 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::$name did not run"; exit 1; }
       - name: G1 safety ingestion against PostgreSQL (binary, flood, sender check, export, verify)
         run: |
           set -euo pipefail
@@ -455,12 +521,13 @@ jobs:
             echo "::endgroup::"
             grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::$name did not run"; exit 1; }
           done
-      - name: Services report a port in use (praetore-gateway-demo, praetore-observe)
+      - name: Services report a port in use (praetore-gateway-demo, praetore-observe); observe read-only role check
         run: |
           set -euo pipefail
           for test in \
             "praetore-gateway-service postgres_gateway_service_reports_a_port_in_use" \
-            "praetore-observe postgres_observe_reports_a_port_in_use"; do
+            "praetore-observe postgres_observe_reports_a_port_in_use" \
+            "praetore-observe postgres_observe_refuses_the_gateway_runtime_role"; do
             read -r package name <<<"$test"
             echo "::group::$name"
             output="$(cargo test -p "$package" --locked --test port_in_use -- --ignored --exact "$name" 2>&1)" || { echo "$output"; exit 1; }
@@ -692,8 +759,24 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - run: cargo build --release --locked --package praetore-mcp --target ${{ matrix.target }}
+      # The version check runs the x86_64 binary on Apple silicon.
+      - name: Install Rosetta 2 for the x86_64 version check
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: softwareupdate --install-rosetta --agree-to-license
       - name: Show binary architecture
         run: file target/${{ matrix.target }}/release/praetore-mcp
+      # The version the binary prints (and writes in its session reports)
+      # comes from crates/praetore-mcp/build_version.rs; the rules are in
+      # scripts/check-build-version.sh, tested first.
+      - name: Self-test of the build version check
+        run: scripts/test-check-build-version.sh
+      - name: Check the build version against the ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          crate=$(cargo metadata --no-deps --format-version 1 --locked |
+            python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "praetore-mcp"))')
+          scripts/check-build-version.sh "target/${{ matrix.target }}/release/praetore-mcp" "${crate}" "${GITHUB_REF}" "${GITHUB_REF_NAME}"
       - name: Package binary with its checksum
         shell: bash
         run: |
@@ -758,9 +841,13 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
-      # @modelcontextprotocol/server-filesystem@2.1.0 and its dependencies
+      # @modelcontextprotocol/server-filesystem@2.3.0 and its dependencies
       # exactly as in scripts/mcp-smoke/package-lock.json.
       - run: npm ci --ignore-scripts --no-audit --no-fund --prefix scripts/mcp-smoke
+      # The smoke reads the crate version with cargo metadata.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Version comparison of the smoke test (release, dev, rc)
+        run: python3 -I scripts/test-mcp-smoke-version.py
       # A real tools/call allowed and one denied, then `verify`.
       - name: End-to-end smoke test of the packaged binary
         run: python3 -I scripts/mcp-smoke.py "$MCP_BINARY"

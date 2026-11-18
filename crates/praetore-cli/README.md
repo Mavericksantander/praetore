@@ -118,12 +118,57 @@ exports one source's chain (or `--source _unattributed`) after verifying it,
 never overwriting, and verifies it offline. Format:
 [docs/proposals/safety-ingestion-jsonl.md](../../docs/proposals/safety-ingestion-jsonl.md).
 
+### Tenant journal in ranges
+
+`praetore journal-export --tenant` exports a whole chain of at most 4096
+entries and 8 MiB. For a longer one, export ranges: `--from-seq 0 [--limit
+N]` writes the first and prints `next_from_seq`; each later range starts
+with its anchor (the receipt just before it) and is verified with
+`praetore-verify journal --range --expected-anchor <head of the previous
+range>`. Ranges carry receipts only, with no database reference, and
+`--from-seq` counts receipts. In a database without storage records the
+last range's head is the head of the whole-chain export; in a database with
+storage records the whole-chain export opens with a `database_head` line at
+`seq` 0, so the same receipt has another `seq` there and the two heads are
+not interchangeable. A range never overwrites a file. See
+[docs/operations.md](../../docs/operations.md#tenant-journal-in-ranges).
+
+```sh
+praetore journal-export --tenant <uuid> --attester-pin attester-public-key.hex \
+  --from-seq 0 --limit 3000 --output part-0.jsonl
+praetore journal-export --tenant <uuid> --attester-pin attester-public-key.hex \
+  --from-seq <next_from_seq> --limit 3000 --output part-1.jsonl
+praetore-verify journal --journal part-1.jsonl --attester-pin attester-public-key.hex \
+  --range --expected-anchor <head of part-0>
+```
+
 ### Human approval
 
 `init` also creates a local human approver key (`approver.key`, owner-only)
 and its public pin (`approver-pin.json`, approver id `local-approver`). The
 gateway loads only the pin; without it, approval is disabled and every
 approval attempt is refused (`approval_not_configured`).
+
+`init` also writes `execution-pin.json`: the public pin of the execution key
+that signs execution receipts (`{"schema_version":1,"key_id":"local-demo-<public key hex>","public_key_hex":...}`,
+no secret). The console's compliance package
+(`PRAETORE_CONSOLE_EXECUTION_PIN_FILES`) and `praetore-verify outcomes
+--execution-pin` take it. For a directory initialized before `init` wrote
+it:
+
+```sh
+praetore execution-pin ./praetore-local   # reads execution-attester.key itself; never overwrites
+```
+
+`init` also writes `attester-public-key.hex`: the public key of the evidence
+attester that signs the journal receipts, 64 lowercase hex characters (no
+secret). The console's `PRAETORE_CONSOLE_ATTESTER_PIN_FILES` and
+`praetore journal-export --attester-pin` take it. For a directory
+initialized before `init` wrote it:
+
+```sh
+praetore attester-pin ./praetore-local    # reads evidence-attester.key itself; never overwrites
+```
 
 When a policy rule has effect `RequireApproval`, `praetore demo` returns
 `requires_approval` / `not_dispatched` and prints the commands to resolve it:

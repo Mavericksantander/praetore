@@ -471,7 +471,12 @@ Production infrastructure must ensure protected tool credentials are absent
 from agent workloads and deny agent egress to protected APIs, allowing access
 only to the gateway. The repository includes a reference
 [Kubernetes NetworkPolicy set](../deploy/kubernetes/mandatory-enforcement.yaml)
-for separately networked agent, gateway, data, and tool workloads. Adapt its
+for separately networked agent, gateway, data, and tool workloads. It starts
+each namespace it writes policies for from a default-deny of ingress and
+egress for every pod (`podSelector: {}`), and the allows add to that
+floor. The gateway proxy may
+reach protected tools, cluster DNS and public HTTPS addresses; protected
+tools get no egress from the template (add what each tool needs). Adapt its
 selectors and ports to the cluster, use a CNI that enforces NetworkPolicy, and
 ensure no additional policy re-allows direct agent egress. Kubernetes
 NetworkPolicies are additive; this example does not override another policy

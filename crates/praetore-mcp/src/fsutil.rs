@@ -1,5 +1,6 @@
 //! Careful file replacement for client configs and the policy.
 
+use crate::shown::Show;
 use std::{
     fs,
     io::{self, Write},
@@ -47,18 +48,18 @@ fn parent_of(path: &Path) -> &Path {
 /// symlink (dotfile managers), so the link is preserved.
 pub fn resolve_target(path: &Path) -> Result<PathBuf, String> {
     let metadata =
-        fs::symlink_metadata(path).map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
+        fs::symlink_metadata(path).map_err(|e| format!("cannot stat {}: {e}", path.shown()))?;
     let real = if metadata.file_type().is_symlink() {
         fs::canonicalize(path)
-            .map_err(|e| format!("cannot resolve symlink {}: {e}", path.display()))?
+            .map_err(|e| format!("cannot resolve symlink {}: {e}", path.shown()))?
     } else {
         path.to_path_buf()
     };
     if !fs::metadata(&real)
-        .map_err(|e| format!("cannot stat {}: {e}", real.display()))?
+        .map_err(|e| format!("cannot stat {}: {e}", real.shown()))?
         .is_file()
     {
-        return Err(format!("{} is not a regular file", real.display()));
+        return Err(format!("{} is not a regular file", real.shown()));
     }
     Ok(real)
 }
@@ -97,19 +98,19 @@ fn write_backup(real: &Path, contents: &str) -> Result<PathBuf, String> {
                 file.write_all(contents.as_bytes())
                     .and_then(|()| file.sync_all())
                     .and_then(|()| sync_dir(parent_of(&candidate)))
-                    .map_err(|e| format!("cannot write backup {}: {e}", candidate.display()))?;
+                    .map_err(|e| format!("cannot write backup {}: {e}", candidate.shown()))?;
                 return Ok(candidate);
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
                 return Err(format!(
                     "cannot create backup {}: {error}",
-                    candidate.display()
+                    candidate.shown()
                 ));
             }
         }
     }
-    Err(format!("too many backups next to {}", real.display()))
+    Err(format!("too many backups next to {}", real.shown()))
 }
 
 /// Replaces the file at `path` (or its symlink target) with `updated`:
@@ -124,15 +125,15 @@ pub fn write_with_backup(
 ) -> Result<(PathBuf, PathBuf), String> {
     let real = resolve_target(path)?;
     let current =
-        fs::read_to_string(&real).map_err(|e| format!("cannot read {}: {e}", real.display()))?;
+        fs::read_to_string(&real).map_err(|e| format!("cannot read {}: {e}", real.shown()))?;
     if current != original {
         return Err(format!(
             "{} changed while praetore-mcp was working; nothing was written",
-            real.display()
+            real.shown()
         ));
     }
     let permissions = fs::metadata(&real)
-        .map_err(|e| format!("cannot stat {}: {e}", real.display()))?
+        .map_err(|e| format!("cannot stat {}: {e}", real.shown()))?
         .permissions();
     #[cfg(unix)]
     let mode = {
@@ -159,7 +160,7 @@ pub fn write_with_backup(
     })();
     if let Err(error) = result {
         let _ = fs::remove_file(&tmp);
-        return Err(format!("cannot update {}: {error}", real.display()));
+        return Err(format!("cannot update {}: {error}", real.shown()));
     }
     Ok((real, backup))
 }

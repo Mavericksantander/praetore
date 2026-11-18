@@ -47,18 +47,25 @@ fn with_dir<'a>(args: &[&'a str], dir: &'a str) -> Vec<&'a str> {
 fn invalid_input_never_writes() {
     let (_temp, home) = init();
     let dir = home.to_str().unwrap();
+    // `init` writes no rules; add one so a duplicate id can be tried.
+    let out = run(&with_dir(
+        &[
+            "policy",
+            "allow",
+            "--id",
+            "allow-read",
+            "--tool",
+            "read_file",
+        ],
+        dir,
+    ));
+    assert!(out.status.success(), "{out:?}");
+    let backups_before = backups(&home);
     let policy = home.join("policy.json");
     let before = fs::read(&policy).unwrap();
     let bad: &[&[&str]] = &[
         // duplicate id
-        &[
-            "policy",
-            "deny",
-            "--id",
-            "allow-all-mcp-tool-calls",
-            "--tool",
-            "x",
-        ],
+        &["policy", "deny", "--id", "allow-read", "--tool", "x"],
         // argument condition without a tool/server selector
         &["policy", "deny", "--id", "a", "--arg-exact", "path=/etc"],
         // no selector at all
@@ -115,7 +122,7 @@ fn invalid_input_never_writes() {
             "{args:?} modified the policy"
         );
     }
-    assert_eq!(backups(&home), 0);
+    assert_eq!(backups(&home), backups_before);
 }
 
 #[test]
@@ -141,7 +148,7 @@ fn add_list_remove_with_backups() {
     assert_eq!(backups(&home), 1);
     let policy: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(home.join("policy.json")).unwrap()).unwrap();
-    let rule = &policy["rules"][1];
+    let rule = &policy["rules"][0];
     assert_eq!(rule["required_capability"], "mcp:tools/call");
     assert_eq!(rule["parameter_conditions"][2]["expected"], true);
     assert_eq!(policy["version"], 2);
@@ -259,7 +266,10 @@ fn concurrent_policy_writes_are_locked_out() {
         dir,
     ));
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("another `praetore-mcp policy`"));
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("another praetore-mcp policy command is running")
+    );
     assert_eq!(fs::read(home.join("policy.json")).unwrap(), before);
     fs::remove_file(home.join("policy.json.lock")).unwrap();
     let out = run(&with_dir(

@@ -2,11 +2,24 @@
 //! `docs/proposals/journal-chain-jsonl.md`. The chain itself is built by
 //! `praetore_core::journal_chain::ChainExporter`, the same code the verifier
 //! uses, so producer and verifier cannot disagree on the link.
+//!
+//! With `--tenant`, `--from-seq N [--limit M]` exports one range of the
+//! tenant's chain of receipts: for N > 0 the anchor (the receipt at `seq`
+//! N - 1) on the first line, then up to M receipts (default and most
+//! `MAX_CHAIN_ENTRIES`) within `MAX_CHAIN_BYTES`; the output names
+//! `next_from_seq` for the next range. Verify a later range with
+//! `praetore-verify journal --range --expected-anchor <head of the previous
+//! range>`.
 
+#[cfg(test)]
+use praetore_core::Evidence;
 use praetore_core::{
-    Evidence, StorageRecord, VerifiedPublicKey,
-    journal_chain::{ChainExporter, ChainHead, DatabaseHead, MAX_CHAIN_ENTRIES},
+    VerifiedPublicKey,
+    journal_chain::{ChainHead, DatabaseHead, MAX_CHAIN_ENTRIES},
 };
+#[cfg(test)]
+use praetore_replay_postgres::journal_export::export_transaction;
+use praetore_replay_postgres::journal_export::{self as shared, RECORD_PIN_HINT};
 use std::{
     fs,
     io::{Read, Write},
@@ -17,6 +30,11 @@ use uuid::Uuid;
 type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 const MAX_RECEIPT_BYTES: u64 = 65_536;
+
+/// The shared export's errors are `Send + Sync`; the CLI's are not.
+fn lift<T>(result: shared::ExportResult<T>) -> CliResult<T> {
+    result.map_err(|error| error as Box<dyn std::error::Error>)
+}
 
 /// Where the receipts come from. Exactly one source per export.
 #[derive(Debug, PartialEq, Eq)]
@@ -42,6 +60,8 @@ pub struct ExportArgs {
     /// rotation, pin the retired key as well as the current one.
     pub attester_pins: Vec<PathBuf>,
     pub output: PathBuf,
+    /// `Some((from_seq, limit))` for a range of a `--tenant` chain.
+    pub range: Option<(u64, usize)>,
 }
 
 pub fn parse(args: impl Iterator<Item = String>) -> CliResult<ExportArgs> {
@@ -50,6 +70,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> CliResult<ExportArgs> {
     let mut attester_pins = Vec::new();
     let mut output = None;
     let mut database = false;
+    let (mut from_seq, mut limit) = (None, None);
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         if flag == "--database" {
@@ -70,6 +91,8 @@ pub fn parse(args: impl Iterator<Item = String>) -> CliResult<ExportArgs> {
             "--receipts-dir" => &mut receipts_dir,
             "--tenant" => &mut tenant,
             "--output" => &mut output,
+            "--from-seq" => &mut from_seq,
+            "--limit" => &mut limit,
             _ => return Err(format!("unexpected argument: {flag}").into()),
         };
         let value = args.next().ok_or(format!("missing value for {flag}"))?;
@@ -88,20 +111,39 @@ pub fn parse(args: impl Iterator<Item = String>) -> CliResult<ExportArgs> {
     if attester_pins.is_empty() {
         return Err("missing --attester-pin".into());
     }
+    let range = match (from_seq, limit) {
+        (None, None) => None,
+        (None, Some(_)) => return Err("--limit needs --from-seq".into()),
+        (Some(_), _) if !matches!(source, Source::Database { .. }) => {
+            return Err("--from-seq applies to --tenant only".into());
+        }
+        (Some(from), limit) => {
+            let from = from
+                .parse::<u64>()
+                .ok()
+                .filter(|seq| *seq < (1 << 53))
+                .ok_or("--from-seq must be a seq (0 or more)")?;
+            let limit = match limit {
+                None => MAX_CHAIN_ENTRIES,
+                Some(value) => value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|limit| (1..=MAX_CHAIN_ENTRIES).contains(limit))
+                    .ok_or(format!("--limit must be between 1 and {MAX_CHAIN_ENTRIES}"))?,
+            };
+            Some((from, limit))
+        }
+    };
     Ok(ExportArgs {
         source,
         attester_pins,
         output: output.ok_or("missing --output")?.into(),
+        range,
     })
 }
 
 /// Most attester pins one export accepts.
 const MAX_ATTESTER_PINS: usize = 16;
-
-/// Hint for a storage record signed by a key that is not pinned.
-const RECORD_PIN_HINT: &str = "storage records keep the signature of the attester key that was \
-     current when they were recorded; after a key rotation, pass the retired key's pin as \
-     another --attester-pin";
 
 pub fn run(args: ExportArgs) -> CliResult<()> {
     let mut attesters: Vec<VerifiedPublicKey> = Vec::with_capacity(args.attester_pins.len());
@@ -121,20 +163,52 @@ pub fn run(args: ExportArgs) -> CliResult<()> {
         std::env::var("PRAETORE_GATEWAY_DATABASE_URL")
             .map_err(|_| "PRAETORE_GATEWAY_DATABASE_URL must point to local PostgreSQL")
     };
+    if let (Source::Database { tenant_id }, Some((from_seq, limit))) = (&args.source, args.range) {
+        let mut client = connect_for_tenant_export(&url()?)?;
+        let range = lift(shared::export_tenant_range(
+            &mut client,
+            *tenant_id,
+            attester,
+            from_seq,
+            limit,
+        ))?;
+        write_new(&args.output, &range.text)?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "command": "journal-export",
+                "kind": "tenant",
+                "range_start": range.range_start,
+                "entries": range.head.entries.get() - range.range_start,
+                "head": range.head.head.to_hex(),
+                "anchor": range.anchor.map(|anchor| anchor.to_hex()),
+                "next_from_seq": range.next_from_seq,
+                "database_head": serde_json::Value::Null,
+            })
+        );
+        return Ok(());
+    }
     let (text, head, kind, database_head) = match &args.source {
         Source::ReceiptsDir(dir) => {
             let (text, head) = export(&read_receipts_dir(dir)?, attester)?;
             (text, head, "tenant", None)
         }
         Source::Database { tenant_id } => {
-            let (receipts, records) = read_tenant_export(&url()?, *tenant_id)?;
-            let database_head = if records.is_empty() {
-                None
-            } else {
-                Some(DatabaseHead::from(records_chain(&records)?.1))
-            };
-            let (text, head) = export_with_database_head(&receipts, database_head, attester)?;
-            (text, head, "tenant", database_head)
+            let mut client = connect_for_tenant_export(&url()?)?;
+            let export = lift(shared::export_tenant(&mut client, *tenant_id, attester)).map_err(
+                |error| {
+                    let text = error.to_string();
+                    if text.contains("too many journal rows")
+                        || text.contains("exceeds the size or entry limit")
+                    {
+                        format!("{text}: export it in ranges with --from-seq 0 [--limit N]").into()
+                    } else {
+                        error
+                    }
+                },
+            )?;
+            (export.text, export.head, "tenant", export.database_head)
         }
         Source::StorageRecords => {
             let records = read_storage_records_only(&url()?)?;
@@ -145,14 +219,7 @@ pub fn run(args: ExportArgs) -> CliResult<()> {
             (text, head, "database", None)
         }
     };
-    // Never overwrite: an existing file may be an anchored export.
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&args.output)
-        .map_err(|error| format!("cannot create {}: {error}", args.output.display()))?;
-    file.write_all(text.as_bytes())?;
-    file.sync_all()?;
+    write_new(&args.output, &text)?;
     println!(
         "{}",
         serde_json::json!({
@@ -167,6 +234,18 @@ pub fn run(args: ExportArgs) -> CliResult<()> {
             })),
         })
     );
+    Ok(())
+}
+
+/// Never overwrite: an existing file may be an anchored export.
+fn write_new(path: &Path, text: &str) -> CliResult<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -187,16 +266,11 @@ pub fn export_with_database_head(
     database_head: Option<DatabaseHead>,
     attester: &[VerifiedPublicKey],
 ) -> CliResult<(String, ChainHead)> {
-    let mut exporter = ChainExporter::with_attesters(attester);
-    if let Some(reference) = &database_head {
-        exporter.push_database_head(reference)?;
-    }
-    for (index, json) in receipts.iter().enumerate() {
-        let evidence = Evidence::from_json(json.trim_end())
-            .map_err(|error| format!("receipt {index}: {error}"))?;
-        exporter.push(&evidence)?;
-    }
-    Ok(exporter.finish()?)
+    lift(shared::export_with_database_head(
+        receipts,
+        database_head,
+        attester,
+    ))
 }
 
 /// The database chain: signed storage records in recording order.
@@ -204,26 +278,11 @@ pub fn export_storage_records(
     records: &[String],
     attester: &[VerifiedPublicKey],
 ) -> CliResult<(String, ChainHead)> {
-    let mut exporter = ChainExporter::with_attesters(attester);
-    for (index, json) in records.iter().enumerate() {
-        let record = StorageRecord::from_json(json)
-            .map_err(|error| format!("storage record {index}: {error}"))?;
-        exporter.push_record(&record)?;
-    }
-    Ok(exporter.finish()?)
+    lift(shared::export_storage_records(records, attester))
 }
 
 pub(crate) fn read_attester_pin(path: &Path) -> CliResult<VerifiedPublicKey> {
-    let text = read_limited(path)?;
-    let encoded = text.trim();
-    if encoded.len() != 64
-        || !encoded
-            .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    {
-        return Err("attester pin must be 64 lowercase hex characters".into());
-    }
-    Ok(VerifiedPublicKey::from_bytes(&hex::decode(encoded)?)?)
+    lift(shared::parse_attester_pin(&read_limited(path)?))
 }
 
 fn read_limited(path: &Path) -> CliResult<String> {
@@ -263,12 +322,6 @@ fn read_receipts_dir(dir: &Path) -> CliResult<Vec<String>> {
         .collect()
 }
 
-/// Total order of one tenant's rows. Without `agent_id`, two agents of the
-/// same tenant reusing a `request_id` with equal `created_at` would come back
-/// in an unspecified order, and two exports of the same journal could differ.
-const JOURNAL_QUERY: &str = "SELECT evidence_json FROM praetore.execution_journal \
-     WHERE tenant_id = $1 ORDER BY created_at, request_id, agent_id LIMIT $2";
-
 #[cfg(test)]
 fn read_journal(database_url: &str, tenant_id: Uuid) -> CliResult<Vec<String>> {
     let mut client = crate::connect_local_database(database_url)?;
@@ -281,84 +334,40 @@ fn read_journal(database_url: &str, tenant_id: Uuid) -> CliResult<Vec<String>> {
     read_journal_rows(&mut client, tenant_id)
 }
 
-/// Storage records in recording order (none before migration 0015).
-const STORAGE_RECORDS_QUERY: &str = "SELECT record_json FROM praetore.storage_records \
-     ORDER BY created_at, record_id LIMIT $1";
-
-fn read_storage_records(transaction: &mut postgres::Transaction<'_>) -> CliResult<Vec<String>> {
-    let exists: bool = transaction
-        .query_one(
-            "SELECT pg_catalog.to_regclass('praetore.storage_records') IS NOT NULL",
-            &[],
-        )?
-        .get(0);
-    if !exists {
-        return Ok(Vec::new());
-    }
-    let limit = (MAX_CHAIN_ENTRIES + 1) as i64;
-    let rows = transaction.query(STORAGE_RECORDS_QUERY, &[&limit])?;
-    if rows.len() > MAX_CHAIN_ENTRIES {
-        return Err("too many storage records for one export".into());
-    }
-    Ok(rows.iter().map(|row| row.get(0)).collect())
-}
-
 fn read_storage_records_only(database_url: &str) -> CliResult<Vec<String>> {
     let mut client = crate::connect_local_database(database_url)?;
-    let mut transaction = export_transaction(&mut client, Uuid::nil())?;
-    let records = read_storage_records(&mut transaction)?;
-    transaction.commit()?;
-    Ok(records)
+    lift(shared::read_storage_records_only(&mut client))
 }
 
-/// The tenant's receipts and the database's storage records, read in one
-/// repeatable-read snapshot so the tenant chain references the database
-/// head of the same moment.
-fn read_tenant_export(
-    database_url: &str,
-    tenant_id: Uuid,
-) -> CliResult<(Vec<String>, Vec<String>)> {
+/// The runtime role check warns and goes on, as before: the export query
+/// still filters by tenant.
+fn connect_for_tenant_export(database_url: &str) -> CliResult<postgres::Client> {
     let mut client = crate::connect_local_database(database_url)?;
     if let Err(error) = praetore_replay_postgres::verify_runtime_role(&mut client) {
         eprintln!("warning: {error} (the export query still filters by tenant)");
     }
-    let mut transaction = export_transaction(&mut client, tenant_id)?;
-    let limit = (MAX_CHAIN_ENTRIES + 1) as i64;
-    let rows = transaction.query(JOURNAL_QUERY, &[&tenant_id, &limit])?;
-    let records = read_storage_records(&mut transaction)?;
-    transaction.commit()?;
-    if rows.len() > MAX_CHAIN_ENTRIES {
-        return Err("too many journal rows for one export".into());
-    }
-    Ok((rows.iter().map(|row| row.get(0)).collect(), records))
+    Ok(client)
+}
+
+#[cfg(test)]
+fn read_tenant_export(
+    database_url: &str,
+    tenant_id: Uuid,
+) -> CliResult<(Vec<String>, Vec<String>)> {
+    let mut client = connect_for_tenant_export(database_url)?;
+    lift(shared::read_tenant_export(&mut client, tenant_id))
 }
 
 #[cfg(test)]
 fn read_journal_rows(client: &mut postgres::Client, tenant_id: Uuid) -> CliResult<Vec<String>> {
     let mut transaction = export_transaction(client, tenant_id)?;
     let limit = (MAX_CHAIN_ENTRIES + 1) as i64;
-    let rows = transaction.query(JOURNAL_QUERY, &[&tenant_id, &limit])?;
+    let rows = transaction.query(shared::JOURNAL_QUERY, &[&tenant_id, &limit])?;
     transaction.commit()?;
     if rows.len() > MAX_CHAIN_ENTRIES {
         return Err("too many journal rows for one export".into());
     }
-    Ok(rows.iter().map(|row| row.get(0)).collect())
-}
-
-/// A READ ONLY transaction with `praetore.tenant_id` set for its duration
-/// only, which is what the `tenant_isolation` RLS policies (migration 0008)
-/// read.
-fn export_transaction(
-    client: &mut postgres::Client,
-    tenant_id: Uuid,
-) -> Result<postgres::Transaction<'_>, postgres::Error> {
-    let mut transaction = client
-        .build_transaction()
-        .read_only(true)
-        .isolation_level(postgres::IsolationLevel::RepeatableRead)
-        .start()?;
-    praetore_replay_postgres::set_tenant_context(&mut transaction, tenant_id)?;
-    Ok(transaction)
+    lift(shared::receipts_in_chain_order(&rows))
 }
 
 #[cfg(test)]
@@ -367,6 +376,50 @@ mod tests {
 
     fn args(list: &[&str]) -> CliResult<ExportArgs> {
         parse(list.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn a_range_needs_a_tenant_and_a_valid_from_seq_and_limit() {
+        let tenant = "00000000-0000-0000-0000-000000000001";
+        let with = |extra: &[&str]| {
+            let mut all = vec!["--tenant", tenant, "--attester-pin", "p", "--output", "o"];
+            all.extend_from_slice(extra);
+            args(&all)
+        };
+        assert_eq!(with(&[]).unwrap().range, None);
+        assert_eq!(
+            with(&["--from-seq", "0"]).unwrap().range,
+            Some((0, MAX_CHAIN_ENTRIES))
+        );
+        assert_eq!(
+            with(&["--from-seq", "4096", "--limit", "10"])
+                .unwrap()
+                .range,
+            Some((4096, 10))
+        );
+        for bad in [
+            &["--limit", "10"][..],
+            &["--from-seq", "-1"],
+            &["--from-seq", "x"],
+            &["--from-seq", "0", "--limit", "0"],
+            &["--from-seq", "0", "--limit", "4097"],
+            &["--from-seq", "0", "--from-seq", "1"],
+        ] {
+            assert!(with(bad).is_err(), "{bad:?}");
+        }
+        // Ranges are for tenant chains only.
+        assert!(
+            args(&[
+                "--database",
+                "--attester-pin",
+                "p",
+                "--output",
+                "o",
+                "--from-seq",
+                "0"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -413,6 +466,7 @@ mod tests {
                 source: Source::ReceiptsDir("d".into()),
                 attester_pins: vec!["p".into()],
                 output: "o".into(),
+                range: None,
             }
         );
         // Repeated pins (a chain across an attester key rotation).
@@ -873,7 +927,7 @@ mod tests {
     /// equal `created_at` and an equal `(created_at, request_id)` pair.
     #[test]
     #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
-    fn postgres_export_orders_by_created_at_then_request_id_then_agent_id() {
+    fn postgres_export_orders_by_commit_position_not_created_at() {
         let admin_url = test_url();
         let runtime_url = runtime_url(&admin_url);
         let set = set("04-sesion-real-bloqueada-web-fetch");
@@ -894,12 +948,16 @@ mod tests {
             id("ff000000-0000-4000-8000-000000000000"),
         );
         let (t0, t1) = ("2026-01-01T00:00:00.000001Z", "2026-01-01T00:00:00.000002Z");
-        // (created_at, request_id, agent_id), in insert order.
+        // (created_at, request_id, agent_id), in insert order. Until
+        // migration 0024 the export ordered them by created_at, request_id,
+        // agent_id (2, 3, 1, 0); now each row takes the next position of its
+        // tenant when it is written, so the export follows the insert (and
+        // commit) order whatever created_at and the ids say.
         let inserts = [
-            (t1, req_a0, agent_00), // expected 3rd
-            (t1, req_0a, agent_ff), // expected 2nd: same t1 and request as the next one
-            (t0, req_ff, agent_01), // expected 0th: earliest, despite the largest ids
-            (t1, req_0a, agent_01), // expected 1st
+            (t1, req_a0, agent_00),
+            (t1, req_0a, agent_ff),
+            (t0, req_ff, agent_01), // earliest created_at, still third
+            (t1, req_0a, agent_01),
         ];
         let mut admin = crate::connect_local_database(&admin_url).unwrap();
         for (index, (created_at, request_id, agent_id)) in inserts.iter().enumerate() {
@@ -910,7 +968,19 @@ mod tests {
                 Some(created_at),
             );
         }
-        let expected: Vec<String> = [2, 3, 1, 0].map(|i| receipts[i].clone()).to_vec();
+        let expected: Vec<String> = [0, 1, 2, 3].map(|i| receipts[i].clone()).to_vec();
+        let positions: Vec<i64> = admin
+            .query(
+                "SELECT chain_seq FROM praetore.execution_journal WHERE tenant_id = $1 \
+                 ORDER BY created_at, request_id, agent_id",
+                &[&tenant],
+            )
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        // In the former order the positions are those of the insert order.
+        assert_eq!(positions, vec![2, 3, 1, 0]);
         let uuid_matches_text: bool = admin
             .query_one(
                 "WITH v (a, b, c) AS (SELECT $1::text, $2::text, $3::text) \
@@ -931,7 +1001,7 @@ mod tests {
         assert_eq!(read_journal(&admin_url, tenant).unwrap(), expected);
         // With index scans off the rows come from the heap in insert order, so
         // the result depends only on ORDER BY, not on which index the planner
-        // picks (the primary key is already sorted by agent_id).
+        // picks (the unique index on tenant_id, chain_seq is already sorted).
         let mut runtime = crate::connect_local_database(&runtime_url).unwrap();
         runtime
             .batch_execute("SET enable_indexscan = off; SET enable_bitmapscan = off")

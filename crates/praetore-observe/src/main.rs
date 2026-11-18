@@ -33,10 +33,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .transpose()?;
     let mut client = database.connect()?;
-    // The same startup check as the gateway runtime: refuse an owner,
-    // superuser, BYPASSRLS or write-capable role, and a session in which
-    // triggers or row-level security could be switched off. It runs once,
-    // at startup; queries pin their search_path per transaction regardless.
+    // A read-only role check at startup (`verify_observe_role_with`): refuse
+    // an owner, superuser, BYPASSRLS or CREATEROLE role, a member of
+    // praetore_runtime (the gateway's credential), praetore_safety_ingest or
+    // praetore_safety_audit, any write privilege and any SELECT beyond the
+    // praetore_observe columns, and a session in which triggers or
+    // row-level security could be switched off. It runs once, at startup;
+    // queries pin their search_path per transaction regardless.
     let options =
         praetore_replay_postgres::RuntimeRoleOptions::from_config(|name| env::var(name).ok())?;
     let relaxed = options.relaxed();
@@ -67,7 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
-    praetore_replay_postgres::verify_runtime_role_with(&mut client, &options)?;
+    praetore_replay_postgres::verify_observe_role_with(&mut client, &options)?;
     let reader = Arc::new(PostgresObservabilityReader::from_client(client)?);
     let state = ObserveState::new(reader, tenant_token_hashes, trusted_attester)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()

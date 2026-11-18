@@ -21,12 +21,127 @@ use std::{
     collections::{HashMap, HashSet},
     env, fs,
     future::IntoFuture,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration as StdDuration,
 };
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
+
+// The owner-only secret file reader of `praetore-safety-ingest`, shared by
+// source so both binaries apply the same checks.
+#[path = "../../praetore-cli/src/secret_file.rs"]
+mod secret_file;
+
+const ADAPTER_ENV: &str = "PRAETORE_GATEWAY_ADAPTER";
+const EVIDENCE_KEY_FILE_ENV: &str = "PRAETORE_GATEWAY_EVIDENCE_ATTESTER_KEY_FILE";
+const EXECUTION_KEY_FILE_ENV: &str = "PRAETORE_GATEWAY_EXECUTION_ATTESTER_KEY_FILE";
+/// Variables of earlier releases that held the keys themselves; refused.
+const REFUSED_KEY_VARIABLES: [(&str, &str); 2] = [
+    (
+        "PRAETORE_GATEWAY_EVIDENCE_ATTESTER_KEY_HEX",
+        EVIDENCE_KEY_FILE_ENV,
+    ),
+    (
+        "PRAETORE_GATEWAY_EXECUTION_ATTESTER_KEY_HEX",
+        EXECUTION_KEY_FILE_ENV,
+    ),
+];
+/// 64 hex characters and a newline fit well within this.
+const MAX_KEY_FILE_BYTES: u64 = 128;
+
+/// The adapter named by `PRAETORE_GATEWAY_ADAPTER`. There is no default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdapterKind {
+    Http,
+    Sandbox,
+    LocalDemo,
+}
+
+fn adapter_kind(value: Option<&std::ffi::OsStr>) -> Result<AdapterKind, String> {
+    match value.map(|value| value.to_str()) {
+        None => Err(format!(
+            "{ADAPTER_ENV} is required: set it to sandbox, http, or local-demo"
+        )),
+        Some(Some("http")) => Ok(AdapterKind::Http),
+        Some(Some("sandbox")) => Ok(AdapterKind::Sandbox),
+        Some(Some("local-demo")) => Ok(AdapterKind::LocalDemo),
+        Some(_) => Err(format!(
+            "{ADAPTER_ENV} must be sandbox, http, or local-demo"
+        )),
+    }
+}
+
+/// The evidence and execution attester secret keys.
+struct AttesterKeys {
+    evidence: [u8; 32],
+    execution: [u8; 32],
+}
+
+/// A 32-byte key as 64 lowercase hex characters, with at most one
+/// trailing newline.
+fn parse_key_hex(contents: &[u8]) -> Result<[u8; 32], &'static str> {
+    let encoded = contents.strip_suffix(b"\n").unwrap_or(contents);
+    if encoded.len() != 64
+        || !encoded
+            .iter()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err("must hold 64 lowercase hex characters (a 32-byte key)");
+    }
+    let mut key = [0; 32];
+    hex::decode_to_slice(encoded, &mut key).map_err(|_| "is not valid hex")?;
+    Ok(key)
+}
+
+/// Refuses the key variables of earlier releases, so that a key left in
+/// the environment is not silently ignored.
+fn refuse_key_variables(
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (refused, replacement) in REFUSED_KEY_VARIABLES {
+        if lookup(refused).is_some() {
+            return Err(format!(
+                "{refused} is set: attester keys are read only from owner-only files \
+                 ({replacement}); remove {refused} from the environment"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Reads the key file named by `variable` (owner-only regular file, see
+/// `secret_file`).
+fn read_key_file(
+    lookup: &impl Fn(&str) -> Option<String>,
+    variable: &str,
+) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    let path = PathBuf::from(lookup(variable).ok_or_else(|| format!("{variable} is required"))?);
+    let contents = secret_file::read_private_file(&path, MAX_KEY_FILE_BYTES)
+        .map_err(|error| format!("{variable}: {} {error}", path.display()))?;
+    Ok(parse_key_hex(&contents)
+        .map_err(|error| format!("{variable}: {} {error}", path.display()))?)
+}
+
+/// Both attester keys from their files; they must be different keys.
+fn load_attester_keys(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<AttesterKeys, Box<dyn std::error::Error>> {
+    refuse_key_variables(&lookup)?;
+    let keys = AttesterKeys {
+        evidence: read_key_file(&lookup, EVIDENCE_KEY_FILE_ENV)?,
+        execution: read_key_file(&lookup, EXECUTION_KEY_FILE_ENV)?,
+    };
+    if keys.evidence == keys.execution {
+        return Err(format!(
+            "{EVIDENCE_KEY_FILE_ENV} and {EXECUTION_KEY_FILE_ENV} hold the same key; \
+             the evidence and execution attesters need different keys"
+        )
+        .into());
+    }
+    Ok(keys)
+}
 
 struct LocalExecutionSigner {
     key_id: String,
@@ -58,19 +173,16 @@ struct GatewayAdapterSetup {
 }
 
 impl LocalExecutionSigner {
-    fn from_hex(value: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let bytes = hex::decode(value)?;
-        let secret: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| "execution attester key must be exactly 32 bytes")?;
-        let signing_key = SigningKey::from_bytes(&secret);
-        Ok(Self {
+    /// The key id names the public key only, whatever the adapter.
+    fn from_secret(secret: &[u8; 32]) -> Self {
+        let signing_key = SigningKey::from_bytes(secret);
+        Self {
             key_id: format!(
-                "local-demo-{}",
+                "execution-attester-{}",
                 hex::encode(signing_key.verifying_key().as_bytes())
             ),
             signing_key,
-        })
+        }
     }
 }
 
@@ -204,16 +316,13 @@ fn migration_options()
     // attester key; without the key there is no signer and adoption fails.
     let record_signer: Option<std::sync::Arc<dyn praetore_core::StorageRecordSigner>> =
         if adopt_legacy_baseline {
-            match std::env::var("PRAETORE_GATEWAY_EVIDENCE_ATTESTER_KEY_HEX") {
-                Ok(key) => {
-                    let bytes: [u8; 32] = hex::decode(key)?
-                        .try_into()
-                        .map_err(|_| "evidence attester key must be exactly 32 bytes")?;
-                    Some(std::sync::Arc::new(EvidenceAttesterKey::from_secret_bytes(
-                        &bytes,
-                    )))
-                }
-                Err(_) => None,
+            let lookup = |name: &str| std::env::var(name).ok();
+            refuse_key_variables(&lookup)?;
+            match lookup(EVIDENCE_KEY_FILE_ENV) {
+                Some(_) => Some(std::sync::Arc::new(EvidenceAttesterKey::from_secret_bytes(
+                    &read_key_file(&lookup, EVIDENCE_KEY_FILE_ENV)?,
+                ))),
+                None => None,
             }
         } else {
             None
@@ -352,8 +461,10 @@ fn migrate_command() -> Result<(), Box<dyn std::error::Error>> {
     apply_migrations(&DatabaseConnector::from_url(&url)?)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_gateway(
     database: &DatabaseConnector,
+    keys: &AttesterKeys,
     dispatcher: Arc<dyn ActionDispatcher>,
     tenant_issuer_bindings: Option<HashMap<Uuid, Vec<String>>>,
     audience: &str,
@@ -369,11 +480,7 @@ fn build_gateway(
     }
     let policy_digest = policy.digest()?;
     let issuer_pins = load_issuer_pins(&read_limited(&issuer_pin_path, 1_048_576)?)?;
-    let evidence_key_hex = required_env("PRAETORE_GATEWAY_EVIDENCE_ATTESTER_KEY_HEX")?;
-    let evidence_key_bytes: [u8; 32] = hex::decode(evidence_key_hex)?
-        .try_into()
-        .map_err(|_| "evidence attester key must be exactly 32 bytes")?;
-    let evidence_attester = EvidenceAttesterKey::from_secret_bytes(&evidence_key_bytes);
+    let evidence_attester = EvidenceAttesterKey::from_secret_bytes(&keys.evidence);
 
     let mut config =
         HighAssuranceConfig::new(policy_digest.clone(), issuer_pins, evidence_attester)?
@@ -402,9 +509,7 @@ fn build_gateway(
         let database = database.clone();
         move || database.connect()
     })?);
-    let execution_signer = Arc::new(LocalExecutionSigner::from_hex(&required_env(
-        "PRAETORE_GATEWAY_EXECUTION_ATTESTER_KEY_HEX",
-    )?)?);
+    let execution_signer = Arc::new(LocalExecutionSigner::from_secret(&keys.execution));
     let mut gateway = Gateway::new(engine, journal, dispatcher, execution_signer)?;
     for verifier in approval_verifiers {
         gateway = gateway.with_human_approval_verifier(verifier);
@@ -498,14 +603,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return migrate_command();
     }
 
+    // First: without an adapter the service does not start at all.
+    let adapter = adapter_kind(env::var_os(ADAPTER_ENV).as_deref())?;
     let database_url = required_env("PRAETORE_GATEWAY_DATABASE_URL")?;
-    let evidence_key_hex = required_env("PRAETORE_GATEWAY_EVIDENCE_ATTESTER_KEY_HEX")?;
-    let execution_key_hex = required_env("PRAETORE_GATEWAY_EXECUTION_ATTESTER_KEY_HEX")?;
-    validate_secret_key(&evidence_key_hex, "evidence attester")?;
-    validate_secret_key(&execution_key_hex, "execution attester")?;
+    let keys = load_attester_keys(|name| env::var(name).ok())?;
 
-    let adapter_setup = match env::var("PRAETORE_GATEWAY_ADAPTER").as_deref() {
-        Ok("http") => {
+    let adapter_setup = match adapter {
+        AdapterKind::Http => {
             let route_path = required_env("PRAETORE_GATEWAY_TOOL_ROUTES_FILE")?;
             let route_config = read_limited(&route_path, 65_536)?;
             let bindings_path = required_env("PRAETORE_GATEWAY_TENANT_ISSUER_BINDINGS_FILE")?;
@@ -521,7 +625,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 production_adapter: true,
             }
         }
-        Ok("sandbox") => {
+        AdapterKind::Sandbox => {
             let endpoint = required_env("PRAETORE_GATEWAY_SANDBOX_SUPERVISOR_URL")?;
             let ca_path = required_env("PRAETORE_GATEWAY_SANDBOX_CA_FILE")?;
             let identity_path = required_env("PRAETORE_GATEWAY_SANDBOX_CLIENT_IDENTITY_FILE")?;
@@ -542,16 +646,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 production_adapter: true,
             }
         }
-        Ok("local-demo") | Err(_) => GatewayAdapterSetup {
+        AdapterKind::LocalDemo => GatewayAdapterSetup {
             dispatcher: Arc::new(LocalDemoDispatcher::new()),
             tenant_issuer_bindings: None,
             audience: "praetore-local-demo".to_owned(),
             require_trusted_clock: false,
             production_adapter: false,
         },
-        Ok(_) => {
-            return Err("PRAETORE_GATEWAY_ADAPTER must be sandbox, http, or local-demo".into());
-        }
     };
     // Cooperative execution is refused by default with every adapter; only
     // the local-demo adapter accepts the explicit development flag.
@@ -571,6 +672,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let gateway = Arc::new(build_gateway(
         &database,
+        &keys,
         adapter_setup.dispatcher,
         adapter_setup.tenant_issuer_bindings,
         &adapter_setup.audience,
@@ -647,22 +749,14 @@ fn env_duration_ms(name: &str, default: u64) -> Result<StdDuration, Box<dyn std:
     Ok(StdDuration::from_millis(value))
 }
 
-fn validate_secret_key(value: &str, description: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let bytes = hex::decode(value)?;
-    if bytes.len() != 32 {
-        return Err(format!("{description} key must be exactly 32 bytes").into());
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use praetore_core::VerifiedPublicKey;
 
     #[test]
-    fn execution_signer_produces_ed25519_signatures_with_stable_key_id() {
-        let signer = LocalExecutionSigner::from_hex(&hex::encode([21; 32])).unwrap();
+    fn execution_signer_produces_ed25519_signatures_with_a_neutral_key_id() {
+        let signer = LocalExecutionSigner::from_secret(&[21; 32]);
         let signature = signer.sign(b"demo payload").unwrap();
         let public_key =
             VerifiedPublicKey::from_bytes(&signer.signing_key.verifying_key().to_bytes()).unwrap();
@@ -674,16 +768,184 @@ mod tests {
         );
         assert_eq!(
             signer.key_id(),
-            LocalExecutionSigner::from_hex(&hex::encode([21; 32]))
-                .unwrap()
-                .key_id()
+            format!("execution-attester-{}", hex::encode(public_key.as_bytes()))
+        );
+        assert!(!signer.key_id().contains("demo"));
+        assert_eq!(
+            signer.key_id(),
+            LocalExecutionSigner::from_secret(&[21; 32]).key_id()
         );
     }
 
     #[test]
-    fn invalid_secret_key_lengths_are_rejected() {
-        assert!(validate_secret_key(&hex::encode([0; 31]), "test").is_err());
-        assert!(validate_secret_key(&hex::encode([0; 32]), "test").is_ok());
+    fn the_adapter_must_be_named() {
+        use std::ffi::OsStr;
+        let error = adapter_kind(None).unwrap_err();
+        assert!(
+            error.contains("PRAETORE_GATEWAY_ADAPTER is required"),
+            "{error}"
+        );
+        assert_eq!(
+            adapter_kind(Some(OsStr::new("local-demo"))),
+            Ok(AdapterKind::LocalDemo)
+        );
+        assert_eq!(
+            adapter_kind(Some(OsStr::new("http"))),
+            Ok(AdapterKind::Http)
+        );
+        assert_eq!(
+            adapter_kind(Some(OsStr::new("sandbox"))),
+            Ok(AdapterKind::Sandbox)
+        );
+        for invalid in ["", "demo", "LOCAL-DEMO", "http "] {
+            assert!(
+                adapter_kind(Some(OsStr::new(invalid)))
+                    .unwrap_err()
+                    .contains("must be sandbox, http, or local-demo"),
+                "{invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn key_files_hold_64_lowercase_hex_characters() {
+        let key = hex::encode([0xab; 32]);
+        assert_eq!(parse_key_hex(key.as_bytes()), Ok([0xab; 32]));
+        assert_eq!(parse_key_hex(format!("{key}\n").as_bytes()), Ok([0xab; 32]));
+        for invalid in [
+            hex::encode([0xab; 31]),
+            format!("{key}00"),
+            key.to_uppercase(),
+            format!("{key}\n\n"),
+            format!(" {key}"),
+        ] {
+            assert!(parse_key_hex(invalid.as_bytes()).is_err(), "{invalid:?}");
+        }
+    }
+
+    /// A scratch directory with owner-only key files.
+    #[cfg(unix)]
+    struct KeyDir(PathBuf);
+
+    #[cfg(unix)]
+    impl KeyDir {
+        fn new() -> Self {
+            let path = env::temp_dir().join(format!("praetore-gateway-keys-{}", Uuid::new_v4()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn key(&self, name: &str, key: [u8; 32], mode: u32) -> String {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.0.join(name);
+            fs::write(&path, format!("{}\n", hex::encode(key))).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            path.display().to_string()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for KeyDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn lookup(pairs: &[(&str, String)]) -> impl Fn(&str) -> Option<String> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), value.clone()))
+            .collect();
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attester_keys_are_read_from_distinct_owner_only_files() {
+        let dir = KeyDir::new();
+        let evidence = dir.key("evidence.key", [7; 32], 0o600);
+        let execution = dir.key("execution.key", [8; 32], 0o400);
+        let keys = load_attester_keys(lookup(&[
+            (EVIDENCE_KEY_FILE_ENV, evidence.clone()),
+            (EXECUTION_KEY_FILE_ENV, execution.clone()),
+        ]))
+        .unwrap();
+        assert_eq!((keys.evidence, keys.execution), ([7; 32], [8; 32]));
+
+        // The same key in both files (two files, or one file named twice).
+        let same = dir.key("same.key", [7; 32], 0o600);
+        for (first, second) in [(&evidence, &same), (&evidence, &evidence)] {
+            let error = load_attester_keys(lookup(&[
+                (EVIDENCE_KEY_FILE_ENV, first.clone()),
+                (EXECUTION_KEY_FILE_ENV, second.clone()),
+            ]))
+            .err()
+            .unwrap()
+            .to_string();
+            assert!(error.contains("hold the same key"), "{error}");
+        }
+
+        // Group- or world-readable, a symbolic link, a missing variable.
+        let shared = dir.key("shared.key", [9; 32], 0o640);
+        let link = dir.0.join("link.key");
+        std::os::unix::fs::symlink(&execution, &link).unwrap();
+        for (pairs, expected) in [
+            (
+                vec![
+                    (EVIDENCE_KEY_FILE_ENV, evidence.clone()),
+                    (EXECUTION_KEY_FILE_ENV, shared.clone()),
+                ],
+                "accessible by group or others",
+            ),
+            (
+                vec![
+                    (EVIDENCE_KEY_FILE_ENV, evidence.clone()),
+                    (EXECUTION_KEY_FILE_ENV, link.display().to_string()),
+                ],
+                "symbolic link",
+            ),
+            (
+                vec![(EVIDENCE_KEY_FILE_ENV, evidence.clone())],
+                "PRAETORE_GATEWAY_EXECUTION_ATTESTER_KEY_FILE is required",
+            ),
+        ] {
+            let error = load_attester_keys(lookup(&pairs))
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_variables_of_earlier_releases_are_refused() {
+        let dir = KeyDir::new();
+        let evidence = dir.key("evidence.key", [7; 32], 0o600);
+        let execution = dir.key("execution.key", [8; 32], 0o600);
+        for refused in [
+            "PRAETORE_GATEWAY_EVIDENCE_ATTESTER_KEY_HEX",
+            "PRAETORE_GATEWAY_EXECUTION_ATTESTER_KEY_HEX",
+        ] {
+            let error = load_attester_keys(lookup(&[
+                (EVIDENCE_KEY_FILE_ENV, evidence.clone()),
+                (EXECUTION_KEY_FILE_ENV, execution.clone()),
+                (refused, hex::encode([1u8; 32])),
+            ]))
+            .err()
+            .unwrap()
+            .to_string();
+            assert!(
+                error.contains(&format!("{refused} is set")),
+                "{refused}: {error}"
+            );
+        }
     }
 
     #[test]

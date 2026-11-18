@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 mod connection;
 mod execution;
+pub mod journal_export;
 mod migrations;
 mod observability;
 mod safety;
@@ -19,8 +20,8 @@ mod safety;
 pub use connection::{
     DatabaseConnector, DatabaseUrlError, RuntimeRoleError, RuntimeRoleOptions, RustlsConnect,
     TrustedSecurityDefiner, describe_trusted_security_definer, runtime_role_members,
-    verify_runtime_role, verify_runtime_role_with, verify_safety_audit_role_with,
-    verify_safety_ingest_role_with,
+    verify_observe_role_with, verify_runtime_role, verify_runtime_role_with,
+    verify_safety_audit_role_with, verify_safety_ingest_role_with,
 };
 pub use execution::PostgresExecutionJournal;
 pub use migrations::{

@@ -102,8 +102,8 @@ impl FreshnessProvider for DemoFreshness {
 struct DemoPublicKeys {
     /// Execution attestation key (pinned with `DEMO_ONLY_KEY_ID`).
     execution: [u8; 32],
-    /// Evidence attester key. On `main`, `verify_gateway_receipt_json` does
-    /// not take it; with PR #35 it is passed as the fourth argument.
+    /// Evidence attester key, passed to `verify_gateway_receipt_json` as its
+    /// fourth argument to check the evidence attester signature.
     evidence_attester: [u8; 32],
 }
 
@@ -312,7 +312,7 @@ fn run() -> DemoResult<bool> {
         &public_key,
         ExecutionAttestationError::InvalidPayload,
     );
-    // 4c: one hex digit of the evidence attester signature (needs PR #35).
+    // 4c: one hex digit of the evidence attester signature.
     let att_marker = "\"attester_signature\": \"";
     let att_offset = att_marker.len() + 10;
     let att_original =

@@ -71,8 +71,14 @@ impl AtomicAuthorizationCommit for PostgresExecutionJournal {
             .client
             .lock()
             .map_err(|_| AuthorizationCommitError::Unavailable)?;
+        // READ COMMITTED whatever the database's default: the journal INSERT
+        // waits for the tenant's position row (0024) while another writer of
+        // the tenant commits, then updates that row. Under REPEATABLE READ or
+        // SERIALIZABLE that update fails with a serialization error instead.
         let mut transaction = client
-            .transaction()
+            .build_transaction()
+            .isolation_level(postgres::IsolationLevel::ReadCommitted)
+            .start()
             .map_err(|_| AuthorizationCommitError::Unavailable)?;
         transaction
             .batch_execute("SET LOCAL synchronous_commit = on")
