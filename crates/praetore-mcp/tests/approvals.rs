@@ -1691,6 +1691,20 @@ fn assert_config_stops_wrap(text: &str, says: &str) {
     );
 }
 
+/// A TOML table header is not a warning. `wrap` exits 2 and does not start
+/// the server, so keys written under the header are not applied.
+#[test]
+fn a_toml_table_in_config_stops_wrap_at_startup() {
+    for text in [
+        "[tabla]\n",
+        "[tabla]\nreport = false\n",
+        "[[servers]]\napproval_ttl_seconds = 1800\n",
+        "report = true\n[tabla]\n",
+    ] {
+        assert_config_stops_wrap(text, "TOML tables are not accepted");
+    }
+}
+
 /// n1: `approval_ttl_seconds: 90000` (YAML style) names the key, so it is
 /// an error at startup, never a warning followed by the default 600.
 #[test]
