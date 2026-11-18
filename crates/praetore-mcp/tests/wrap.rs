@@ -1481,10 +1481,13 @@ fn chain_continues_across_daily_files_and_a_removed_file_is_detected() {
     assert!(report.contains("journal order"), "{report}");
 }
 
-/// Receipts written before the chain existed (bare evidence lines) still
-/// verify, are counted apart, and the chain starts after them.
+/// A bare evidence line (the format before the chain existed) has no `seq`
+/// or `prev`, so it is not an entry of the chain: `verify` fails on it
+/// wherever it is. Before, such lines verified when they came before the
+/// first chained entry, which let a signed receipt be added to a journal
+/// without changing its head.
 #[test]
-fn unchained_entries_from_earlier_versions_still_verify_before_the_chain() {
+fn a_bare_evidence_line_is_outside_the_chain_wherever_it_is() {
     let (_temp, home, file, lines) = journal_of_three();
     // Rewrite the first two entries in the earlier format.
     let bare = |line: &String| {
@@ -1499,14 +1502,17 @@ fn unchained_entries_from_earlier_versions_still_verify_before_the_chain() {
     let (_, stderr, out) = wrap(&home, "observe", &session(vec![call]));
     assert!(out.status.success(), "{stderr}");
     let (code, report) = verify_output(&home, &[]);
-    assert_eq!(code, Some(0), "{report}");
-    assert!(report.contains("3 verified, 0 failed"), "{report}");
-    assert!(
-        report.contains("1 chained entries") && report.contains("2 unchained"),
+    assert_eq!(code, Some(1), "{report}");
+    assert!(report.contains("1 verified, 2 failed"), "{report}");
+    assert_eq!(
+        report.matches("journal order: unchained line").count(),
+        2,
         "{report}"
     );
+    assert!(report.contains("2001-01-01.jsonl:1"), "{report}");
+    assert!(report.contains("2001-01-01.jsonl:2"), "{report}");
 
-    // An unchained line after the chain started is reported.
+    // After the chain too.
     let today = receipts::read_journal(&home)
         .unwrap()
         .last()
@@ -1518,8 +1524,9 @@ fn unchained_entries_from_earlier_versions_still_verify_before_the_chain() {
     fs::write(&today, text).unwrap();
     let (code, report) = verify_output(&home, &[]);
     assert_eq!(code, Some(1), "{report}");
-    assert!(
-        report.contains("unchained line after the chain started"),
+    assert_eq!(
+        report.matches("journal order: unchained line").count(),
+        3,
         "{report}"
     );
 }

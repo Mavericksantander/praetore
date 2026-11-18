@@ -2,7 +2,7 @@
 //! delegated to `praetore-core` (`Evidence::from_json` integrity,
 //! `verify_attester_signature`, `verify_agent_intent`, issuer pins).
 
-use crate::journal::{self, ChainCheck, Position};
+use crate::journal::{self, Chain, ChainLine, Position};
 use crate::shown::Show;
 use crate::{
     gate::MODE_CONTEXT_KEY,
@@ -413,9 +413,24 @@ pub fn verify_journal_with(
     let attester = store::read_attester_pin(&home.attester_pin())?;
     let pins = store::read_issuer_pins(&home.issuer_pins())?;
     let mut report = VerifyReport::default();
-    let mut chain = ChainCheck::default();
+    let lines = read_journal(home)?;
+    let parsed: Vec<Result<journal::Entry, String>> = lines
+        .iter()
+        .map(|line| journal::parse_line(&line.text))
+        .collect();
+    let entries: Vec<ChainLine<'_>> = parsed
+        .iter()
+        .zip(&lines)
+        .map(|(entry, line)| match entry {
+            Ok(entry) => ChainLine::Entry(entry),
+            Err(_) => ChainLine::Unreadable(journal::claimed_position(&line.text)),
+        })
+        .collect();
+    // The one check of the journal's shape: its lines are exactly the chain
+    // that ends at the head (the expected one, or the last line's).
+    let chain = Chain::rebuild(&entries, expected_head);
     let mut parsed_evidence = Vec::new();
-    for line in read_journal(home)? {
+    for ((line, entry), order) in lines.into_iter().zip(&parsed).zip(&chain.problems) {
         report.total += 1;
         let at = format!("{}:{}", line.file.shown(), line.line_number);
         let mut verdict = LineVerdict {
@@ -427,18 +442,16 @@ pub fn verify_journal_with(
             order: None,
             verified: false,
         };
-        let entry = match journal::parse_line(&verdict.text) {
+        let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                chain.push_unreadable();
                 report.failures.push(format!("FAIL {at}: {error}"));
-                verdict.parse_error = Some(error);
+                verdict.parse_error = Some(error.clone());
                 report.lines.push(verdict);
                 continue;
             }
         };
         parsed_evidence.push(entry.evidence.clone());
-        let order = chain.push(&entry);
         let checks = check_evidence(&entry.evidence, &attester, &pins);
         match checks.first_failure() {
             None if order.is_none() => {
@@ -456,29 +469,29 @@ pub fn verify_journal_with(
             None => {}
             Some(error) => report.failures.push(format!("FAIL {at}: {error}")),
         }
-        if let Some(problem) = &order {
+        if let Some(problem) = order {
             report
                 .failures
                 .push(format!("FAIL {at}: journal order: {problem}"));
         }
         verdict.checks = Some(checks);
-        verdict.order = order;
+        verdict.order = order.clone();
         report.lines.push(verdict);
     }
     report.chained = chain.chained;
     report.unchained = chain.unchained;
-    report.head = chain.head();
-    if let Some(expected) = expected_head {
-        match report.head {
-            Some(head) if head.prev == expected => {}
-            Some(head) => report.failures.push(format!(
-                "FAIL journal head {} ({} chained entries present, next seq {}) does not match the expected head {expected}: entries were removed or added",
+    report.head = chain.head;
+    if let Some(missing) = &chain.missing {
+        report.failures.push(match (expected_head, report.head) {
+            (Some(expected), Some(head)) if head.prev != expected => format!(
+                "FAIL journal head {} ({} chained entries present, next seq {}) does not match the expected head {expected}: entries were removed or added ({missing})",
                 head.prev, report.chained, head.seq
-            )),
-            None => report.failures.push(format!(
-                "FAIL journal has no verifiable head; expected {expected}"
-            )),
-        }
+            ),
+            (Some(expected), None) => format!(
+                "FAIL journal has no verifiable head; expected {expected} ({missing})"
+            ),
+            _ => format!("FAIL journal: {missing}"),
+        });
     }
     let approvals = crate::approvals::verify(home, &parsed_evidence)?;
     report.failures.extend(approvals.failures);
