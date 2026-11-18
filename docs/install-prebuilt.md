@@ -324,7 +324,7 @@ install or upgrade Node.
   can remove the wrapper).
 - `praetore-mcp verify` checks this installation's receipt journal
   (integrity, signatures, mode binding). In observe, a receipt records a
-  decision that was not enforced. `OK 0 receipts` means the journal is empty.
+  decision that was not enforced. `UNANCHORED 0 receipts` means the journal is empty.
   The v0.3.3 `praetore-mcp verify` does not read 0.3.4 receipts.
 - A `write_file` deny rule blocks that tool only. On
   `@modelcontextprotocol/server-filesystem@2.3.0`, `append_file`,

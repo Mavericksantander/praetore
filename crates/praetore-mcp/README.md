@@ -201,7 +201,7 @@ In a terminal, `install` and `uninstall` ask
 terminal they exit 1 and print
 `not modifying <file> without confirmation; re-run with --yes`, and they
 do not change the file. A later `praetore-mcp verify` that prints
-`OK 0 receipts` means the journal is empty.
+`UNANCHORED 0 receipts` means the journal is empty.
 
 A rule names one tool. `policy deny --tool write_file` on
 `@modelcontextprotocol/server-filesystem@2.3.0` does not make that server
