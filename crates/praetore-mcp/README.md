@@ -991,4 +991,4 @@ each evidence receipt on its own.
 | `receipts/YYYY-MM-DD.jsonl` | hash-linked evidence journal (`seq`, `prev`, `evidence`) |
 | `receipts/.journal.lock` | lock held while one entry is appended |
 | `reports/session-<start UTC>-<id>.json`, `.pdf` | report of one `wrap` session, written when it ends (0600); a view of the journal, see GUIDE.md |
-| `config.toml` | optional; `report = false` turns the session reports off; `approval_ttl_seconds = <1..86400>` sets the approval lifetime |
+| `config.toml` | optional flat `key = value` file; `report = false` turns the session reports off; `approval_ttl_seconds = <1..86400>` sets the approval lifetime. A `[table]` header stops `wrap` (exit 2) |

@@ -15,9 +15,11 @@
 //!
 //! A missing file means the defaults. For `report`, a line that cannot be
 //! read is a warning and is skipped, so a typo there never stops `wrap`.
+//! A TOML table header (`[tabla]`, `[[tabla]]`) is an error: this file is
+//! a flat list, and a header would silently group the keys under it.
 //! `approval_ttl_seconds` is read strictly by [`approval_ttl_seconds`]: an
-//! unreadable file, a malformed or repeated key is an error, and `wrap`
-//! refuses to start on it.
+//! unreadable file, a table header, a malformed or repeated key is an error,
+//! and `wrap` refuses to start on it.
 
 use crate::shown::Show;
 use crate::store::Home;
@@ -58,10 +60,10 @@ fn unquoted(key: &str) -> &str {
 
 /// The raw `approval_ttl_seconds` value of `config.toml`, or `None` when the
 /// file or the key is absent. Unlike [`load`], this fails on a file that
-/// cannot be read or starts with a byte order mark, on a line naming the key
-/// without `= value` (`key: value` included), and on the
-/// key given twice: an approval window must never fall back to a default
-/// the user did not choose. The range is checked by the caller.
+/// cannot be read or starts with a byte order mark, on a TOML table header,
+/// on a line naming the key without `= value` (`key: value` included), and
+/// on the key given twice: an approval window must never fall back to a
+/// default the user did not choose. The range is checked by the caller.
 pub fn approval_ttl_seconds(home: &Home) -> Result<Option<String>, String> {
     let path = path(home);
     let text = match fs::read_to_string(&path) {
@@ -76,6 +78,9 @@ pub fn approval_ttl_seconds(home: &Home) -> Result<Option<String>, String> {
             "{} starts with a byte order mark (U+FEFF); save it as UTF-8 without one",
             path.shown()
         ));
+    }
+    if let Some(error) = table_header_error(&text) {
+        return Err(format!("{}: {error}", path.shown()));
     }
     let mut found: Option<(usize, String)> = None;
     for (index, raw) in text.lines().enumerate() {
@@ -112,37 +117,67 @@ pub fn approval_ttl_seconds(home: &Home) -> Result<Option<String>, String> {
 }
 
 /// The config of `home` and the warnings found while reading it.
-pub fn load(home: &Home) -> (Config, Vec<String>) {
+/// A TOML table header is an error: `wrap` must not start on a file this
+/// reader would only partly understand.
+pub fn load(home: &Home) -> Result<(Config, Vec<String>), String> {
     let path = path(home);
     match fs::read_to_string(&path) {
         Ok(text) => {
-            let (config, problems) = parse(&text);
+            let (config, problems, errors) = parse(&text);
+            if let Some(error) = errors.into_iter().next() {
+                return Err(format!("{}: {error}", path.shown()));
+            }
             let warnings = problems
                 .into_iter()
                 .map(|problem| format!("{}: {problem}", path.shown()))
                 .collect();
-            (config, warnings)
+            Ok((config, warnings))
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => (Config::default(), Vec::new()),
-        Err(error) => (
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Ok((Config::default(), Vec::new()))
+        }
+        Err(error) => Ok((
             Config::default(),
             vec![format!(
                 "cannot read {}: {error}; using the defaults",
                 path.shown()
             )],
-        ),
+        )),
     }
 }
 
-pub fn parse(text: &str) -> (Config, Vec<String>) {
+/// The first `[table]` line, if any. Comments are stripped the same way as
+/// [`parse`]. A header is not a warning: keys under it would still be read
+/// as if they were at the top level.
+fn table_header_error(text: &str) -> Option<String> {
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.split('#').next().unwrap_or_default().trim();
+        if line.starts_with('[') {
+            return Some(format!(
+                "line {}: TOML tables are not accepted ({line}); config.toml only allows `key = value`",
+                index + 1
+            ));
+        }
+    }
+    None
+}
+
+pub fn parse(text: &str) -> (Config, Vec<String>, Vec<String>) {
     let mut config = Config::default();
     let mut problems = Vec::new();
+    let mut errors = Vec::new();
     for (index, raw) in text.lines().enumerate() {
         let line = raw.split('#').next().unwrap_or_default().trim();
         if line.is_empty() {
             continue;
         }
         let at = index + 1;
+        if line.starts_with('[') {
+            errors.push(format!(
+                "line {at}: TOML tables are not accepted ({line}); config.toml only allows `key = value`"
+            ));
+            continue;
+        }
         let Some((key, value)) = line.split_once('=') else {
             problems.push(format!("line {at}: expected `key = value`; ignored"));
             continue;
@@ -158,7 +193,7 @@ pub fn parse(text: &str) -> (Config, Vec<String>) {
             (other, _) => problems.push(format!("line {at}: unknown key {other:?}; ignored")),
         }
     }
-    (config, problems)
+    (config, problems, errors)
 }
 
 #[cfg(test)]
@@ -169,19 +204,50 @@ mod tests {
     fn report_defaults_to_on_and_can_be_turned_off() {
         assert!(parse("").0.report);
         assert!(parse("# nothing\n").0.report);
-        let (config, problems) = parse("report = false # quiet\n");
+        let (config, problems, errors) = parse("report = false # quiet\n");
         assert!(!config.report);
         assert!(problems.is_empty());
+        assert!(errors.is_empty());
         assert!(parse("report=true").0.report);
     }
 
     #[test]
     fn unreadable_lines_are_warnings_and_keep_the_default() {
-        let (config, problems) = parse("report = no\nother = 1\nnonsense\n");
+        let (config, problems, errors) = parse("report = no\nother = 1\nnonsense\n");
         assert!(config.report);
+        assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(problems.len(), 3);
         assert!(problems[0].contains("line 1"));
         assert!(problems[1].contains("unknown key"));
+    }
+
+    #[test]
+    fn a_table_header_is_an_error_and_not_a_warning() {
+        for text in [
+            "[tabla]\n",
+            "[[tabla]]\n",
+            "  [ tabla ]\n",
+            "[tabla] # note\n",
+        ] {
+            let (config, problems, errors) = parse(text);
+            assert!(config.report, "{text:?}");
+            assert!(problems.is_empty(), "{text:?}: {problems:?}");
+            assert_eq!(errors.len(), 1, "{text:?}: {errors:?}");
+            assert!(errors[0].contains("TOML tables"), "{text:?}: {}", errors[0]);
+            assert!(!errors[0].contains("ignored"), "{text:?}: {}", errors[0]);
+        }
+        // A comment, or a `#` after a real assignment, is not a table.
+        let (_, problems, errors) = parse("# [tabla]\nreport = false # [nota]\n");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(!parse("# [tabla]\nreport = false # [nota]\n").0.report);
+        let temp = tempfile::tempdir().unwrap();
+        let home = Home::new(temp.path().to_path_buf());
+        fs::write(path(&home), "[tabla]\napproval_ttl_seconds = 1800\n").unwrap();
+        let error = approval_ttl_seconds(&home).unwrap_err();
+        assert!(error.contains("TOML tables"), "{error}");
+        assert!(error.contains("[tabla]"), "{error}");
+        assert!(load(&home).unwrap_err().contains("TOML tables"));
     }
 
     #[test]
