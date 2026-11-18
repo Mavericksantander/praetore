@@ -53,6 +53,19 @@
 
 ### Fixed
 
+- **praetore-mcp: `verify --expected-head` passed with receipts added
+  before the chain.** A bare evidence line placed before the first chained
+  entry was counted as an "unchained earlier entry" and verified, and the
+  head did not cover it. `verify` now rebuilds the chain from the head
+  backwards (`journal::Chain::rebuild`; the head is `--expected-head`, or
+  the last entry without it) and fails unless the lines of the journal
+  are exactly that chain, in order. A line outside the chain, a missing
+  entry and a reordered entry each fail, with the file and line.
+  **Breaking: a journal with lines written by 0.3.3 or earlier no longer
+  verifies.** Those lines have no `seq` or `prev`; move that journal out
+  of `receipts/` to keep it. An entry removed from the middle now also
+  fails the entries before it, which the chain no longer reaches.
+
 - **praetore-mcp: what observe mode refuses, and what a DENY shows.** The
   help, the `init` output, the READMEs and the GUIDE said observe mode
   never blocks (the 0.3.5 entry below says so too). It records a DENY and

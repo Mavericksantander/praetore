@@ -318,9 +318,15 @@ duplicated or reordered before the last one, and prints the head (entry
 count and last link). Entries removed at the end of the journal leave a
 valid shorter chain: they are only detected with `verify --expected-head`
 against a head kept where the wrapped servers cannot write. Without that,
-the journal shows what is in it, not that nothing is missing. Lines written
-by earlier versions (a bare evidence document) still verify, are counted as
-unchained, and may only come before the first chained entry. The v0.3.3
+the journal shows what is in it, not that nothing is missing. `verify`
+rebuilds the chain from the head backwards (the `--expected-head`, or the
+last entry without it) and fails unless the lines of the journal are
+exactly that chain, in order: a line outside it is not covered by the
+head. A line written by 0.3.3 or earlier (a bare evidence document) has no
+`seq` or `prev`, so it is outside every chain and fails `verify` wherever
+it is; before, such lines verified when they came before the first chained
+entry, and a signed receipt could be added there without changing the
+head. Move a 0.3.3 journal out of `receipts/` to keep it. The v0.3.3
 `praetore-mcp verify` does not read 0.3.4 receipts: it reads each line as
 a bare evidence document, and a 0.3.4 line is not one. Concurrent
 wrappers serialize appends with a lock file (`receipts/.journal.lock`,

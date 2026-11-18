@@ -251,9 +251,9 @@ praetore-mcp verify    # OK N receipts: N verified, 0 failed; prints the journal
 
 The v0.3.3 `praetore-mcp verify` does not read 0.3.4 receipts. A 0.3.4
 journal line is `{"seq","prev","evidence"}`. v0.3.3 reads each line as a
-bare evidence document. This release's `praetore-mcp verify` still reads a
-v0.3.3 journal: those lines are unchained and may only come before the
-first chained entry.
+bare evidence document. This release's `praetore-mcp verify` fails on a
+v0.3.3 line wherever it is: it has no `seq` or `prev`, so it is outside
+the chain. Move a v0.3.3 journal out of `receipts/` to keep it.
 
 ### A home from v0.3.4
 

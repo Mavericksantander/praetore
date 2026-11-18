@@ -2,7 +2,7 @@
 
 This page lists what an agent, or another process running as the same OS user, can try to get a `tools/call` past praetore-mcp or to remove its trace. It records what happens on main after praetore-mcp 0.3.6.
 
-Each row names the test that pins the behaviour. All of them are in `crates/praetore-mcp/tests/evasion.rs`. A test pins a limitation as well as a defence. When a limitation is closed, its test fails and has to be changed together with this table.
+Each row names the test that pins the behaviour. They are in `crates/praetore-mcp/tests/evasion.rs`, unless the row names another file. A test pins a limitation as well as a defence. When a limitation is closed, its test fails and has to be changed together with this table.
 
 Status:
 
@@ -30,6 +30,7 @@ The threat model behind these rows is in [../threat-model.md](../threat-model.md
 | c, d | Cut the forwarded receipt in half, so its line keeps `praetore.approval_id` but is not JSON, and drop the execution record | bloqueado (`wrap` cannot read which approval the line names and holds the call); detectado después | `a_cut_receipt_line_that_names_an_approval_holds_the_retry_and_fails_verify` | Already blocked |
 | c, d | Write a second receipt that names a used approval, signed with the keys in the home | detectado después | `two_receipts_naming_one_approval_fail_verify` | Already detected |
 | c | Write a receipt that names a rejected approval, or a malformed approval id | detectado después; a malformed id also holds every approved call until it is removed | `a_receipt_naming_a_rejected_or_malformed_approval_fails_verify` | Already detected |
+| c | Add a signed receipt to the journal without changing its head: a bare evidence line (or a chained line) before the first entry, or after the last one | detectado después, con y sin `--expected-head` (the line is outside the chain that ends at the head). Signing the receipt needs the keys in the home | `a_signed_line_before_the_chain_fails_verify`, `a_chained_line_before_the_chain_fails_verify` and `a_line_after_the_head_fails_verify`, in `crates/praetore-mcp/tests/journal_exact_chain.rs` | Already detected. Rewriting the whole chain with the keys is still only found by a head kept elsewhere |
 | d | Send the approved call twice | bloqueado | `an_approval_is_used_once` | Already blocked |
 | e | Change the arguments after approval | bloqueado | `an_approval_does_not_cover_other_arguments` | Already blocked |
 | e | Same tool and arguments under another `--name`, or another held tool with the same arguments | bloqueado | `an_approval_does_not_cover_another_server_or_another_held_tool` | Already blocked |
