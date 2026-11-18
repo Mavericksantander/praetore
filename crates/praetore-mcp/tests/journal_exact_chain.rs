@@ -124,13 +124,16 @@ fn journal() -> Journal {
         .collect();
     assert_eq!(lines.len(), N);
     let (code, report) = verify(&root, None);
-    assert_eq!(code, 0, "{report}");
+    assert_eq!(code, 3, "{report}");
+    assert!(report.starts_with("UNANCHORED "), "{report}");
     let head = report
         .split(", head ")
         .nth(1)
         .and_then(|rest| rest.get(..64))
         .unwrap()
         .to_owned();
+    let (code, report) = verify_anchored(&root, &head);
+    assert_eq!(code, 0, "{report}");
 
     // The same keys sign one more receipt in a copy of the home.
     let copy = temp.path().join("copy");
@@ -178,9 +181,25 @@ fn write_lines(path: &Path, lines: &[&str]) {
 
 /// Exit code and stdout of `verify`, with `--expected-head` when given.
 fn verify(root: &Path, expected_head: Option<&str>) -> (i32, String) {
+    verify_with(root, expected_head, None)
+}
+
+/// `verify` against both anchors: the receipts head and `none` for approvals.
+fn verify_anchored(root: &Path, expected_head: &str) -> (i32, String) {
+    verify_with(root, Some(expected_head), Some("none"))
+}
+
+fn verify_with(
+    root: &Path,
+    expected_head: Option<&str>,
+    expected_approval_head: Option<&str>,
+) -> (i32, String) {
     let mut args = vec!["verify", "--dir", root.to_str().unwrap()];
     if let Some(head) = expected_head {
         args.extend(["--expected-head", head]);
+    }
+    if let Some(head) = expected_approval_head {
+        args.extend(["--expected-approval-head", head]);
     }
     let out = run(&args, "");
     (
@@ -208,15 +227,26 @@ fn assert_fails(journal: &Journal, cause: &str, at: &str) {
 #[test]
 fn a_clean_journal_verifies_with_and_without_its_head() {
     let journal = journal();
-    for expected in [Some(journal.head.as_str()), None] {
-        let (code, report) = verify(&journal.root, expected);
-        assert_eq!(code, 0, "{report}");
-        assert!(
-            report.contains(&format!("OK {N} receipts: {N} verified, 0 failed")),
-            "{report}"
-        );
-        assert!(report.contains("(0 unchained"), "{report}");
-    }
+    // Without anchors: not a pass.
+    let (code, report) = verify(&journal.root, None);
+    assert_eq!(code, 3, "{report}");
+    assert!(
+        report.contains(&format!("UNANCHORED {N} receipts: {N} verified, 0 failed")),
+        "{report}"
+    );
+    assert!(report.contains("(0 unchained"), "{report}");
+    // One anchor alone is not OK either.
+    let (code, report) = verify(&journal.root, Some(&journal.head));
+    assert_eq!(code, 3, "{report}");
+    assert!(report.starts_with("UNANCHORED "), "{report}");
+    // Both anchors: OK.
+    let (code, report) = verify_anchored(&journal.root, &journal.head);
+    assert_eq!(code, 0, "{report}");
+    assert!(
+        report.contains(&format!("OK {N} receipts: {N} verified, 0 failed")),
+        "{report}"
+    );
+    assert!(report.contains("(0 unchained"), "{report}");
 }
 
 /// The reported case: a validly signed bare line before the chain, in the
@@ -285,7 +315,18 @@ fn a_line_after_the_head_fails_verify() {
         )),
         "{report}"
     );
+    // Without the saved head it is simply the journal's last entry: a
+    // clean longer chain, so without anchors that is UNANCHORED, and
+    // with both anchors (the new head) it is OK.
     let (code, report) = verify(&journal.root, None);
+    assert_eq!(code, 3, "{report}");
+    assert!(report.starts_with("UNANCHORED "), "{report}");
+    let new_head = report
+        .split(", head ")
+        .nth(1)
+        .and_then(|rest| rest.get(..64))
+        .unwrap();
+    let (code, report) = verify_anchored(&journal.root, new_head);
     assert_eq!(code, 0, "{report}");
 }
 
@@ -378,8 +419,21 @@ fn entries_removed_at_the_end_need_the_saved_head() {
     let journal = journal();
     let lines: Vec<&str> = journal.lines[..N - 1].iter().map(String::as_str).collect();
     write_lines(&journal.file, &lines);
+    // A shorter journal is still exactly one chain: without anchors that
+    // is UNANCHORED, and with both anchors at its own new head it is OK.
     let (code, report) = verify(&journal.root, None);
+    assert_eq!(code, 3, "{report}");
+    assert!(report.starts_with("UNANCHORED "), "{report}");
+    let new_head = report
+        .split(", head ")
+        .nth(1)
+        .and_then(|rest| rest.get(..64))
+        .unwrap()
+        .to_owned();
+    let (code, report) = verify_anchored(&journal.root, &new_head);
     assert_eq!(code, 0, "{report}");
+    // The head saved earlier still finds the removed entries. Failed
+    // beats Unanchored, even with only --expected-head.
     let (code, report) = verify(&journal.root, Some(&journal.head));
     assert_eq!(code, 1, "{report}");
     assert!(

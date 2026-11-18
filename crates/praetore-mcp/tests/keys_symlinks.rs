@@ -187,12 +187,40 @@ fn a_home_with_its_own_keys_runs_the_calls() {
     let dir = root.to_str().unwrap();
     for command in [
         vec!["policy", "check", "--dir", dir],
-        vec!["verify", "--dir", dir],
         vec!["init", "--dir", dir],
     ] {
         let out = run(&command, "");
         assert!(out.status.success(), "{command:?}: {out:?}");
     }
+    // The calls ran; `verify` without anchors is UNANCHORED, and with both
+    // heads it is OK. This home has no approval journal.
+    let probe = run(&["verify", "--dir", dir], "");
+    let report = String::from_utf8_lossy(&probe.stdout);
+    assert_eq!(probe.status.code(), Some(3), "{report}");
+    assert!(report.starts_with("UNANCHORED "), "{report}");
+    let head = report
+        .split(", head ")
+        .nth(1)
+        .and_then(|rest| rest.get(..64))
+        .expect("verify prints the journal head");
+    let out = run(
+        &[
+            "verify",
+            "--dir",
+            dir,
+            "--expected-head",
+            head,
+            "--expected-approval-head",
+            "none",
+        ],
+        "",
+    );
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{report}");
+    assert!(
+        report.contains("OK 2 receipts: 2 verified, 0 failed"),
+        "{report}"
+    );
 }
 
 #[test]

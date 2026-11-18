@@ -133,8 +133,43 @@ fn receipts(root: &Path) -> usize {
         .sum()
 }
 
+/// `verify` against both anchors of a clean home (receipts head, or
+/// `none` if the journal is empty, plus `--expected-approval-head none`).
 fn verify(root: &Path) -> Output {
-    run(&["verify", "--dir", root.to_str().unwrap()], "")
+    let probe = run(&["verify", "--dir", root.to_str().unwrap()], "");
+    let report = String::from_utf8_lossy(&probe.stdout).into_owned();
+    let head = report
+        .split(", head ")
+        .nth(1)
+        .and_then(|rest| rest.get(..64))
+        .map(str::to_owned);
+    let dir = root.to_str().unwrap();
+    match head.as_deref() {
+        Some(head) => run(
+            &[
+                "verify",
+                "--dir",
+                dir,
+                "--expected-head",
+                head,
+                "--expected-approval-head",
+                "none",
+            ],
+            "",
+        ),
+        None => run(
+            &[
+                "verify",
+                "--dir",
+                dir,
+                "--expected-head",
+                "none",
+                "--expected-approval-head",
+                "none",
+            ],
+            "",
+        ),
+    }
 }
 
 fn assert_verifies(root: &Path, context: &str) {

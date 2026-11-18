@@ -201,7 +201,7 @@ In a terminal, `install` and `uninstall` ask
 terminal they exit 1 and print
 `not modifying <file> without confirmation; re-run with --yes`, and they
 do not change the file. A later `praetore-mcp verify` that prints
-`OK 0 receipts` means the journal is empty.
+`UNANCHORED 0 receipts` means the journal is empty.
 
 A rule names one tool. `policy deny --tool write_file` on
 `@modelcontextprotocol/server-filesystem@2.3.0` does not make that server
@@ -866,9 +866,11 @@ receipts journal. Keep the head off this machine:
 # After a run you trust: print the approval head; keep it off this machine.
 praetore-mcp verify --dir "$DIR" | sed -n 's/^approval journal: .* head \([0-9a-f]\{64\}\).*/\1/p'
 
-# Later, with that value:
+# Later, with that value and the receipts head saved the same way
+# (`verify` exits 0 only when both are given and both match):
+HEAD=<receipts head kept off this machine>
 SAVED=<approval head kept off this machine>
-if praetore-mcp verify --dir "$DIR" --expected-approval-head "$SAVED" > /dev/null; then
+if praetore-mcp verify --dir "$DIR" --expected-head "$HEAD" --expected-approval-head "$SAVED" > /dev/null; then
   echo "approval journal still ends at $SAVED"
 else
   echo "approval journal changed or verify failed"
@@ -876,6 +878,16 @@ fi
 ```
 
 A new approval moves the head, so save it again after each run you trust.
+
+`verify` has three results. `OK` (exit 0) needs both `--expected-head` and
+`--expected-approval-head`, and both journals ending exactly there; use
+`none` for a journal that does not exist yet. `UNANCHORED` (exit 3) means
+every check passed but a head was not given: the keys are files in the home,
+so a journal rewritten with them from the first entry, or cut at the end,
+passes every check that reads only the home, and `verify` says so instead of
+`OK`. `FAIL` is exit 1. The heads are worth what the place they are kept in
+is worth: if the process that can read the keys can also write the saved
+heads, it can replace both.
 Cutting the journal or deleting it fails the check. The session report
 prints the same command with both heads at close, and `dashboard` takes
 the same flag.

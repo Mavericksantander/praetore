@@ -15,6 +15,13 @@ use std::{
     time::Duration,
 };
 
+/// Whether a `verify` run without the heads kept elsewhere found nothing
+/// wrong: the summary says UNANCHORED and the exit code is 3, not 0 (a
+/// result without both heads is not a pass).
+fn unanchored(out: &Output) -> bool {
+    out.status.code() == Some(3) && String::from_utf8_lossy(&out.stdout).starts_with("UNANCHORED ")
+}
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_praetore-mcp")
 }
@@ -388,7 +395,7 @@ fn enforce_holds_the_call_and_names_the_exact_command() {
     assert_eq!(recorded[0].context["praetore.mode"], "enforce");
     let verify = verify(&home);
     assert!(
-        verify.status.success(),
+        unanchored(&verify),
         "{}",
         String::from_utf8_lossy(&verify.stdout)
     );
@@ -565,7 +572,7 @@ fn approved_call_forwards_once_and_a_second_retry_asks_again() {
 
     let verify = verify(&home);
     let report = String::from_utf8_lossy(&verify.stdout);
-    assert!(verify.status.success(), "{report}");
+    assert!(unanchored(&verify), "{report}");
     assert!(report.contains("1 decision(s), 1 execution(s)"), "{report}");
 }
 
@@ -600,7 +607,7 @@ fn different_arguments_do_not_use_the_approval() {
     assert_ne!(other, id);
     let verify = verify(&home);
     assert!(
-        verify.status.success(),
+        unanchored(&verify),
         "{}",
         String::from_utf8_lossy(&verify.stdout)
     );
@@ -657,7 +664,7 @@ fn rejected_call_is_not_forwarded() {
     assert_eq!(by_id(&responses, 8)["result"]["isError"], true);
     let verify = verify(&home);
     let report = String::from_utf8_lossy(&verify.stdout);
-    assert!(verify.status.success(), "{report}");
+    assert!(unanchored(&verify), "{report}");
     assert!(report.contains("1 decision(s), 0 execution(s)"), "{report}");
     let table = run(&["receipts", "--dir", home.root.to_str().unwrap()], "");
     let table = String::from_utf8_lossy(&table.stdout);
@@ -705,7 +712,7 @@ fn expired_pending_and_expired_approval_do_not_pass() {
     assert_eq!(by_id(&responses, 8)["result"]["isError"], true);
     let verify = verify(&home);
     assert!(
-        verify.status.success(),
+        unanchored(&verify),
         "{}",
         String::from_utf8_lossy(&verify.stdout)
     );
@@ -721,7 +728,7 @@ fn verify_rejects_a_bad_signature_and_a_reused_approval() {
     assert!(approve_on_tty(&home, &id).status.success());
     let (_, stderr, _) = wrap(&home, "enforce", &session(echo(8, json!({"n": 1}))), &[]);
     assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
-    assert!(verify(&home).status.success());
+    assert!(unanchored(&verify(&home)));
 
     let path = home.root.join("approvals").join("journal.jsonl");
     let original = fs::read(&path).unwrap();
@@ -740,7 +747,7 @@ fn verify_rejects_a_bad_signature_and_a_reused_approval() {
     assert!(report.contains("signature"), "{report}");
 
     fs::write(&path, &original).unwrap();
-    assert!(verify(&home).status.success());
+    assert!(unanchored(&verify(&home)));
     let executed = evidence(&home)
         .into_iter()
         .rfind(|item| item.decision.outcome == DecisionOutcome::RequireApproval)
@@ -772,7 +779,7 @@ fn observe_does_not_hold_and_the_receipt_says_enforce_would_ask() {
     assert!(table.contains("enforce would ask"), "{table}");
     let verify = verify(&home);
     let report = String::from_utf8_lossy(&verify.stdout);
-    assert!(verify.status.success(), "{report}");
+    assert!(unanchored(&verify), "{report}");
     assert!(report.contains("approval journal: none"), "{report}");
 }
 
@@ -808,7 +815,7 @@ fn an_evidence_only_journal_still_verifies() {
     assert!(value.get("record").is_none(), "{line}");
     let verify = verify(&home);
     let report = String::from_utf8_lossy(&verify.stdout);
-    assert!(verify.status.success(), "{report}");
+    assert!(unanchored(&verify), "{report}");
     assert!(
         report.contains("1 receipts: 1 verified, 0 failed"),
         "{report}"
@@ -1397,7 +1404,7 @@ fn a_decided_id_whose_pending_file_was_left_is_not_reused() {
         assert_eq!(executions_of_decided, expected, "{outcome:?}");
         let verify = verify(&home);
         assert!(
-            verify.status.success(),
+            unanchored(&verify),
             "{}",
             String::from_utf8_lossy(&verify.stdout)
         );

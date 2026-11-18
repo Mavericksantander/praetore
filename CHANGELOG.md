@@ -41,6 +41,19 @@
 
 ### Breaking
 
+- **praetore-mcp: `verify` exits 0 only against both heads; without them
+  it exits 3.** A journal rewritten from the first entry with the keys in
+  the home, or cut at the end, passed `verify` as `OK`: every check read
+  only the home. `verify` now has three results: `OK` (exit 0) when both
+  `--expected-head` and `--expected-approval-head` are given and both
+  journals end exactly there, `UNANCHORED` (exit 3) when every check
+  passed but a head is missing, with a warning that says what cannot be
+  detected, and `FAIL` (exit 1). Both options take `none` for a journal
+  that must not exist yet. **A script that runs `verify` without the
+  heads and expects exit 0 now gets 3.** `init` prints how to save the
+  heads, and the dashboard state has `verify.assurance`
+  (`anchored`, `unanchored`, `failed`).
+
 - **praetore-mcp: an invalid TTL source stops `wrap` even when another one
   wins.** Before, only the source in use was read:
   `PRAETORE_MCP_APPROVAL_TTL_SECONDS` hid a bad `approvals/ttl-seconds`

@@ -55,6 +55,32 @@ fn run(args: &[&str], stdin: &str) -> Output {
     child.wait_with_output().unwrap()
 }
 
+/// `verify` against both anchors of a clean home (receipts head, or
+/// `none` if the journal is empty, plus `--expected-approval-head none`).
+fn verify_anchored(root: &Path) -> Output {
+    let probe = run(&["verify", "--dir", root.to_str().unwrap()], "");
+    let report = String::from_utf8_lossy(&probe.stdout).into_owned();
+    let head = report
+        .split(", head ")
+        .nth(1)
+        .and_then(|rest| rest.get(..64))
+        .map(str::to_owned);
+    let dir = root.to_str().unwrap();
+    let head = head.as_deref().unwrap_or("none");
+    run(
+        &[
+            "verify",
+            "--dir",
+            dir,
+            "--expected-head",
+            head,
+            "--expected-approval-head",
+            "none",
+        ],
+        "",
+    )
+}
+
 /// A literal whose text an f64, a decimal or a bigint parser reads
 /// differently, or reads differently from a parser that rounds wrongly.
 const BOUNDARY: [&str; 5] = [
@@ -276,7 +302,7 @@ fn the_decision_matches_the_value_the_server_recorded() {
         }
 
         // No literal may leave a journal that verify cannot read.
-        let verify = run(&["verify", "--dir", root.to_str().unwrap()], "");
+        let verify = verify_anchored(&root);
         assert!(
             verify.status.success(),
             "{operator:?} {threshold} {effect:?}: verify failed\n{}{}",
