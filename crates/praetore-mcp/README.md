@@ -952,10 +952,10 @@ each evidence receipt on its own.
 * Only top-level argument fields can be matched individually
   (`arguments.<key>`). `policy` commands refuse keys containing `.`,
   because `arguments.opts.path` would match a literal top-level key
-  `"opts.path"` that the caller controls, not the nested field. `policy
-  check` warns about such hand-written rules. Nested fields can only be
-  matched through an `Exact`
-  match on a whole value.
+  `"opts.path"` that the caller controls, not the nested field. A
+  hand-written rule that still uses such a key makes `policy check` exit
+  1, and `wrap --mode enforce` refuses to load the policy. Nested fields
+  can only be matched through an `Exact` match on a whole value.
 * Several wrappers (one per server) append to the same daily journal file
   with single `O_APPEND` writes. This is safe on local filesystems; network
   filesystems are not supported.
