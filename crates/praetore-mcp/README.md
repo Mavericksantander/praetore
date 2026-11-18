@@ -201,7 +201,7 @@ In a terminal, `install` and `uninstall` ask
 terminal they exit 1 and print
 `not modifying <file> without confirmation; re-run with --yes`, and they
 do not change the file. A later `praetore-mcp verify` that prints
-`OK 0 receipts` means the journal is empty.
+`UNANCHORED 0 receipts` means the journal is empty.
 
 A rule names one tool. `policy deny --tool write_file` on
 `@modelcontextprotocol/server-filesystem@2.3.0` does not make that server
@@ -318,9 +318,15 @@ duplicated or reordered before the last one, and prints the head (entry
 count and last link). Entries removed at the end of the journal leave a
 valid shorter chain: they are only detected with `verify --expected-head`
 against a head kept where the wrapped servers cannot write. Without that,
-the journal shows what is in it, not that nothing is missing. Lines written
-by earlier versions (a bare evidence document) still verify, are counted as
-unchained, and may only come before the first chained entry. The v0.3.3
+the journal shows what is in it, not that nothing is missing. `verify`
+rebuilds the chain from the head backwards (the `--expected-head`, or the
+last entry without it) and fails unless the lines of the journal are
+exactly that chain, in order: a line outside it is not covered by the
+head. A line written by 0.3.3 or earlier (a bare evidence document) has no
+`seq` or `prev`, so it is outside every chain and fails `verify` wherever
+it is; before, such lines verified when they came before the first chained
+entry, and a signed receipt could be added there without changing the
+head. Move a 0.3.3 journal out of `receipts/` to keep it. The v0.3.3
 `praetore-mcp verify` does not read 0.3.4 receipts: it reads each line as
 a bare evidence document, and a 0.3.4 line is not one. Concurrent
 wrappers serialize appends with a lock file (`receipts/.journal.lock`,
@@ -687,7 +693,7 @@ Things to know:
 * **Ambiguous lines** are lines that this proxy and the server could split or
   read differently. Enforce refuses them with `-32700` (`id: null`). Observe
   forwards them unchanged, warns, and evaluates and records **every**
-  `tools/call` reading it can find. Two kinds are detected:
+  `tools/call` reading it can find. Three kinds are detected:
   * **Bare carriage returns.** The proxy frames on `\n`, and JSON treats
     `\r` as whitespace. Universal-newline readers end a line at `\r`, `\n`
     or `\r\n`: the MCP Python SDK (`TextIOWrapper`, `newline=None`) and
@@ -706,6 +712,18 @@ Things to know:
     if a message-level or `params` key is a case variant of `method`,
     `params`, `id`, `jsonrpc`, `name` or `arguments`. In observe, both the
     exact-key and the Go (case-folded, last-wins) readings are recorded.
+  * **Numbers not in canonical form.** The server gets the client's bytes
+    and parses each number itself. A number in the `params` of a
+    `tools/call` is canonical when its text is exactly what the value
+    prints as: `50`, `50.0`, `49.99999999999999`, `0.1`. Any other text
+    makes the line ambiguous: more digits than an f64 holds
+    (`49.9999999999999965` is 50.0 as an f64, and another value for a
+    decimal parser), `50.00`, an exponent form such as `1e2` or `1e+21`,
+    `-0`, and an integer above 2^64 - 1. The stderr line names the number
+    and the form to send. In observe the value recorded is the correctly
+    rounded f64. A client that prints large or small floats with an
+    exponent (JavaScript and Python do, for example `1e+21`) is refused in
+    enforce for those values.
 * Client lines over 32 MiB are refused in both modes, with a stderr
   warning: they are not parsed, so they cannot be checked for a `safety*`
   tool (G7).
@@ -714,6 +732,15 @@ Things to know:
   every `tools/call` (fail closed)** and gate the remaining traffic as
   enforce does; other MCP messages still reach the server. Fix the home
   (`praetore-mcp init`, `praetore-mcp policy check`) and restart the client.
+* Keys are read only from a real `DIR/keys`. A home does not load, and
+  `init`, `verify` and `policy check` exit non-zero, when `DIR/keys` is a
+  symlink, when a key file is a symlink, has a second name (a hard link) or
+  is not owned by the user running praetore-mcp, or when a directory above
+  `DIR/keys` is a symlink that a user made. A symlink owned by root (`/tmp`
+  and `/var` on macOS) is accepted. Otherwise a scratch home with links to
+  another home's keys and a policy of its own would sign receipts with
+  those keys. This does not stop a process that reads the key files and
+  copies them; see the trust model.
 * Errors while evaluating one call after a successful start (clock, replay
   guard): **enforce refuses the call (fail closed); observe forwards it with
   a loud stderr warning and no receipt.** Exceptions (G7): an unclassified
@@ -721,6 +748,12 @@ Things to know:
   Safety action are refused in observe as well, even when the name would
   fail validation or the line is ambiguous. If a receipt cannot be written,
   enforce refuses the call; observe forwards it and warns.
+* Before a receipt is written, its journal line is read back and checked as
+  `verify` would check it. If it does not read back as the receipt that was
+  signed (for example a float argument that prints as text which parses to
+  another float), nothing is written and **both modes refuse that call**:
+  it could never have a receipt, and the line would stop every later
+  append. The stderr line says so; later calls are recorded as usual.
 * Client lines that praetore-mcp cannot parse (not UTF-8, not JSON, a
   duplicate key, a lone UTF-16 surrogate escape, nesting deeper than 128)
   are never forwarded silently. Other parsers may accept them, so they are
@@ -833,9 +866,11 @@ receipts journal. Keep the head off this machine:
 # After a run you trust: print the approval head; keep it off this machine.
 praetore-mcp verify --dir "$DIR" | sed -n 's/^approval journal: .* head \([0-9a-f]\{64\}\).*/\1/p'
 
-# Later, with that value:
+# Later, with that value and the receipts head saved the same way
+# (`verify` exits 0 only when both are given and both match):
+HEAD=<receipts head kept off this machine>
 SAVED=<approval head kept off this machine>
-if praetore-mcp verify --dir "$DIR" --expected-approval-head "$SAVED" > /dev/null; then
+if praetore-mcp verify --dir "$DIR" --expected-head "$HEAD" --expected-approval-head "$SAVED" > /dev/null; then
   echo "approval journal still ends at $SAVED"
 else
   echo "approval journal changed or verify failed"
@@ -843,6 +878,16 @@ fi
 ```
 
 A new approval moves the head, so save it again after each run you trust.
+
+`verify` has three results. `OK` (exit 0) needs both `--expected-head` and
+`--expected-approval-head`, and both journals ending exactly there; use
+`none` for a journal that does not exist yet. `UNANCHORED` (exit 3) means
+every check passed but a head was not given: the keys are files in the home,
+so a journal rewritten with them from the first entry, or cut at the end,
+passes every check that reads only the home, and `verify` says so instead of
+`OK`. `FAIL` is exit 1. The heads are worth what the place they are kept in
+is worth: if the process that can read the keys can also write the saved
+heads, it can replace both.
 Cutting the journal or deleting it fails the check. The session report
 prints the same command with both heads at close, and `dashboard` takes
 the same flag.
