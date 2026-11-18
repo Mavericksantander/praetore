@@ -1913,12 +1913,13 @@ mod tests {
         let signed = sign_record(&record, DECISION_DOMAIN, &approver).unwrap();
         with_lock(&home, |journal| append_signed(journal, &[], &signed)).unwrap();
 
+        use crate::shown::Show;
         let bin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/debug/praetore-mcp");
         assert!(
             bin.is_file(),
             "build praetore-mcp before this test ({})",
-            bin.display()
+            bin.shown()
         );
         let out = std::process::Command::new(&bin)
             .args(["verify", "--dir", home.root.to_str().unwrap()])
