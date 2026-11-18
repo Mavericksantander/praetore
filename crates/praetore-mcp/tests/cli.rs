@@ -128,10 +128,10 @@ fn init_help_says_what_observe_mode_still_refuses() {
         init.contains(
             "Observe mode records a DENY and forwards the call, but it still refuses a \
              tools/call the policy does not classify, a client line it cannot parse that \
-             may name a safety* tool, a client line over 32 MiB, and a whole batch when a \
-             tools/call in it is refused. When the home cannot be loaded (before init, for \
-             example), every tools/call and every client line that cannot be parsed is \
-             refused."
+             may name a safety* tool, a client line over 32 MiB, a whole batch when a \
+             tools/call in it is refused, and a tools/call whose receipt would not verify. \
+             When the home cannot be loaded (before init, for example), every tools/call \
+             and every client line that cannot be parsed is refused."
         ),
         "{init}"
     );
@@ -139,8 +139,9 @@ fn init_help_says_what_observe_mode_still_refuses() {
     assert!(
         top.contains(
             "it still refuses unclassified calls, unparseable lines that may name a \
-             safety* tool, lines over 32 MiB and batches with a refused call, and, when the \
-             home cannot be loaded, every tools/call."
+             safety* tool, lines over 32 MiB, batches with a refused call and a tools/call \
+             whose receipt would not verify, and, when the home cannot be loaded, every \
+             tools/call."
         ),
         "{top}"
     );
@@ -164,7 +165,8 @@ fn init_output_says_what_observe_mode_still_refuses() {
         text.contains(
             "In enforce mode every tools/call is denied unless a rule allows it. Observe \
              mode records a DENY and forwards the call, but it still refuses calls the \
-             policy does not classify and client lines it cannot check (see `init --help`)."
+             policy does not classify, client lines it cannot check, and a call whose \
+             receipt would not verify (see `init --help`)."
         ),
         "{text}"
     );

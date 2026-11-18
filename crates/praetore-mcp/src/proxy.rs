@@ -326,6 +326,8 @@ pub struct Outcome {
 enum CallDecision {
     Forward,
     Block(String),
+    /// The receipt line does not verify. Not forwarded in either mode.
+    Unverifiable(String),
 }
 
 fn decide(
@@ -362,6 +364,17 @@ fn decide(
             ));
             CallDecision::Block(format!(
                 "PRÆTORE refused this tool call because the policy does not classify it: {error}"
+            ))
+        }
+        // The line that would be written does not verify. Both modes refuse
+        // it, so the call is not executed and the journal is left as it was.
+        Err(error @ GateError::ReceiptUnverifiable { .. }) => {
+            warnings.push(format!(
+                "praetore-mcp: ERROR receipt for {server}/{tool} does not verify before it is written: {error}; call REFUSED ({})",
+                mode.as_str()
+            ));
+            CallDecision::Unverifiable(format!(
+                "PRÆTORE could not record a verifiable receipt for this tool call, so it was not executed. {error}"
             ))
         }
         Err(error) => match mode {
@@ -670,11 +683,17 @@ pub fn handle_client_line(
                 for call in &candidates {
                     // Observe forwards and only records receipts, except a
                     // reading named `safety*` that is not a declared Safety
-                    // action (G7): then the line is refused.
+                    // action (G7), and a reading whose receipt line does not
+                    // verify: then the line is refused.
                     let decision = decide(mode, server, call, evaluator, &mut out.warnings);
-                    if let CallDecision::Block(text) = decision
-                        && crate::gate::is_safety_named(&call.params)
-                    {
+                    let blocked = match decision {
+                        CallDecision::Unverifiable(text) => Some(text),
+                        CallDecision::Block(text) if crate::gate::is_safety_named(&call.params) => {
+                            Some(text)
+                        }
+                        CallDecision::Block(_) | CallDecision::Forward => None,
+                    };
+                    if let Some(text) = blocked {
                         refused.get_or_insert((call.id.clone(), text));
                     }
                 }
@@ -697,7 +716,7 @@ pub fn handle_client_line(
         Classified::ToolCall(call) => {
             match decide(mode, server, &call, evaluator, &mut out.warnings) {
                 CallDecision::Forward => out.to_server = Some(forward_unchanged(raw)),
-                CallDecision::Block(text) => {
+                CallDecision::Block(text) | CallDecision::Unverifiable(text) => {
                     if let Some(id) = &call.id {
                         out.to_client = Some(line(&blocked_response(id, &text)));
                     }
@@ -713,7 +732,7 @@ pub fn handle_client_line(
                 blocked.push(match &item.call {
                     Some(call) => match decide(mode, server, call, evaluator, &mut out.warnings) {
                         CallDecision::Forward => None,
-                        CallDecision::Block(text) => Some(text),
+                        CallDecision::Block(text) | CallDecision::Unverifiable(text) => Some(text),
                     },
                     None => None,
                 });
@@ -919,6 +938,31 @@ mod tests {
         let out = handle_client_line(CALL, Mode::Observe, "fs", &mut eval);
         assert_eq!(out.to_server.as_deref(), Some(CALL));
         assert!(out.warnings[0].contains("WITHOUT a receipt"));
+    }
+
+    #[test]
+    fn an_unverifiable_receipt_is_not_forwarded_in_either_mode() {
+        struct Unverifiable;
+        impl Evaluator for Unverifiable {
+            fn evaluate(&mut self, _: &str, _: &Value) -> Result<Verdict, GateError> {
+                Err(GateError::ReceiptUnverifiable {
+                    detail: "receipt does not verify before it is written: EVIDENCE_FAIL".into(),
+                })
+            }
+        }
+        for mode in [Mode::Enforce, Mode::Observe] {
+            let mut eval = Unverifiable;
+            let out = handle_client_line(CALL, mode, "fs", &mut eval);
+            assert!(out.to_server.is_none(), "{}", mode.as_str());
+            let reply: Value = serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+            let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("not executed"), "{text}");
+            let warning = out.warnings.join("\n");
+            assert!(warning.contains("does not verify"), "{warning}");
+            assert!(warning.contains("REFUSED"), "{warning}");
+            assert!(!warning.contains("forwarded"), "{warning}");
+        }
     }
 
     #[test]

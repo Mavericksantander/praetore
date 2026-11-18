@@ -719,8 +719,10 @@ Things to know:
   a loud stderr warning and no receipt.** Exceptions (G7): an unclassified
   action type and any `safety*` tool name that is not exactly a declared
   Safety action are refused in observe as well, even when the name would
-  fail validation or the line is ambiguous. If a receipt cannot be written,
-  enforce refuses the call; observe forwards it and warns.
+  fail validation or the line is ambiguous. If a receipt cannot be written
+  (the disk is full, for example), enforce refuses the call; observe forwards
+  it and warns. A receipt line that would not verify is not written, and both
+  modes refuse that call.
 * Client lines that praetore-mcp cannot parse (not UTF-8, not JSON, a
   duplicate key, a lone UTF-16 surrogate escape, nesting deeper than 128)
   are never forwarded silently. Other parsers may accept them, so they are

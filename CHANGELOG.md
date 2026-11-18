@@ -53,6 +53,14 @@
 
 ### Fixed
 
+- **praetore-mcp: a receipt is checked before it is written.** The receipts
+  journal appends a line only after that exact line parses back, its
+  evidence integrity holds and the next link can be computed. A line that
+  does not pass is not written. Enforce and observe both refuse that call,
+  and later calls keep working. `verify` still exits 0. The approval
+  journal already refused a line that did not round-trip; that check is
+  now the only value its append writes.
+
 - **praetore-mcp: what observe mode refuses, and what a DENY shows.** The
   help, the `init` output, the READMEs and the GUIDE said observe mode
   never blocks (the 0.3.5 entry below says so too). It records a DENY and

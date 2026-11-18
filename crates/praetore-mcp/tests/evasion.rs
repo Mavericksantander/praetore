@@ -930,9 +930,9 @@ fn forge_named_receipt(
     let evidence = gate
         .evaluate_evidence_with("fake", &params, Some(approval_id))
         .unwrap();
-    praetore_mcp::gate::Journal::new(home)
-        .append(&evidence)
-        .unwrap();
+    let journal = praetore_mcp::gate::Journal::new(home);
+    let line = journal.seal(&evidence).unwrap();
+    journal.append(&line).unwrap();
     evidence
 }
 

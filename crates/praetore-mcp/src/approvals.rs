@@ -1112,15 +1112,8 @@ fn append_signed(journal: &Path, entries: &[JournalEntry], record: &Value) -> Re
         ));
     }
     let (seq, prev) = next_position(entries)?;
-    let canonical_text = std::str::from_utf8(&canonical)
-        .map_err(|_| "canonical approval record is not UTF-8".to_owned())?;
-    let line = format!("{{\"seq\":{seq},\"prev\":\"{prev}\",\"record\":{canonical_text}}}\n");
-    // The line we write must be the line verify parses back.
-    let parsed = parse_journal_text(line.trim_end_matches('\n'))?;
-    if parsed.seq != seq || parsed.prev != prev || parsed.canonical != canonical {
-        return Err("approval journal line did not round-trip".into());
-    }
-    append_line(journal, line.as_bytes())
+    let line = VerifiedApprovalLine::seal(seq, &prev, &canonical)?;
+    append_line(journal, &line)
 }
 
 fn next_position(entries: &[JournalEntry]) -> Result<(u64, String), String> {
@@ -1658,8 +1651,45 @@ fn link_bytes(seq: u64, prev: &str, canonical: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-fn append_line(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    crate::journal_io::append_journal_file(path, bytes)
+mod verified_approval {
+    use super::{link_bytes, parse_journal_text};
+
+    /// An approval-journal line that re-parsed to the same canonical record
+    /// and whose next link could be computed. The parent appends only this.
+    pub(super) struct VerifiedApprovalLine {
+        bytes: Vec<u8>,
+    }
+
+    impl VerifiedApprovalLine {
+        pub(super) fn seal(seq: u64, prev: &str, canonical: &[u8]) -> Result<Self, String> {
+            let canonical_text = std::str::from_utf8(canonical)
+                .map_err(|_| "canonical approval record is not UTF-8".to_owned())?;
+            let line =
+                format!("{{\"seq\":{seq},\"prev\":\"{prev}\",\"record\":{canonical_text}}}\n");
+            let parsed = parse_journal_text(line.trim_end_matches('\n'))?;
+            if parsed.seq != seq || parsed.prev != prev || parsed.canonical != canonical {
+                return Err("approval journal line did not round-trip".into());
+            }
+            let next = hex::encode(link_bytes(parsed.seq, &parsed.prev, &parsed.canonical));
+            let expected = hex::encode(link_bytes(seq, prev, canonical));
+            if next != expected {
+                return Err("approval journal line did not round-trip".into());
+            }
+            Ok(Self {
+                bytes: line.into_bytes(),
+            })
+        }
+
+        pub(super) fn as_bytes(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+}
+
+use verified_approval::VerifiedApprovalLine;
+
+fn append_line(path: &Path, line: &VerifiedApprovalLine) -> Result<(), String> {
+    crate::journal_io::append_journal_file(path, line.as_bytes())
         .map_err(|e| format!("cannot append to {}: {e}", path.shown()))
 }
 

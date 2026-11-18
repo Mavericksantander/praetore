@@ -111,6 +111,160 @@ pub fn chained_line(position: &Position, evidence_json: &str) -> String {
     )
 }
 
+/// Why [`crate::gate::Journal::seal`] did not produce a line.
+#[derive(Debug)]
+pub enum SealError {
+    /// The exact line that would be written does not re-parse, its evidence
+    /// integrity does not hold, or the next link cannot be computed. Nothing
+    /// was written.
+    Unverifiable(String),
+    /// The journal could not be read or the evidence could not be serialized.
+    /// Nothing was written.
+    Unavailable(String),
+}
+
+impl SealError {
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::Unverifiable(detail) | Self::Unavailable(detail) => detail,
+        }
+    }
+}
+
+mod verified {
+    use super::{JournalLock, Position, chained_line, parse_line};
+    use std::path::{Path, PathBuf};
+
+    /// One receipts-journal line that has been re-parsed and checked.
+    ///
+    /// [`VerifiedLine::seal`] is the only constructor. It formats the line
+    /// that would be written, parses that exact text, checks evidence
+    /// integrity and computes the link of the next entry. The journal
+    /// appends these bytes and nothing else.
+    pub struct VerifiedLine {
+        bytes: String,
+        journal_dir: PathBuf,
+        path: PathBuf,
+        position: Position,
+        next: Position,
+        /// Held from the tail read until this value is dropped, which is
+        /// after append returns.
+        lock: JournalLock,
+    }
+
+    impl VerifiedLine {
+        /// Builds the line `chained_line(position, evidence_json)` only when
+        /// that text parses, its evidence verifies and the next link exists.
+        pub(crate) fn seal(
+            journal_dir: PathBuf,
+            path: PathBuf,
+            position: Position,
+            evidence_json: &str,
+            lock: JournalLock,
+        ) -> Result<Self, String> {
+            let bytes = chained_line(&position, evidence_json);
+            if !bytes.ends_with('\n')
+                || bytes.contains('\r')
+                || bytes.bytes().filter(|byte| *byte == b'\n').count() != 1
+            {
+                return Err(
+                    "receipt does not verify before it is written: the line is not a single JSON line"
+                        .into(),
+                );
+            }
+            let text = bytes.trim_end_matches('\n');
+            let entry = parse_line(text).map_err(|error| {
+                format!("receipt does not verify before it is written: {error}")
+            })?;
+            if !entry.evidence.verify_integrity() {
+                return Err(
+                    "receipt does not verify before it is written: evidence integrity verification failed"
+                        .into(),
+                );
+            }
+            let Some(parsed) = entry.position else {
+                return Err(
+                    "receipt does not verify before it is written: the line parsed as an unchained receipt"
+                        .into(),
+                );
+            };
+            if parsed != position {
+                return Err(
+                    "receipt does not verify before it is written: the chain position did not round-trip"
+                        .into(),
+                );
+            }
+            let next = parsed.after(&entry.evidence).map_err(|error| {
+                format!("receipt does not verify before it is written: {error}")
+            })?;
+            Ok(Self {
+                bytes,
+                journal_dir,
+                path,
+                position: parsed,
+                next,
+                lock,
+            })
+        }
+
+        pub(crate) fn as_bytes(&self) -> &[u8] {
+            self.bytes.as_bytes()
+        }
+
+        pub(crate) fn journal_dir(&self) -> &Path {
+            &self.journal_dir
+        }
+
+        pub(crate) fn path(&self) -> &Path {
+            &self.path
+        }
+
+        pub(crate) fn position(&self) -> Position {
+            self.position
+        }
+
+        /// Position the next entry must use, from the re-parsed evidence.
+        pub fn next_position(&self) -> Position {
+            self.next
+        }
+
+        pub(crate) fn journal_lock(&self) -> &JournalLock {
+            &self.lock
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::VerifiedLine;
+        use crate::journal::{JournalLock, Position};
+        use std::fs;
+
+        #[test]
+        fn seal_rejects_a_line_that_does_not_parse() {
+            let temp = tempfile::tempdir().unwrap();
+            let dir = temp.path().join("receipts");
+            fs::create_dir(&dir).unwrap();
+            let lock = JournalLock::acquire(&dir).unwrap();
+            let error = match VerifiedLine::seal(
+                dir.clone(),
+                dir.join("2026-01-01.jsonl"),
+                Position::FIRST,
+                "null",
+                lock,
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("seal accepted a line that does not parse"),
+            };
+            assert!(
+                error.contains("does not verify before it is written"),
+                "{error}"
+            );
+        }
+    }
+}
+
+pub use verified::VerifiedLine;
+
 /// Daily files (`*.jsonl`) in `dir`, in name (date) order.
 pub fn journal_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut files: Vec<PathBuf> = match fs::read_dir(dir) {

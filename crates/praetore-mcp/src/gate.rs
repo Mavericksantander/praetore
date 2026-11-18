@@ -100,6 +100,10 @@ pub enum GateError {
     UnclassifiedAction { action_type: String },
     /// Anything else that prevented a verdict (keys, signing, engine).
     Failed(String),
+    /// The receipt line that would be written does not re-parse and verify.
+    /// Nothing was written. Refused in both modes: there is no execution
+    /// without evidence that `verify` can read.
+    ReceiptUnverifiable { detail: String },
 }
 
 impl std::fmt::Display for GateError {
@@ -114,7 +118,24 @@ impl std::fmt::Display for GateError {
                 "UNCLASSIFIED_ACTION: action type {action_type:?} is not declared in the policy's action_classes"
             ),
             Self::Failed(message) => f.write_str(message),
+            Self::ReceiptUnverifiable { detail } => f.write_str(detail),
         }
+    }
+}
+
+/// Why recording one receipt stopped.
+enum RecordError {
+    /// The line was not written because it does not verify.
+    Unverifiable(String),
+    /// The journal could not be read or the line could not be stored.
+    Failed(String),
+}
+
+fn recorded(result: Result<PathBuf, RecordError>) -> Result<Result<PathBuf, String>, GateError> {
+    match result {
+        Ok(path) => Ok(Ok(path)),
+        Err(RecordError::Failed(detail)) => Ok(Err(detail)),
+        Err(RecordError::Unverifiable(detail)) => Err(GateError::ReceiptUnverifiable { detail }),
     }
 }
 
@@ -1221,20 +1242,42 @@ fn unclassified_action_type(server: &str, params: &Value) -> String {
 /// (printable ASCII only), so it is always unclassified.
 pub const UNCLASSIFIED_TOOL_ACTION_TYPE: &str = "praetore-mcp unclassified tool name";
 
+impl Gate {
+    /// Seals `evidence` for the current tail and appends that line.
+    ///
+    /// A line that does not verify is [`RecordError::Unverifiable`] and is
+    /// not written. A later call still appends.
+    fn record(&self, evidence: &Evidence) -> Result<PathBuf, RecordError> {
+        let line = match self.journal.seal(evidence) {
+            Ok(line) => line,
+            Err(crate::journal::SealError::Unverifiable(detail)) => {
+                return Err(RecordError::Unverifiable(detail));
+            }
+            Err(crate::journal::SealError::Unavailable(detail)) => {
+                return Err(RecordError::Failed(detail));
+            }
+        };
+        self.journal.append(&line).map_err(RecordError::Failed)
+    }
+}
+
 impl Evaluator for Gate {
     fn evaluate(&mut self, server: &str, params: &Value) -> Result<Verdict, GateError> {
         let evidence = self.evaluate_evidence(server, params)?;
         if self.mode != Mode::Enforce
             || evidence.decision.outcome != DecisionOutcome::RequireApproval
         {
-            let journaled = self.journal.append(&evidence);
+            let journaled = recorded(self.record(&evidence))?;
             return Ok(verdict_from(&evidence, journaled));
         }
         let sign_forward = |approval_id: &str| {
             self.evaluate_evidence_with(server, params, Some(approval_id))
                 .map_err(|error| error.to_string())
         };
-        let journal = |evidence: &Evidence| self.journal.append(evidence);
+        let journal = |evidence: &Evidence| match self.record(evidence) {
+            Ok(path) => Ok(path),
+            Err(RecordError::Failed(detail) | RecordError::Unverifiable(detail)) => Err(detail),
+        };
         use crate::approvals::HoldOrForward;
         Ok(
             match crate::approvals::on_require_approval(
@@ -1333,36 +1376,60 @@ impl Journal {
         ))
     }
 
-    pub fn append(&self, evidence: &Evidence) -> Result<PathBuf, String> {
+    /// Reads the current tail and seals `evidence` into the only line
+    /// [`Self::append`] will write. The journal lock is held inside the
+    /// returned line until that line is dropped.
+    pub fn seal(
+        &self,
+        evidence: &Evidence,
+    ) -> Result<crate::journal::VerifiedLine, crate::journal::SealError> {
         #[cfg(test)]
         tests::JOURNAL_APPENDS.with(|appends| appends.set(appends.get() + 1));
-        let evidence_json = evidence
-            .to_json()
-            .map_err(|e| format!("cannot serialize evidence: {e}"))?;
-        store::ensure_dir(&self.dir, false)?;
-        // Held until the entry is on disk: the position read below must
-        // still be the end of the journal when the line is written.
-        let _lock = crate::journal::JournalLock::acquire(&self.dir)?;
+        let evidence_json = evidence.to_json().map_err(|e| {
+            crate::journal::SealError::Unavailable(format!("cannot serialize evidence: {e}"))
+        })?;
+        store::ensure_dir(&self.dir, false).map_err(crate::journal::SealError::Unavailable)?;
+        let lock = crate::journal::JournalLock::acquire(&self.dir)
+            .map_err(crate::journal::SealError::Unavailable)?;
         let (path, position) = crate::journal::next_append(
             &self.dir,
             self.path_for(OffsetDateTime::now_utc()),
             &self.verify,
-        )?;
-        if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+        )
+        .map_err(crate::journal::SealError::Unavailable)?;
+        if fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(crate::journal::SealError::Unavailable(format!(
+                "{} is a symlink; refusing to append",
+                path.shown()
+            )));
+        }
+        crate::journal::VerifiedLine::seal(self.dir.clone(), path, position, &evidence_json, lock)
+            .map_err(crate::journal::SealError::Unverifiable)
+    }
+
+    /// Appends a line produced by [`Self::seal`]. Any other bytes are not
+    /// a [`crate::journal::VerifiedLine`] and cannot be passed here.
+    pub fn append(&self, line: &crate::journal::VerifiedLine) -> Result<PathBuf, String> {
+        // The lock acquired with the tail read is still held by `line`.
+        let _held = line.journal_lock();
+        if line.journal_dir() != self.dir {
+            return Err("verified line belongs to another journal; nothing was written".into());
+        }
+        let path = line.path().to_path_buf();
+        if fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
             return Err(format!("{} is a symlink; refusing to append", path.shown()));
         }
-        let line = crate::journal::chained_line(&position, &evidence_json);
-        append_line(&path, line.as_bytes())
+        let (current, position) =
+            crate::journal::next_append(&self.dir, path.clone(), &self.verify)?;
+        if current != path || position != line.position() {
+            return Err(
+                "journal changed before the verified line was written; nothing was written".into(),
+            );
+        }
+        crate::journal_io::append_journal_file(&path, line.as_bytes())
             .map_err(|e| format!("cannot append to {}: {e}", path.shown()))?;
         Ok(path)
     }
-}
-
-fn append_line(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    // One line per append. The journal lock keeps concurrent wrappers (one
-    // per server) from interleaving. The shared helper rolls a short or
-    // failed write back to the previous length.
-    crate::journal_io::append_journal_file(path, bytes)
 }
 
 #[cfg(test)]
@@ -1371,7 +1438,8 @@ pub(crate) fn seed_one_receipt(home: &Home) -> PathBuf {
     let evidence = gate
         .evaluate_evidence("s", &json!({"name": "echo", "arguments": {"n": 1}}))
         .unwrap();
-    gate.journal.append(&evidence).unwrap()
+    let line = gate.journal.seal(&evidence).unwrap();
+    gate.journal.append(&line).unwrap()
 }
 
 #[cfg(test)]
@@ -2708,7 +2776,8 @@ mod tests {
                     for n in 0..10 {
                         let params = json!({"name": "echo", "arguments": {"w": writer, "n": n}});
                         let evidence = gate.evaluate_evidence("s", &params).unwrap();
-                        gate.journal.append(&evidence).unwrap();
+                        let line = gate.journal.seal(&evidence).unwrap();
+                        gate.journal.append(&line).unwrap();
                     }
                 })
             })
@@ -2732,15 +2801,15 @@ mod tests {
         assert!(crate::fsutil::sync_dir(&temp.path().join("missing")).is_err());
         // A new daily file is created and the directory synced with it.
         let path = temp.path().join("2026-01-01.jsonl");
-        append_line(&path, b"x\n").unwrap();
-        append_line(&path, b"y\n").unwrap();
+        crate::journal_io::append_journal_file(&path, b"x\n").unwrap();
+        crate::journal_io::append_journal_file(&path, b"y\n").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"x\ny\n");
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             // The daily file is opened with O_NOFOLLOW.
             let link = temp.path().join("2026-01-02.jsonl");
             std::os::unix::fs::symlink(&path, &link).unwrap();
-            assert!(append_line(&link, b"z\n").is_err());
+            assert!(crate::journal_io::append_journal_file(&link, b"z\n").is_err());
             assert_eq!(fs::read(&path).unwrap(), b"x\ny\n");
         }
     }
@@ -2786,5 +2855,121 @@ mod tests {
             crate::journal_io::commit_journal_line(&mut writer, &crate::journal_io::line_of_401())
                 .unwrap_err();
         crate::journal_io::assert_journal_intact(&home, &path, &original, &writer, &error, kind);
+    }
+
+    /// The link stored on a sealed line is the position the next append reads
+    /// back from the bytes that were written.
+    #[test]
+    fn the_next_link_is_computed_from_the_line_that_was_written() {
+        let (_temp, root) = canonical_tempdir();
+        let home = Home::new(root.join("home"));
+        store::init(&home).unwrap();
+        let gate = Gate::load(&home, Mode::Observe).unwrap();
+        let first = gate
+            .evaluate_evidence("s", &json!({"name": "echo", "arguments": {"n": 1}}))
+            .unwrap();
+        let next = {
+            let line = gate.journal.seal(&first).unwrap();
+            let next = line.next_position();
+            gate.journal.append(&line).unwrap();
+            next
+        };
+        let second = gate
+            .evaluate_evidence("s", &json!({"name": "echo", "arguments": {"n": 2}}))
+            .unwrap();
+        let line = gate.journal.seal(&second).unwrap();
+        assert_eq!(line.position(), next);
+        gate.journal.append(&line).unwrap();
+        let report = crate::receipts::verify_journal(&home, None).unwrap();
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.chained, 2);
+    }
+
+    fn allow_every_call(home: &Home) {
+        let mut policy = store::default_policy();
+        policy.rules.push(
+            praetore_core::PolicyRule::new(
+                store::LEGACY_ALLOW_ALL_RULE,
+                store::ACTION_TYPE,
+                praetore_core::PolicyEffect::Allow,
+            )
+            .with_capability(store::CAPABILITY),
+        );
+        fs::write(home.policy(), serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+    }
+
+    /// `true` when parsing `literal` and parsing that value's JSON again
+    /// produce the same number. Without serde_json's `float_roundtrip` the
+    /// fixed literal below does not.
+    fn json_number_round_trips(literal: &str) -> bool {
+        let Ok(value) = serde_json::from_str::<Value>(literal) else {
+            return false;
+        };
+        let encoded = serde_json::to_string(&value).unwrap();
+        serde_json::from_str::<Value>(&encoded).ok().as_ref() == Some(&value)
+    }
+
+    fn raw_call(id: &str, arguments: &str) -> Vec<u8> {
+        format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{id}\",\"method\":\"tools/call\",\"params\":{{\"name\":\"echo\",\"arguments\":{arguments}}}}}\n"
+        )
+        .into_bytes()
+    }
+
+    /// A number that does not survive a JSON re-parse must not be written.
+    /// The following call, in a newly loaded gate, still runs, and the
+    /// journal verifies. When the number does survive, the first call is
+    /// written and the journal still verifies.
+    #[test]
+    fn a_non_round_tripping_number_is_not_written_and_the_next_call_is() {
+        const LITERAL: &str = "99.9999999999999929";
+        for mode in [Mode::Observe, Mode::Enforce] {
+            let (_temp, root) = canonical_tempdir();
+            let home = Home::new(root.join("home"));
+            store::init(&home).unwrap();
+            allow_every_call(&home);
+            let mut gate = Gate::load(&home, mode).unwrap();
+            let poison = raw_call("p", &format!("{{\"n\":{LITERAL}}}"));
+            let out = crate::proxy::handle_client_line(&poison, mode, "s", &mut gate);
+            drop(gate);
+            let after_poison = crate::receipts::verify_journal(&home, None).unwrap();
+            assert!(
+                after_poison.failures.is_empty(),
+                "{mode:?}: {:?}",
+                after_poison.failures
+            );
+            if !json_number_round_trips(LITERAL) {
+                assert!(
+                    out.to_server.is_none(),
+                    "{mode:?}: a number that does not round-trip was forwarded: {:?}",
+                    out.warnings
+                );
+                assert_eq!(after_poison.total, 0, "{mode:?}");
+                assert!(
+                    out.warnings
+                        .iter()
+                        .any(|warning| warning.contains("does not verify")),
+                    "{mode:?}: {:?}",
+                    out.warnings
+                );
+            } else if out.to_server.is_some() {
+                assert_eq!(after_poison.total, 1, "{mode:?}");
+            }
+            let mut again = Gate::load(&home, mode).unwrap();
+            let normal = raw_call("n", r#"{"n":1}"#);
+            let next = crate::proxy::handle_client_line(&normal, mode, "s", &mut again);
+            assert!(
+                next.to_server.is_some(),
+                "{mode:?}: the call after the bad number was not executed: {:?}",
+                next.warnings
+            );
+            let report = crate::receipts::verify_journal(&home, None).unwrap();
+            assert!(
+                report.failures.is_empty(),
+                "{mode:?}: {:?}",
+                report.failures
+            );
+            assert!(report.ok >= 1, "{mode:?}: {report:?}");
+        }
     }
 }
