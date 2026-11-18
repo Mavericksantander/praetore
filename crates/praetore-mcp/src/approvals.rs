@@ -84,7 +84,11 @@ impl HumanOutcome {
 struct Binding {
     server: String,
     tool: String,
+    /// Raw call arguments. Not the copy the engine saw.
     arguments: Value,
+    /// `praetore.path_check` from the retained receipt, or from the receipt
+    /// of the call being evaluated. `Null` when that receipt has none.
+    path_check: Value,
 }
 
 /// What enforce does with a `REQUIRE_APPROVAL` verdict.
@@ -241,7 +245,7 @@ fn hold_or_forward(
     journal: &dyn Fn(&Evidence) -> Result<PathBuf, String>,
     written: &mut Option<Written>,
 ) -> Result<HoldOrForward, String> {
-    let binding = binding_from_call(server, params)?;
+    let binding = binding_from_call(server, params, held)?;
     if held.decision.outcome != DecisionOutcome::RequireApproval {
         return Err("approval handling called for a call that is not REQUIRE_APPROVAL".into());
     }
@@ -987,6 +991,12 @@ fn first_unused_approval(
     named: &BTreeSet<String>,
     now: OffsetDateTime,
 ) -> Result<Option<String>, String> {
+    // A path that no longer resolves the way it did when the call was held
+    // does not consume an approval. `same` is required on every checked
+    // argument; an absent path check has nothing to disagree with.
+    if !path_check_is_same(&binding.path_check) {
+        return Ok(None);
+    }
     let mut used: BTreeSet<&str> = entries
         .iter()
         .filter(|entry| entry.record["kind"] == "execution")
@@ -999,7 +1009,14 @@ fn first_unused_approval(
             continue;
         }
         let id = required_str(&entry.record, "approval_id")?;
-        if used.contains(id) || binding_from_record(&entry.record)? != *binding {
+        if used.contains(id) {
+            continue;
+        }
+        let pending_id = required_str(&entry.record, "pending_evidence_id")?;
+        let retained = load_signed_receipt(home, pending_id)?;
+        let mut held = binding_from_record(&entry.record)?;
+        held.path_check = path_check_of(&retained);
+        if held != *binding {
             continue;
         }
         let expires = parse_time(required_str(&entry.record, "expires_at")?)?;
@@ -1050,7 +1067,10 @@ fn reuse_or_create_pending(
             fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.shown()))?;
         let value: Value = serde_json::from_str(&text)
             .map_err(|e| format!("{} is not JSON: {e}", path.shown()))?;
-        let existing = binding_from_pending(&value)?;
+        let mut existing = binding_from_pending(&value)?;
+        if let Ok(evidence) = load_signed_receipt(home, &pending.evidence_id) {
+            existing.path_check = path_check_of(&evidence);
+        }
         if existing == *binding && !pending.expiry.is_expired_at(now) {
             return pending_info(&value);
         }
@@ -1179,7 +1199,7 @@ fn public_hex(secret: &[u8; 32]) -> String {
     hex::encode(SigningKey::from_bytes(secret).verifying_key().to_bytes())
 }
 
-fn binding_from_call(server: &str, params: &Value) -> Result<Binding, String> {
+fn binding_from_call(server: &str, params: &Value, evidence: &Evidence) -> Result<Binding, String> {
     let Some(tool) = params.get("name").and_then(Value::as_str) else {
         return Err("tool name is not a string, so the call cannot be bound to an approval".into());
     };
@@ -1190,7 +1210,27 @@ fn binding_from_call(server: &str, params: &Value) -> Result<Binding, String> {
         server: server.to_owned(),
         tool: tool.to_owned(),
         arguments: params.get("arguments").cloned().unwrap_or(Value::Null),
+        path_check: path_check_of(evidence),
     })
+}
+
+fn path_check_of(evidence: &Evidence) -> Value {
+    evidence
+        .context
+        .get(crate::gate::PATH_CHECK_CONTEXT_KEY)
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// Every checked path is `same`. No path check counts as same.
+fn path_check_is_same(path_check: &Value) -> bool {
+    match path_check {
+        Value::Null => true,
+        Value::Object(entries) => entries
+            .values()
+            .all(|entry| entry.get("status").and_then(Value::as_str) == Some("same")),
+        _ => false,
+    }
 }
 
 fn binding_from_record(record: &Value) -> Result<Binding, String> {
@@ -1201,6 +1241,7 @@ fn binding_from_record(record: &Value) -> Result<Binding, String> {
             .get("arguments")
             .cloned()
             .ok_or("approval record has no arguments")?,
+        path_check: Value::Null,
     })
 }
 
@@ -1780,5 +1821,115 @@ mod tests {
                 .unwrap_err();
         crate::journal_io::assert_journal_intact(&home, &path, &original, &writer, &error, kind);
         assert_eq!(report.approval_decisions, 1, "{report:?}");
+    }
+
+    #[test]
+    fn spec_defines_consumed_approval_path_check_equals_held() {
+        let spec = include_str!("../../../docs/formal/ApprovalPath.tla");
+        let cfg = include_str!("../../../docs/formal/ApprovalPath.cfg");
+        assert!(spec.contains("ConsumedApprovalPathCheckEqualsHeld =="));
+        assert!(cfg.contains("ConsumedApprovalPathCheckEqualsHeld"));
+    }
+
+    /// The approval is consumed when the path still resolves to itself.
+    #[cfg(unix)]
+    #[test]
+    fn an_unchanged_path_still_consumes_the_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        fs::create_dir(&work).unwrap();
+        fs::write(work.join("a"), b"x").unwrap();
+        let work = fs::canonicalize(&work).unwrap();
+        let (_temp, home) = approve_path_call(&work);
+        let mut gate = crate::gate::Gate::load(&home, crate::gate::Mode::Enforce).unwrap();
+        let verdict = crate::gate::Evaluator::evaluate(
+            &mut gate,
+            "fake",
+            &json!({"name": "echo", "arguments": {"path": work.join("a").to_str().unwrap()}}),
+        )
+        .unwrap();
+        assert_eq!(verdict.outcome, DecisionOutcome::RequireApproval);
+        assert!(verdict.consumed_approval.is_some(), "{verdict:?}");
+        assert!(verdict.hold_message.is_none());
+        assert_eq!(execution_count(&home), 1);
+    }
+
+    /// Replacing the directory with a symlink must not consume the approval.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_in_place_of_the_held_directory_does_not_consume_the_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        fs::create_dir(&work).unwrap();
+        fs::write(work.join("a"), b"x").unwrap();
+        let work = fs::canonicalize(&work).unwrap();
+        let (_temp, home) = approve_path_call(&work);
+        let moved = work.with_file_name("work.real");
+        fs::rename(&work, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &work).unwrap();
+        let mut gate = crate::gate::Gate::load(&home, crate::gate::Mode::Enforce).unwrap();
+        let verdict = crate::gate::Evaluator::evaluate(
+            &mut gate,
+            "fake",
+            &json!({"name": "echo", "arguments": {"path": work.join("a").to_str().unwrap()}}),
+        )
+        .unwrap();
+        assert_eq!(verdict.outcome, DecisionOutcome::RequireApproval);
+        assert!(
+            verdict.consumed_approval.is_none(),
+            "forwarded: {verdict:?}"
+        );
+        assert!(verdict.hold_message.is_some(), "{verdict:?}");
+        assert_eq!(execution_count(&home), 0);
+    }
+
+    #[cfg(unix)]
+    fn approve_path_call(work: &std::path::Path) -> (tempfile::TempDir, Home) {
+        use crate::gate::{Evaluator, Gate, Mode};
+        use praetore_core::{PolicyCondition, PolicyEffect, PolicyRule};
+        let (temp, home) = crate::journal_io::temp_home();
+        let mut policy = store::default_policy();
+        policy.rules.push(
+            PolicyRule::new(
+                "approve-path",
+                store::ACTION_TYPE,
+                PolicyEffect::RequireApproval,
+            )
+            .with_capability(store::CAPABILITY)
+            .with_parameter_condition(PolicyCondition::exact("tool", json!("echo")))
+            .with_parameter_condition(PolicyCondition::path_prefix(
+                "arguments.path",
+                work.to_str().unwrap(),
+            )),
+        );
+        fs::write(home.policy(), serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+        let mut gate = Gate::load(&home, Mode::Enforce).unwrap();
+        let verdict = Evaluator::evaluate(
+            &mut gate,
+            "fake",
+            &json!({"name": "echo", "arguments": {"path": work.join("a").to_str().unwrap()}}),
+        )
+        .unwrap();
+        assert_eq!(verdict.outcome, DecisionOutcome::RequireApproval);
+        assert!(verdict.hold_message.is_some(), "{verdict:?}");
+        assert!(verdict.consumed_approval.is_none());
+        let pending = list_pending(&home).unwrap();
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        decide(&home, &pending[0].approval_id, HumanOutcome::Approve, None).unwrap();
+        assert_eq!(execution_count(&home), 0);
+        (temp, home)
+    }
+
+    #[cfg(unix)]
+    fn execution_count(home: &Home) -> usize {
+        let path = journal_path(home);
+        if !path.exists() {
+            return 0;
+        }
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("\"kind\":\"execution\""))
+            .count()
     }
 }
