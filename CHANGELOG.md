@@ -79,6 +79,12 @@
   the request id when that value is complete in the first 32 MiB, or
   `-32700` with `id` null when it is not. The next line is answered normally.
 
+- **praetore-mcp: a condition key `arguments.a.b` is not a nested field.**
+  It matches a literal top-level argument key `"a.b"`, which the caller
+  controls. `policy check` used to warn and exit 0. It now exits 1.
+  `wrap --mode enforce` refuses to load a policy that contains one, and
+  every `tools/call` is refused until the rule is removed.
+
 - **praetore-mcp: a `[table]` line in `config.toml` stops `wrap`.** The file
   is a flat list of `key = value` lines. A header such as `[tabla]` or
   `[[tabla]]` used to be a warning (`expected key = value; ignored`) and

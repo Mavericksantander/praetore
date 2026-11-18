@@ -1026,6 +1026,19 @@ impl Gate {
             policy,
             ..
         } = store::load(home)?;
+        if mode == Mode::Enforce {
+            let dotted = crate::policy::literal_dotted_argument_rules(&policy);
+            if !dotted.is_empty() {
+                let listed = dotted
+                    .iter()
+                    .map(|(id, key)| format!("rule {id:?} condition {key:?}"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(format!(
+                    "refusing to load policy: {listed} matches a literal top-level argument key (nested fields are not supported)"
+                ));
+            }
+        }
         let policy_digest = policy.digest().map_err(|e| format!("policy digest: {e}"))?;
         let path_keys = path_prefix_keys(&policy);
         let path_prefixes = path_prefix_values(&policy);
