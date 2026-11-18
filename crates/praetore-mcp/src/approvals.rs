@@ -322,7 +322,7 @@ fn hold_or_forward(
                 &approval_id,
                 &binding,
                 &evidence.evidence_id.to_string(),
-                now,
+                OffsetDateTime::now_utc(),
             )?;
             return Ok(HoldOrForward::Forward {
                 approval_id,
@@ -633,7 +633,7 @@ pub fn record_duplicate_execution(
             approval_id,
             &binding,
             &evidence.evidence_id.to_string(),
-            now_utc()?,
+            OffsetDateTime::now_utc(),
         )
     })
 }
@@ -1167,7 +1167,9 @@ fn append_execution(
         "server": binding.server,
         "tool": binding.tool,
         "arguments": binding.arguments,
-        "executed_at": timestamp(now)?,
+        // Full precision. A timestamp truncated to the second can fall
+        // before decided_at when both are in the same second.
+        "executed_at": now.format(&Rfc3339).map_err(|error| error.to_string())?,
         "attester_key_id": public_hex(&attester),
     });
     let signed = sign_record(&record, EXECUTION_DOMAIN, &attester)?;
@@ -1569,14 +1571,6 @@ fn read_ttl_file(home: &Home) -> Result<Option<String>, String> {
 fn now_utc() -> Result<OffsetDateTime, String> {
     OffsetDateTime::now_utc()
         .replace_nanosecond(0)
-        .map_err(|e| e.to_string())
-}
-
-fn timestamp(value: OffsetDateTime) -> Result<String, String> {
-    value
-        .replace_nanosecond(0)
-        .map_err(|e| e.to_string())?
-        .format(&Rfc3339)
         .map_err(|e| e.to_string())
 }
 
