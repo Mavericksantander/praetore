@@ -721,6 +721,12 @@ Things to know:
   Safety action are refused in observe as well, even when the name would
   fail validation or the line is ambiguous. If a receipt cannot be written,
   enforce refuses the call; observe forwards it and warns.
+* Before a receipt is written, its journal line is read back and checked as
+  `verify` would check it. If it does not read back as the receipt that was
+  signed (for example a float argument that prints as text which parses to
+  another float), nothing is written and **both modes refuse that call**:
+  it could never have a receipt, and the line would stop every later
+  append. The stderr line says so; later calls are recorded as usual.
 * Client lines that praetore-mcp cannot parse (not UTF-8, not JSON, a
   duplicate key, a lone UTF-16 surrogate escape, nesting deeper than 128)
   are never forwarded silently. Other parsers may accept them, so they are
