@@ -745,6 +745,213 @@ pub fn handle_client_line(
     out
 }
 
+/// JSON-RPC error for a client line longer than the bytes kept in `prefix`.
+/// `-32600` carries the top-level `id` when that value is complete in
+/// `prefix`. Otherwise `-32700` with `id` null (no id, a truncated id, a
+/// second id, or a batch).
+pub fn oversized_line_response(prefix: &[u8]) -> Vec<u8> {
+    let (id, code) = match extract_top_level_id(prefix) {
+        Some(id) => (id, -32600),
+        None => (Value::Null, -32700),
+    };
+    line(&json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": "praetore-mcp: client message over 32 MiB was not forwarded"
+        }
+    }))
+}
+
+struct Scan<'a> {
+    input: &'a [u8],
+    i: usize,
+}
+
+impl Scan<'_> {
+    fn peek(&self) -> Option<u8> {
+        self.input.get(self.i).copied()
+    }
+
+    fn bump(&mut self) -> Option<u8> {
+        let byte = self.peek()?;
+        self.i += 1;
+        Some(byte)
+    }
+
+    fn skip_ws(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.i += 1;
+        }
+    }
+
+    fn skip_string(&mut self) -> bool {
+        if self.bump() != Some(b'"') {
+            return false;
+        }
+        while let Some(byte) = self.bump() {
+            match byte {
+                b'"' => return true,
+                b'\\' => match self.bump() {
+                    Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => {}
+                    Some(b'u') => {
+                        let end = self.i.saturating_add(4);
+                        if end > self.input.len()
+                            || !self.input[self.i..end]
+                                .iter()
+                                .all(|c| c.is_ascii_hexdigit())
+                        {
+                            return false;
+                        }
+                        self.i = end;
+                    }
+                    _ => return false,
+                },
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn skip_literal(&mut self, literal: &[u8]) -> bool {
+        if self.input[self.i..].starts_with(literal) {
+            self.i += literal.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn skip_digits(&mut self) -> bool {
+        let start = self.i;
+        while matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.i += 1;
+        }
+        self.i > start
+    }
+
+    fn skip_number(&mut self) -> bool {
+        if self.peek() == Some(b'-') {
+            self.i += 1;
+        }
+        if !self.skip_digits() {
+            return false;
+        }
+        if self.peek() == Some(b'.') {
+            self.i += 1;
+            if !self.skip_digits() {
+                return false;
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.i += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.i += 1;
+            }
+            if !self.skip_digits() {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn skip_value(&mut self) -> bool {
+        match self.peek() {
+            Some(b'"') => self.skip_string(),
+            Some(b'{') => self.skip_container(b'{', b'}'),
+            Some(b'[') => self.skip_container(b'[', b']'),
+            Some(b't') => self.skip_literal(b"true"),
+            Some(b'f') => self.skip_literal(b"false"),
+            Some(b'n') => self.skip_literal(b"null"),
+            Some(b'-' | b'0'..=b'9') => self.skip_number(),
+            _ => false,
+        }
+    }
+
+    fn skip_container(&mut self, open: u8, close: u8) -> bool {
+        if self.bump() != Some(open) {
+            return false;
+        }
+        loop {
+            self.skip_ws();
+            if self.peek() == Some(close) {
+                self.i += 1;
+                return true;
+            }
+            if open == b'{' {
+                if !self.skip_string() {
+                    return false;
+                }
+                self.skip_ws();
+                if self.bump() != Some(b':') {
+                    return false;
+                }
+                self.skip_ws();
+            }
+            if !self.skip_value() {
+                return false;
+            }
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => self.i += 1,
+                Some(byte) if byte == close => {
+                    self.i += 1;
+                    return true;
+                }
+                _ => return false,
+            }
+        }
+    }
+}
+
+/// Top-level JSON-RPC `id` when `prefix` holds a complete value for it.
+/// `Some(Null)` means the document's id is JSON null (`-32600`). `None`
+/// means the id cannot be taken from this prefix (`-32700`).
+fn extract_top_level_id(input: &[u8]) -> Option<Value> {
+    let mut scan = Scan { input, i: 0 };
+    scan.skip_ws();
+    if scan.bump() != Some(b'{') {
+        return None;
+    }
+    let mut found = None;
+    loop {
+        scan.skip_ws();
+        match scan.peek() {
+            Some(b'}') => return found,
+            Some(b'"') => {}
+            None => return found,
+            _ => return None,
+        }
+        let key_start = scan.i;
+        if !scan.skip_string() {
+            return None;
+        }
+        let key: String = serde_json::from_slice(&scan.input[key_start..scan.i]).ok()?;
+        scan.skip_ws();
+        if scan.bump() != Some(b':') {
+            return None;
+        }
+        scan.skip_ws();
+        let value_start = scan.i;
+        let complete = scan.skip_value();
+        if key == "id" {
+            if !complete || found.is_some() {
+                return None;
+            }
+            found = Some(serde_json::from_slice(&scan.input[value_start..scan.i]).ok()?);
+        } else if !complete {
+            return found;
+        }
+        scan.skip_ws();
+        match scan.peek() {
+            Some(b',') => scan.i += 1,
+            Some(b'}') | None => return found,
+            _ => return None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1247,5 +1454,42 @@ mod tests {
         // Ordinary non-reserved keys with distinct folds stay fine.
         let ok = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{"Path":"/a","mode":"r"}}}"#;
         assert!(matches!(classify(ok), Classified::ToolCall(_)));
+    }
+
+    fn oversized(prefix: &str) -> Value {
+        serde_json::from_slice(&oversized_line_response(prefix.as_bytes())).unwrap()
+    }
+
+    #[test]
+    fn oversized_line_uses_32600_when_the_id_is_in_the_prefix() {
+        for (prefix, id) in [
+            (
+                r#"{"jsonrpc":"2.0","id":"big","method":"tools/call","params":{"f":""#,
+                json!("big"),
+            ),
+            (r#"{"id":7,"#, json!(7)),
+            ("{ \"id\" : null }", json!(null)),
+            (r#"{"params":{"id":1},"id":"late"}"#, json!("late")),
+        ] {
+            let reply = oversized(prefix);
+            assert_eq!(reply["id"], id, "{prefix}");
+            assert_eq!(reply["error"]["code"], -32600, "{prefix}");
+        }
+    }
+
+    #[test]
+    fn oversized_line_uses_32700_when_the_id_is_not_extractable() {
+        for prefix in [
+            r#"{"jsonrpc":"2.0","method":"tools/call","params":{"f":"xxxx"#,
+            r#"{"id":"trun"#,
+            r#"{"id":1,"id":2}"#,
+            r#"[{"jsonrpc":"2.0","id":1}]"#,
+            "not json",
+            r#"{"method":"see \"id\" here"}"#,
+        ] {
+            let reply = oversized(prefix);
+            assert_eq!(reply["id"], Value::Null, "{prefix}");
+            assert_eq!(reply["error"]["code"], -32700, "{prefix}");
+        }
     }
 }

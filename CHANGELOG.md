@@ -53,6 +53,12 @@
 
 ### Fixed
 
+- **praetore-mcp: a client line over 32 MiB gets a JSON-RPC error.** The
+  line is still not parsed and not forwarded (both modes). The client used
+  to get no reply and wait for its own timeout. It now gets `-32600` with
+  the request id when that value is complete in the first 32 MiB, or
+  `-32700` with `id` null when it is not. The next line is answered normally.
+
 - **praetore-mcp: what observe mode refuses, and what a DENY shows.** The
   help, the `init` output, the READMEs and the GUIDE said observe mode
   never blocks (the 0.3.5 entry below says so too). It records a DENY and

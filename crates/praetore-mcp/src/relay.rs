@@ -13,7 +13,7 @@
 use crate::shown::Show;
 use crate::{
     gate::{Evaluator, Gate, GateError, Mode, Verdict},
-    proxy::handle_client_line,
+    proxy::{handle_client_line, oversized_line_response},
     report::{self, SessionLog, SessionMeta},
     store::Home,
 };
@@ -523,12 +523,20 @@ pub fn run(options: WrapOptions) -> i32 {
                 Ok(LineRead::TooLong) => {
                     // Too long to parse, so it can be neither evaluated nor
                     // checked for a safety* tool name (G7): refused in both
-                    // modes, never forwarded unchecked.
+                    // modes, never forwarded unchecked. The client still gets
+                    // a JSON-RPC error, or it would wait until its own timeout.
+                    // Drain first: the rest of the line may still be filling
+                    // the pipe, and a reply written before that read can stall
+                    // both sides.
+                    let reply = oversized_line_response(&buf);
                     eprintln!(
                         "praetore-mcp: REFUSED client message over {MAX_CLIENT_LINE_BYTES} bytes ({}); it cannot be checked",
                         mode.as_str()
                     );
                     if drain_line(&mut reader, None).is_err() {
+                        break;
+                    }
+                    if write_locked(&client_stdout, &reply).is_err() {
                         break;
                     }
                 }

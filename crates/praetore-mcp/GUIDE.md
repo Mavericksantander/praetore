@@ -694,7 +694,9 @@ Read these before relying on anything above.
    forwards the call. Use it to try a policy, not to stop calls. It still
    refuses, as enforce does: a `tools/call` the policy does not classify, a
    client line it cannot parse that may name a `safety*` tool, a client
-   line over 32 MiB, and a whole batch when a `tools/call` in it is refused.
+   line over 32 MiB (the client gets a JSON-RPC error, `-32600` with the id
+   when the kept prefix contains it, otherwise `-32700` with id null), and a
+   whole batch when a `tools/call` in it is refused.
    When the home cannot be loaded, every `tools/call` and every client line
    that cannot be parsed is refused. In enforce, a tool that no rule allows
    is denied by default.
