@@ -1543,6 +1543,40 @@ fn torn_journal_tail_refuses_in_enforce() {
     assert!(!stderr.contains("EXECUTED"), "{stderr}");
 }
 
+/// A literal argument key `"a.b"` must not satisfy a condition written as
+/// the nested path `arguments.a.b`. Enforce refuses to load that policy, so
+/// the call is not executed.
+#[test]
+fn enforce_does_not_load_a_rule_on_arguments_a_dot_b() {
+    let (_temp, home) = init_home();
+    let mut policy = store::default_policy();
+    policy.rules.push(
+        PolicyRule::new("allow-dotted", ACTION_TYPE, PolicyEffect::Allow)
+            .with_capability(CAPABILITY)
+            .with_parameter_condition(PolicyCondition::exact("tool", json!("echo")))
+            .with_parameter_condition(PolicyCondition::exact("arguments.a.b", json!("x"))),
+    );
+    fs::write(
+        home.policy(),
+        serde_json::to_string_pretty(&policy).unwrap(),
+    )
+    .unwrap();
+    let call = json!({
+        "jsonrpc": "2.0",
+        "id": "c",
+        "method": "tools/call",
+        "params": {"name": "echo", "arguments": {"a.b": "x"}}
+    });
+    let (responses, stderr, out) = wrap(&home, "enforce", &session(vec![call]));
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("refusing to load policy") && stderr.contains("arguments.a.b"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("EXECUTED echo"), "{stderr}");
+    assert_eq!(by_id(&responses, &json!("c"))["result"]["isError"], true);
+}
+
 /// Oversized client lines: a client line over 32 MiB is not parsed, so it cannot be
 /// checked for a `safety*` tool; it is refused in observe too, and the
 /// traffic after it still flows.

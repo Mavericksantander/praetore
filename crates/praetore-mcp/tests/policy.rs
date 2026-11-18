@@ -1,5 +1,8 @@
 //! `praetore-mcp policy ...` command-line behavior.
 
+use praetore_core::{PolicyCondition, PolicyEffect, PolicyRule};
+use praetore_mcp::store::{ACTION_TYPE, CAPABILITY};
+use serde_json::json;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -370,4 +373,39 @@ fn init_declares_the_mcp_action_type_as_mission() {
         policy.action_classes.get("mcp.tools/call"),
         Some(&praetore_core::ActionClass::Mission)
     );
+}
+
+fn write_dotted_allow(home: &Path) {
+    let mut policy = praetore_mcp::store::default_policy();
+    policy.rules.push(
+        PolicyRule::new("allow-dotted", ACTION_TYPE, PolicyEffect::Allow)
+            .with_capability(CAPABILITY)
+            .with_parameter_condition(PolicyCondition::exact("tool", json!("echo")))
+            .with_parameter_condition(PolicyCondition::exact("arguments.a.b", json!("x"))),
+    );
+    fs::write(
+        home.join("policy.json"),
+        serde_json::to_string_pretty(&policy).unwrap(),
+    )
+    .unwrap();
+}
+
+/// A hand-written condition `arguments.a.b` is not a nested field. `policy
+/// check` exits 1. An ordinary warning (allow-all next to a tool deny) still
+/// exits 0; that case is `policy_check_warns_about_allow_all_with_tool_denies`.
+#[test]
+fn policy_check_exits_1_when_an_argument_key_contains_a_dot() {
+    let (_temp, home) = init();
+    let dir = home.to_str().unwrap();
+    write_dotted_allow(&home);
+    let out = run(&["policy", "check", "--dir", dir]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("INVALID"), "{stdout}");
+    assert!(stdout.contains("arguments.<a.b>"), "{stdout}");
+    assert!(
+        stdout.contains("allow-dotted") && stdout.contains("nested"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("OK "), "{stdout}");
 }

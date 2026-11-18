@@ -1200,15 +1200,24 @@ fn cmd_policy(args: &[String]) -> Result<i32, String> {
                     for warning in &warnings {
                         println!("warning: {warning}");
                     }
+                    let dotted = policy::literal_dotted_argument_rules(&parsed_policy);
+                    if !dotted.is_empty() {
+                        println!(
+                            "INVALID: {} argument condition(s) use arguments.<a.b>, which matches a literal top-level key the caller controls, not a nested field. Nested fields are not supported, and enforce mode will not load this policy.",
+                            dotted.len()
+                        );
+                    }
                     // Build the same engine `wrap` builds, so key/pin/policy
                     // problems surface here instead of as refused calls.
+                    // Observe still loads a dotted key (the check above is
+                    // what fails the command). Enforce refuses it in Gate::load.
                     let engine = if home.is_initialized() {
                         crate::gate::Gate::load(&home, Mode::Observe).map(|_| ())
                     } else {
                         Err(format!("{} is not initialized", home.root.shown()))
                     };
                     match engine {
-                        Ok(()) => {
+                        Ok(()) if dotted.is_empty() => {
                             println!(
                                 "OK {} policy {} v{}: {} rule(s), digest {digest}, {} warning(s); HighAssurance engine starts",
                                 path.shown(),
@@ -1219,6 +1228,7 @@ fn cmd_policy(args: &[String]) -> Result<i32, String> {
                             );
                             0
                         }
+                        Ok(()) => 1,
                         Err(error) => {
                             println!("INVALID engine: {error}");
                             1

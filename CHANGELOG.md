@@ -53,6 +53,12 @@
 
 ### Fixed
 
+- **praetore-mcp: a condition key `arguments.a.b` is not a nested field.**
+  It matches a literal top-level argument key `"a.b"`, which the caller
+  controls. `policy check` used to warn and exit 0. It now exits 1.
+  `wrap --mode enforce` refuses to load a policy that contains one, and
+  every `tools/call` is refused until the rule is removed.
+
 - **praetore-mcp: what observe mode refuses, and what a DENY shows.** The
   help, the `init` output, the READMEs and the GUIDE said observe mode
   never blocks (the 0.3.5 entry below says so too). It records a DENY and
