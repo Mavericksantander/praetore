@@ -207,8 +207,10 @@ Checks every receipt in the journal: integrity hash, attester signature,
 agent intent signature, authority signature against the issuer pins at
 decision time, and the praetore.mode binding. Checks the order of the
 journal too: each entry carries a sequence number and the hash link of the
-previous one, so an entry removed, duplicated or reordered before the last
-one is reported. Prints the head (entry count and last link).
+previous one, and the lines of the journal must be exactly the chain that
+ends at the head (the --expected-head, or the last entry without it). A
+line outside that chain, a missing entry and a reordered entry all fail.
+Prints the head (entry count and last link).
 
 Also checks DIR/approvals/journal.jsonl when it exists: the approver
 signature, that the decision is bound to the held receipt, that an
@@ -235,9 +237,8 @@ A result has one of three levels, in the first word of the summary line:
               every check that reads only the home. This is not a pass.
   FAIL        a check failed.
 
-Entries written by an earlier praetore-mcp version (unchained) are verified
-one by one and counted apart; they may only come before the first chained
-entry.
+A line written by praetore-mcp 0.3.3 or earlier (a bare evidence document,
+unchained) is not part of any chain and fails, wherever it is.
 
 Exit code: 0 for OK, 3 for UNANCHORED, 1 for FAIL, 2 if the journal or the
 pins cannot be read or the arguments are wrong. A script that checks only
@@ -814,6 +815,7 @@ fn cmd_verify(args: &[String]) -> Result<i32, String> {
         false,
     )?;
     let home = parsed.home()?;
+    crate::keypath::check_home_keys(&home)?;
     let report = receipts::verify_journal_with(
         &home,
         receipts::ExpectedHeads {
@@ -852,7 +854,7 @@ fn cmd_verify(args: &[String]) -> Result<i32, String> {
     );
     match report.head {
         Some(head) => println!(
-            "journal head: {} chained entries present, next seq {}, head {} ({} unchained earlier entries); keep it outside this machine and pass it as --expected-head to detect entries removed at the end",
+            "journal head: {} chained entries present, next seq {}, head {} ({} unchained lines); keep it outside this machine and pass it as --expected-head to detect entries removed at the end",
             report.chained, head.seq, head.prev, report.unchained
         ),
         None => println!(
@@ -1207,6 +1209,7 @@ fn cmd_policy(args: &[String]) -> Result<i32, String> {
         "check" => {
             let parsed = parse(rest, &["--dir"], &[], false)?;
             let home = parsed.home()?;
+            crate::keypath::check_home_keys(&home)?;
             let path = home.policy();
             let text = fs::read_to_string(&path)
                 .map_err(|e| format!("cannot read {}: {e}", path.shown()))?;
