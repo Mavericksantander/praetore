@@ -216,8 +216,9 @@ praetore-mcp verify
 decision that was not enforced. The v0.3.3 `praetore-mcp verify` does not
 read 0.3.4 receipts. A 0.3.4 journal line is `{"seq","prev","evidence"}`.
 v0.3.3 reads each line as a bare evidence document. This release's
-`praetore-mcp verify` still reads a v0.3.3 journal: those lines are
-unchained and may only come before the first chained entry.
+`praetore-mcp verify` fails on a v0.3.3 line wherever it is: it has no
+`seq` or `prev`, so it is outside the chain. Move a v0.3.3 journal out of
+`receipts/` to keep it.
 
 A policy change is loaded when `wrap` starts. Restart the client after
 `policy deny`, `policy allow`, `policy require-approval`, or

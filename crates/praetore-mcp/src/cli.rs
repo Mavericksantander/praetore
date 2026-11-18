@@ -205,8 +205,10 @@ Checks every receipt in the journal: integrity hash, attester signature,
 agent intent signature, authority signature against the issuer pins at
 decision time, and the praetore.mode binding. Checks the order of the
 journal too: each entry carries a sequence number and the hash link of the
-previous one, so an entry removed, duplicated or reordered before the last
-one is reported. Prints the head (entry count and last link).
+previous one, and the lines of the journal must be exactly the chain that
+ends at the head (the --expected-head, or the last entry without it). A
+line outside that chain, a missing entry and a reordered entry all fail.
+Prints the head (entry count and last link).
 
 Also checks DIR/approvals/journal.jsonl when it exists: the approver
 signature, that the decision is bound to the held receipt, that an
@@ -226,9 +228,8 @@ earlier) still verify.
                        records removed at the end of that journal, or the
                        whole file, are not detected.
 
-Entries written by an earlier praetore-mcp version (unchained) are verified
-one by one and counted apart; they may only come before the first chained
-entry.
+A line written by praetore-mcp 0.3.3 or earlier (a bare evidence document,
+unchained) is not part of any chain and fails, wherever it is.
 
 Exit code: 0 if every receipt verifies, 1 if any fails, 2 if the journal
 cannot be read.";
@@ -836,7 +837,7 @@ fn cmd_verify(args: &[String]) -> Result<i32, String> {
     );
     match report.head {
         Some(head) => println!(
-            "journal head: {} chained entries present, next seq {}, head {} ({} unchained earlier entries); keep it outside this machine and pass it as --expected-head to detect entries removed at the end",
+            "journal head: {} chained entries present, next seq {}, head {} ({} unchained lines); keep it outside this machine and pass it as --expected-head to detect entries removed at the end",
             report.chained, head.seq, head.prev, report.unchained
         ),
         None => println!(

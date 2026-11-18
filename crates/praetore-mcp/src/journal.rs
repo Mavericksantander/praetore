@@ -327,74 +327,221 @@ pub fn nofollow_flag() -> i32 {
     0
 }
 
-/// Checks the order of the entries of a whole journal, in file order.
-#[derive(Default)]
-pub struct ChainCheck {
-    /// Position expected for the next chained entry; `None` before the
-    /// first one and after an entry whose link could not be computed.
-    expected: Option<Position>,
-    started: bool,
-    seen: HashSet<Uuid>,
-    pub chained: u64,
-    pub unchained: u64,
-    head: Option<Position>,
+/// The `seq` and `prev` a line claims, when it is a chained line whose
+/// evidence could not be read. The line fails on its own; its claimed
+/// position only lets [`Chain::rebuild`] keep walking past it, so one
+/// damaged entry does not put every earlier entry outside the chain.
+pub fn claimed_position(text: &str) -> Option<Position> {
+    let line: ChainedLine<'_> = serde_json::from_str(text).ok()?;
+    Some(Position {
+        seq: line.seq,
+        prev: ChainLink::from_hex(line.prev)?,
+    })
 }
 
-impl ChainCheck {
-    /// Records one parsed entry. Returns the problem, if any.
-    pub fn push(&mut self, entry: &Entry) -> Option<String> {
-        let mut problem = None;
-        if !self.seen.insert(entry.evidence.evidence_id) {
-            problem = Some(format!(
-                "duplicate evidence_id {}",
-                entry.evidence.evidence_id
-            ));
-        }
-        let Some(position) = entry.position else {
-            self.unchained += 1;
-            if self.started {
-                return problem.or(Some("unchained line after the chain started".into()));
-            }
-            return problem;
-        };
-        self.chained += 1;
-        let order = if !self.started {
-            (position != Position::FIRST).then(|| {
-                format!(
-                    "chain starts at seq {} instead of 0: earlier entries are missing",
-                    position.seq
-                )
+/// One journal line as [`Chain::rebuild`] sees it.
+#[derive(Clone, Copy)]
+pub enum ChainLine<'a> {
+    Entry(&'a Entry),
+    /// A line that could not be parsed, with its [`claimed_position`].
+    Unreadable(Option<Position>),
+}
+
+/// The journal as one chain: the result of [`Chain::rebuild`].
+///
+/// The invariant: the lines of the journal are exactly the entries of the
+/// chain that ends at the head, in chain order. The chain is rebuilt from
+/// the head backwards along `prev` to the first entry (`seq` 0, `prev` 64
+/// zeros). A line that this walk does not reach is outside the chain: it
+/// is not covered by the head, so nothing says it was there when the head
+/// was saved. A link the walk cannot follow is a missing entry.
+///
+/// A bare evidence line (the format before the chain existed) has no
+/// `seq` or `prev`, so it is never part of a chain and always fails.
+pub struct Chain {
+    /// One per line, in file order: why the line breaks the invariant.
+    pub problems: Vec<Option<String>>,
+    /// Set when no line produces the expected head.
+    pub missing: Option<String>,
+    /// Chained lines present, whether or not they are in the chain.
+    pub chained: u64,
+    /// Bare evidence lines present. Each one is a problem.
+    pub unchained: u64,
+    /// Position after the last line of the journal, when that line is a
+    /// chained entry: the next `seq`, and the link to keep somewhere else
+    /// and pass later as the expected head.
+    pub head: Option<Position>,
+}
+
+impl Chain {
+    /// Rebuilds the chain that ends at `expected`, or, without one, at the
+    /// last entry of the journal that can be linked. `lines` are the lines
+    /// in file order.
+    ///
+    /// Without `expected`, entries removed at the end of the journal leave
+    /// a shorter journal that still is exactly one chain: only a head kept
+    /// somewhere else finds them.
+    pub fn rebuild(lines: &[ChainLine<'_>], expected: Option<ChainLink>) -> Self {
+        // The link each chained line produces: the `prev` of its successor.
+        let produced: Vec<Option<(Position, ChainLink)>> = lines
+            .iter()
+            .map(|line| {
+                let ChainLine::Entry(entry) = line else {
+                    return None;
+                };
+                let position = entry.position?;
+                let next = position.after(&entry.evidence).ok()?;
+                Some((position, next.prev))
             })
-        } else {
-            match self.expected {
-                Some(expected) if expected != position => Some(format!(
-                    "seq {} / prev do not follow the previous entry (expected seq {}): an entry was removed, duplicated or reordered",
-                    position.seq, expected.seq
-                )),
-                _ => None,
-            }
+            .collect();
+        let entry_of = |index: usize| match lines[index] {
+            ChainLine::Entry(entry) => Some(entry),
+            ChainLine::Unreadable(_) => None,
         };
-        problem = problem.or(order);
-        self.started = true;
-        self.expected = position.after(&entry.evidence).ok();
-        self.head = self.expected;
-        problem
-    }
+        let mut chain = Self {
+            problems: vec![None; lines.len()],
+            missing: None,
+            chained: produced.iter().flatten().count() as u64,
+            unchained: (0..lines.len())
+                .filter(|&index| entry_of(index).is_some_and(|entry| entry.position.is_none()))
+                .count() as u64,
+            head: None,
+        };
+        // The last entry that can be linked is the journal's own head.
+        chain.head = produced
+            .iter()
+            .rev()
+            .flatten()
+            .next()
+            .map(|(position, link)| Position {
+                seq: position.seq.saturating_add(1),
+                prev: *link,
+            });
+        // The first line that produces each link.
+        let mut by_link: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for (index, link) in produced.iter().enumerate() {
+            if let Some((_, link)) = link {
+                by_link.entry(link.to_hex()).or_insert(index);
+            }
+        }
 
-    /// Records a chained-looking line that could not be parsed: the next
-    /// entry cannot be checked against it.
-    pub fn push_unreadable(&mut self) {
-        self.started = true;
-        self.expected = None;
-        self.head = None;
-    }
+        // Walk from the head back to the first entry.
+        let own_head = chain.head.map(|head| head.prev);
+        let head = match expected {
+            // The expected head is not the link of any entry here: that is
+            // one failure of the whole journal. The lines are then checked
+            // against the journal's own head, so each line that is outside
+            // that chain is still named.
+            Some(link) if !by_link.contains_key(&link.to_hex()) => {
+                chain.missing = Some(format!("no entry produces the head {link}"));
+                own_head
+            }
+            Some(link) => Some(link),
+            None => own_head,
+        };
+        let mut members: Vec<usize> = Vec::new();
+        let mut in_chain = vec![false; lines.len()];
+        let mut wanted = head.map(|link| (link, None::<u64>));
+        while let Some((link, successor_seq)) = wanted.take() {
+            let member = by_link
+                .get(&link.to_hex())
+                .and_then(|&index| Some((index, produced[index]?.0)))
+                // No entry produces this link. A line that could not be
+                // read and claims the seq before `successor_seq` holds the
+                // place; it fails on its own.
+                .or_else(|| {
+                    let seq = successor_seq?.checked_sub(1)?;
+                    lines
+                        .iter()
+                        .enumerate()
+                        .find_map(|(index, line)| match line {
+                            ChainLine::Unreadable(Some(position))
+                                if position.seq == seq && !in_chain[index] =>
+                            {
+                                Some((index, *position))
+                            }
+                            _ => None,
+                        })
+                });
+            let Some((index, position)) = member else {
+                // The walk stops at the last member: nothing here produces
+                // the link it names as its predecessor.
+                if let (Some(&successor), Some(seq)) = (members.last(), successor_seq) {
+                    chain.problems[successor] = Some(format!(
+                        "the entry before seq {seq} (link {link}) is missing: an entry was removed"
+                    ));
+                }
+                break;
+            };
+            if in_chain[index] {
+                // Unreachable with a collision-free hash; ends the walk.
+                chain.missing = Some(format!("the chain loops at link {link}"));
+                break;
+            }
+            if successor_seq.is_some_and(|seq| position.seq.checked_add(1) != Some(seq)) {
+                chain.problems[index] = Some(format!(
+                    "seq {} does not come right before seq {}: an entry was removed, duplicated or reordered",
+                    position.seq,
+                    successor_seq.unwrap_or_default()
+                ));
+            }
+            in_chain[index] = true;
+            members.push(index);
+            if position.seq == 0 {
+                if position.prev != ChainLink::GENESIS {
+                    chain.problems[index] = Some(format!(
+                        "the first entry (seq 0) has prev {} instead of 64 zeros",
+                        position.prev
+                    ));
+                }
+                break;
+            }
+            wanted = Some((position.prev, Some(position.seq)));
+        }
 
-    /// Position after the last chained entry: the next `seq` (the last
-    /// entry's `seq` + 1, which is not the number of entries present when
-    /// some were removed; see `chained`) and the link to keep somewhere else
-    /// and compare later. `None` if the last entry could not
-    /// be linked or there is no chained entry.
-    pub fn head(&self) -> Option<Position> {
-        self.head
+        // The file must hold the chain in chain order.
+        members.reverse();
+        let mut last_index = None;
+        for &index in &members {
+            if last_index.is_some_and(|last| index < last) {
+                chain.problems[index].get_or_insert_with(|| {
+                    "the entry is in the chain but out of place in the file: entries were reordered"
+                        .into()
+                });
+            }
+            last_index = Some(last_index.map_or(index, |last: usize| last.max(index)));
+        }
+
+        // Every other line is outside the chain.
+        let mut ids: HashSet<Uuid> = members
+            .iter()
+            .filter_map(|&index| entry_of(index).map(|entry| entry.evidence.evidence_id))
+            .collect();
+        let anchor = match head {
+            Some(link) => format!("the chain that ends at head {link}"),
+            None => "any chain: the journal has no head".to_owned(),
+        };
+        for (index, _) in in_chain.iter().enumerate().filter(|(_, member)| !**member) {
+            let Some(entry) = entry_of(index) else {
+                // Its parse error is reported on its own.
+                continue;
+            };
+            let duplicate = if ids.insert(entry.evidence.evidence_id) {
+                ""
+            } else {
+                "duplicate evidence_id; "
+            };
+            chain.problems[index] = Some(match entry.position {
+                None => {
+                    format!("{duplicate}unchained line (no seq and prev): it is outside {anchor}")
+                }
+                Some(position) => format!(
+                    "{duplicate}seq {} is outside {anchor}: an entry was added, duplicated or reordered, or the head is older than this entry",
+                    position.seq
+                ),
+            });
+        }
+        chain
     }
 }

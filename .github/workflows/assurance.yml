@@ -118,6 +118,12 @@ jobs:
         run: make demo demo-verify
       - name: Receipt verification demo (DEMO/TEST-ONLY keys)
         run: ./demo/verify-receipt.sh
+      - name: The journal is exactly the chain that ends at the head (output shown)
+        run: |
+          set -euo pipefail
+          output="$(cargo test --locked -p praetore-mcp --test journal_exact_chain -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok\. 8 passed" <<<"$output" || { echo "::error::expected the 8 tests of tests/journal_exact_chain.rs to run and pass"; exit 1; }
       - name: Keys reached through a symlink or a hard link are refused (output shown)
         run: |
           set -euo pipefail

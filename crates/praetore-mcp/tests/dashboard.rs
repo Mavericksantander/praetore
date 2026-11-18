@@ -1947,8 +1947,25 @@ fn the_chain_is_cut_where_verify_fails_and_the_receipt_is_rebuilt() {
     assert_eq!(status, 200);
     let receipts = state["page"]["receipts"].as_array().unwrap();
     let cut: Vec<&Value> = receipts.iter().filter(|r| r["order"].is_string()).collect();
-    assert_eq!(cut.len(), 1, "{receipts:?}");
-    assert_eq!(cut[0]["verified"], false);
+    // Two lines fail: the entry after the gap, which names a predecessor
+    // that is not there, and the entry before the gap, which the chain that
+    // ends at the head no longer reaches.
+    assert_eq!(cut.len(), 2, "{receipts:?}");
+    assert!(
+        cut.iter()
+            .any(|r| r["order"].as_str().unwrap().contains("is missing")),
+        "{cut:?}"
+    );
+    assert!(
+        cut.iter().any(|r| r["order"]
+            .as_str()
+            .unwrap()
+            .contains("is outside the chain")),
+        "{cut:?}"
+    );
+    for r in &cut {
+        assert_eq!(r["verified"], false);
+    }
     for r in receipts {
         assert!(r["seq"].is_u64(), "{r}");
         assert!(r["prev"].is_string(), "{r}");
