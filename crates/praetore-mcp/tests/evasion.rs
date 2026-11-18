@@ -931,7 +931,7 @@ fn forge_named_receipt(
         .evaluate_evidence_with("fake", &params, Some(approval_id))
         .unwrap();
     praetore_mcp::gate::Journal::new(home)
-        .append(&evidence)
+        .record(&evidence)
         .unwrap();
     evidence
 }
