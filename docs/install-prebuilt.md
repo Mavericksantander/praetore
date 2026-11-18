@@ -1,9 +1,9 @@
-# Install praetore-mcp from the published v0.3.5 release
+# Install praetore-mcp from the published v0.3.6 release
 
 This page installs the `praetore-mcp` binary from the published
-[v0.3.5 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.5).
+[v0.3.6 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.6).
 That release was built from commit
-`b6d668acb8e153a47a9478fe96b92a0c9eafb423`. It is not a build of the
+`27ceddbbd295162ca351ea5dfa47fe8bb37315a3`. It is not a build of the
 current `main` branch. You do not clone the repository, and you do not
 install Rust.
 
@@ -18,14 +18,14 @@ on macOS.
 
 ## Which archive
 
-Download one archive from the release. v0.3.5 has no Windows binary, no
+Download one archive from the release. v0.3.6 has no Windows binary, no
 Linux ARM binary, and no brew installer.
 
 | Machine | Archive |
 | --- | --- |
-| macOS Apple silicon | `praetore-mcp-v0.3.5-aarch64-apple-darwin.tar.gz` |
-| macOS Intel | `praetore-mcp-v0.3.5-x86_64-apple-darwin.tar.gz` |
-| Linux x86_64 | `praetore-mcp-v0.3.5-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS Apple silicon | `praetore-mcp-v0.3.6-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `praetore-mcp-v0.3.6-x86_64-apple-darwin.tar.gz` |
+| Linux x86_64 | `praetore-mcp-v0.3.6-x86_64-unknown-linux-gnu.tar.gz` |
 
 The Linux archive is the `x86_64-unknown-linux-gnu` build from that release.
 It was built on GitHub's `ubuntu-latest` runner and needs a glibc at least
@@ -41,18 +41,18 @@ you unpack it. These are the published digests. If the downloaded
 `SHA256SUMS` does not match this list, stop.
 
 ```text
-e72444786f5e7d84a7c17718b3c1d7cfa247cd9e441f5878502f6f1aba771003  praetore-mcp-v0.3.5-aarch64-apple-darwin.tar.gz
-54afcc6256f12257119e89ceac80fa4de108fdf779d2344565156777bd913464  praetore-mcp-v0.3.5-x86_64-apple-darwin.tar.gz
-935eb8be2577dcc7619c012f03d70e82aac8afc3a9a413a0f46c5911c45aec7d  praetore-mcp-v0.3.5-x86_64-unknown-linux-gnu.tar.gz
-764af894c4461b659b0c1c60c23fc1b3922a5d17a306082da8abc04a712cda37  praetore-verify
+93af3bf576a3158fd3087e23fccd3f118aeeb33578bd617f68a47b2e54f66fd2  praetore-mcp-v0.3.6-aarch64-apple-darwin.tar.gz
+99ec7ae7a66cfb9069778a538f8573285eb3be0564769ffa55c5cab19505e368  praetore-mcp-v0.3.6-x86_64-apple-darwin.tar.gz
+d03a7799ef173b767d4bac4da8435466c30d401142644c21b23345c3946d1a46  praetore-mcp-v0.3.6-x86_64-unknown-linux-gnu.tar.gz
+45672489a2d23b42f06b65b1cfcbd271295f8573ad3f1098fe4378970b7490ff  praetore-verify
 ```
 
 The `praetore-verify` line is part of the published file. This install does
 not use that binary. Do not download or run it on macOS.
 
 The release also includes `SHA256SUMS.sigstore.json`. Checking that
-signature is optional for this install. It needs `cosign`. For v0.3.5,
-pass `--certificate-github-workflow-sha b6d668acb8e153a47a9478fe96b92a0c9eafb423`
+signature is optional for this install. It needs `cosign`. For v0.3.6,
+pass `--certificate-github-workflow-sha 27ceddbbd295162ca351ea5dfa47fe8bb37315a3`
 so the check does not need a clone (`git rev-parse` does). What the
 signature proves is described in
 [Release artifact integrity](operations.md#release-artifact-integrity).
@@ -64,11 +64,11 @@ Replace the archive name in the example with the one for your machine.
 The example uses the Apple silicon archive. Do not use `sudo`.
 
 ```sh
-mkdir -p "$HOME/praetore-v0.3.5"
-cd "$HOME/praetore-v0.3.5"
-base=https://github.com/Mavericksantander/praetore/releases/download/v0.3.5
+mkdir -p "$HOME/praetore-v0.3.6"
+cd "$HOME/praetore-v0.3.6"
+base=https://github.com/Mavericksantander/praetore/releases/download/v0.3.6
 curl -fsSL -O "$base/SHA256SUMS"
-curl -fsSL -O "$base/praetore-mcp-v0.3.5-aarch64-apple-darwin.tar.gz"
+curl -fsSL -O "$base/praetore-mcp-v0.3.6-aarch64-apple-darwin.tar.gz"
 ```
 
 On macOS:
@@ -87,8 +87,8 @@ The line for your archive must say `OK`. If it does not, stop. Do not clear
 a quarantine attribute, and do not copy the binary.
 
 ```sh
-tar -xzf praetore-mcp-v0.3.5-aarch64-apple-darwin.tar.gz
-cd praetore-mcp-v0.3.5-aarch64-apple-darwin
+tar -xzf praetore-mcp-v0.3.6-aarch64-apple-darwin.tar.gz
+cd praetore-mcp-v0.3.6-aarch64-apple-darwin
 ```
 
 On macOS, after the checksum matches, clear the quarantine attribute on the
@@ -135,7 +135,7 @@ praetore-mcp --version
 ```
 
 `command -v` should print `$HOME/.local/bin/praetore-mcp`. The version line
-should be `praetore-mcp 0.3.5`. If either check fails, stop.
+should be `praetore-mcp 0.3.6`. If either check fails, stop.
 
 ```sh
 praetore-mcp init
@@ -159,7 +159,7 @@ Run the dry-run again. A wrapped entry is reported as
 (exit 0). Open the config and check that the entry's `command` is the
 absolute path of `~/.local/bin/praetore-mcp` and that its args start with
 `wrap`. If `command` is still the original server program, the install did
-not apply. `praetore-mcp verify` can then print `OK 0 receipts`, which
+not apply. `praetore-mcp verify` can then print `UNANCHORED 0 receipts`, which
 means the journal is empty.
 
 Restart the client after `install`. A running client keeps the old config.
@@ -216,8 +216,9 @@ praetore-mcp verify
 decision that was not enforced. The v0.3.3 `praetore-mcp verify` does not
 read 0.3.4 receipts. A 0.3.4 journal line is `{"seq","prev","evidence"}`.
 v0.3.3 reads each line as a bare evidence document. This release's
-`praetore-mcp verify` still reads a v0.3.3 journal: those lines are
-unchained and may only come before the first chained entry.
+`praetore-mcp verify` fails on a v0.3.3 line wherever it is: it has no
+`seq` or `prev`, so it is outside the chain. Move a v0.3.3 journal out of
+`receipts/` to keep it.
 
 A policy change is loaded when `wrap` starts. Restart the client after
 `policy deny`, `policy allow`, `policy require-approval`, or
@@ -312,17 +313,19 @@ install or upgrade Node.
 
 - Only `tools/call` requests that go through a wrapped MCP server are
   governed. The client's own built-in tools are not.
-- Observe mode (the arrival mode) does not block: a DENY receipt records
-  what enforce would have blocked, but the call still runs.
+- Observe mode (the arrival mode) does not block DENY: a DENY receipt
+  records what enforce would have blocked, but the call still runs. Observe
+  still refuses a call the policy does not classify and client lines it
+  cannot check; the praetore-mcp README lists them.
 - This is pre-release software, not independently audited, with no security
   guarantees. It is not a network service; it runs on the person's computer.
 - macOS binaries are not signed or notarized.
-- v0.3.5 has no Windows binary, no Linux ARM binary, and no brew installer.
+- v0.3.6 has no Windows binary, no Linux ARM binary, and no brew installer.
 - Enforcement is still cooperative (someone who can edit the client config
   can remove the wrapper).
 - `praetore-mcp verify` checks this installation's receipt journal
   (integrity, signatures, mode binding). In observe, a receipt records a
-  decision that was not enforced. `OK 0 receipts` means the journal is empty.
+  decision that was not enforced. `UNANCHORED 0 receipts` means the journal is empty.
   The v0.3.3 `praetore-mcp verify` does not read 0.3.4 receipts.
 - A `write_file` deny rule blocks that tool only. On
   `@modelcontextprotocol/server-filesystem@2.3.0`, `append_file`,

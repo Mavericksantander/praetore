@@ -24,6 +24,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy, rustfmt
+      - name: rust-version is declared and matches the workspace
+        run: |
+          scripts/test-check-rust-version.sh
+          scripts/check-rust-version.sh
       - run: cargo test --workspace --locked
       # G7: shown separately so the log shows each test ran. A renamed or
       # missing test fails the step (the counts are pinned).
@@ -118,7 +122,45 @@ jobs:
         run: make demo demo-verify
       - name: Receipt verification demo (DEMO/TEST-ONLY keys)
         run: ./demo/verify-receipt.sh
+      - name: verify is OK only against both heads kept elsewhere (output shown)
+        run: |
+          set -euo pipefail
+          output="$(cargo test --locked -p praetore-mcp --test verify_anchor -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok\. 6 passed" <<<"$output" || { echo "::error::expected the 6 tests of tests/verify_anchor.rs to run and pass"; exit 1; }
+      - name: The journal is exactly the chain that ends at the head (output shown)
+        run: |
+          set -euo pipefail
+          output="$(cargo test --locked -p praetore-mcp --test journal_exact_chain -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok\. 8 passed" <<<"$output" || { echo "::error::expected the 8 tests of tests/journal_exact_chain.rs to run and pass"; exit 1; }
+      - name: Keys reached through a symlink or a hard link are refused (output shown)
+        run: |
+          set -euo pipefail
+          output="$(cargo test --locked -p praetore-mcp --test keys_symlinks -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok\. 5 passed" <<<"$output" || { echo "::error::expected the 5 tests of tests/keys_symlinks.rs to run and pass"; exit 1; }
+      - name: serde_json is built with float_roundtrip in every package that ships it
+        run: scripts/check-float-roundtrip.sh
+      - name: The gate decides on the number the server reads (boundary literals, output shown)
+        run: |
+          set -euo pipefail
+          output="$(cargo test --locked -p praetore-mcp --test numeric_gate -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok\. 2 passed" <<<"$output" || { echo "::error::expected the 2 tests of tests/numeric_gate.rs to run and pass"; exit 1; }
+      - name: Every appended receipt verifies (random floats and literals, output shown)
+        run: |
+          set -euo pipefail
+          output="$(cargo test --locked -p praetore-mcp --test journal_verified_line -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok\. 4 passed" <<<"$output" || { echo "::error::expected the 4 tests of tests/journal_verified_line.rs to run and pass"; exit 1; }
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # A new Expiry::at() call without #[expect] must fail clippy in this
+      # job's environment. tests/lint_guard.rs reads sources and config
+      # files; this also catches lint levels only the build sees (RUSTFLAGS,
+      # .cargo/config.toml, workspace lints, a crate-level allow).
+      - name: Clippy canary (Expiry::at without expect fails)
+        run: scripts/clippy-canary.sh
       - run: cargo fmt --all -- --check
       - run: cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check
       - name: Validate Kubernetes manifest YAML syntax
@@ -359,28 +401,10 @@ jobs:
           target/release/praetore-verify evidence --evidence examples/verify/evidence.json \
             --attester-pin examples/verify/attester-public-key.hex \
             --issuer-pins examples/verify/issuer-pins.jsonl --require-intent --format json
+      # Exit codes, not a search of the output: a test whose child process
+      # writes to stdout splits the `test ... ok` line. See the script.
       - name: HighAssurance hook tests (output shown)
-        run: |
-          set -euo pipefail
-          output="$(cargo test --manifest-path examples/claude-code-hook/Cargo.toml --locked tests_high_assurance -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
-          echo "$output"
-          grep -Eq "test result: ok\. [0-9]+ passed; 0 failed" <<<"$output" || { echo "::error::the HighAssurance hook tests failed"; exit 1; }
-          for test in every_receipt_records_a_signed_decision_time \
-            declared_safety_tool_gets_no_receipt_and_no_claim \
-            state_without_a_replay_store_is_refused_with_a_pointer_to_init \
-            unavailable_replay_store_fails_closed \
-            unwritable_receipts_journal_denies_and_leaves_an_orphan_claim \
-            tool_use_id_is_signed_and_tampering_fails \
-            same_tool_use_id_twice_is_allowed_and_reported \
-            missing_tool_use_id_is_recorded_as_absent \
-            tool_use_id_is_bounded_and_escaped \
-            guard::replaying_the_same_request_is_refused \
-            guard::guard_reports_unavailable_when_the_store_is \
-            guard::concurrent_claims_of_one_request_succeed_exactly_once \
-            guard::concurrent_hook_calls_each_claim_their_own_request \
-            guard::directory_owned_by_another_user_is_refused; do
-            grep -q "^test tests_high_assurance::$test \.\.\. ok$" <<<"$output" || { echo "::error::$test did not run or failed"; exit 1; }
-          done
+        run: scripts/check-hook-high-assurance-tests.sh
       # SAF-14: two agents sign with different issued identities, and no
       # edit of index.json or of the receipt re-attributes a receipt.
       - name: Per-agent attribution end to end

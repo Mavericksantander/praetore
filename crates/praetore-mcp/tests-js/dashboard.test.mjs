@@ -218,7 +218,7 @@ function page({ reduced = false, hash = "#/live", now = Date.parse("2026-01-01T0
   vm.runInContext(`${source}
 ;globalThis.__page = {
   get state() { return state; },
-  hud, chain, load,
+  hud, chain, load, shown,
 };`, context, { filename: "app.js" });
   const p = context.__page;
   let requested = 0;
@@ -264,6 +264,10 @@ function page({ reduced = false, hash = "#/live", now = Date.parse("2026-01-01T0
     canvas(id) { return getElementById(id).getContext(); },
     text(id) { return getElementById(id).textContent; },
     table() { return tbody.textContent; },
+    tbody,
+    shown: (text) => p.shown(text),
+    // Runs `code` in the page's context (before start, to stand in for a browser).
+    run: (code) => vm.runInContext(code, context),
   };
 }
 
@@ -824,5 +828,112 @@ test("an approval that expired undecided reads Expired in the visual and the lis
     select.value = code;
     select.listeners.get("change")[0]();
     assert.ok(p.text("hud-list").includes(label), `${code}: ${p.text("hud-list")}`);
+  }
+});
+
+// m5: a path or a name may hold a terminal escape, \r or \n. The page and
+// both drawings show them as \u{..}, never raw: page text, titles, <pre>
+// blocks, the canvas texts cut to fit (clipText) and wrapped (wrapText).
+async function controlCharsShown(name) {
+  const evil = "x\u001b[2K\r\nfake\u009b";
+  const escaped = "x\\u{1b}[2K\\u{d}\\u{a}fake\\u{9b}";
+  const state = fixture(name);
+  state.home = `/home/user/${evil}`;
+  state.policy.path = `/home/user/${evil}/policy.json`;
+  for (const r of [...state.recent, ...state.page.receipts]) {
+    r.server = evil;
+    r.tool = `t${evil}`;
+    if (r.arguments && typeof r.arguments === "object") r.arguments.from = `/srv/${evil}`;
+    if (typeof r.order === "string") r.order = `${r.order} ${evil}`;
+  }
+  for (const held of state.pending || []) {
+    held.server = evil;
+    held.tool = `t${evil}`;
+    // Canonical JSON escapes C0 itself; C1 and bidi stay raw in it.
+    held.arguments_canonical = `{"from":"/srv/x\u009b‮"}`;
+  }
+  const p = page({ now: pendingNow() });
+  await p.start(state);
+  const roots = () => [...p.byId.values(), p.tbody];
+  const texts = [];
+  const drawings = [];
+  for (const view of ["#/home", "#/live", "#/chain", "#/info", "#/live"]) {
+    p.go(view);
+    drawings.push(...drawn(p, "hud"), ...drawn(p, "chain"));
+    for (const node of roots()) {
+      texts.push(node.textContent);
+      for (const n of node.all()) if (n.getAttribute("title") !== null) texts.push(n.getAttribute("title"));
+    }
+  }
+  const text = texts.join("\n");
+  assert.ok(!/[\u001b\r\u009b‮]/.test(text), `${name}: raw control in the page`);
+  assert.ok(!text.includes("[2K\n"), `${name}: raw newline from a name in the page`);
+  assert.ok(text.includes(escaped), `${name}: the escaped name is in the page`);
+  const drawnText = drawings.map((t) => t.text);
+  for (const t of drawnText) assert.ok(!/[\u0000-\u001f\u007f-\u009f]/.test(t), `${name}: raw control drawn: ${JSON.stringify(t)}`);
+  assert.ok(drawnText.some((t) => t.includes("\\u{1b}[2K")), drawnText.join("\n"));
+  return { text, drawnText };
+}
+
+test("paths and names with control characters are shown escaped in the page and the drawings", async () => {
+  const pending = await controlCharsShown("pending");
+  assert.ok(pending.text.includes("\\u{9b}\\u{202e}"), "the canonical arguments <pre>");
+  const cut = await controlCharsShown("cut");
+  // The verify reason of the cut receipt is wrapped over several lines.
+  assert.ok(cut.drawnText.some((t) => t.includes("fake\\u{9b}")), cut.drawnText.join("\n"));
+});
+
+// m1: shown() escapes exactly the code points praetore_core does
+// (fixtures/invisible-ranges.json, held equal to
+// praetore_core::display::is_invisible by tests/control_chars.rs).
+test("shown() escapes exactly the code points of praetore_core", () => {
+  const { ranges } = fixture("invisible-ranges");
+  const p = page();
+  const differ = [];
+  let k = 0;
+  for (let cp = 0; cp <= 0x10ffff; cp += 1) {
+    if (cp >= 0xd800 && cp <= 0xdfff) continue;
+    while (k < ranges.length && ranges[k][1] < cp) k += 1;
+    const core = k < ranges.length && ranges[k][0] <= cp;
+    const page_ = p.shown(String.fromCodePoint(cp)) !== String.fromCodePoint(cp);
+    if (core !== page_) differ.push(cp.toString(16).toUpperCase().padStart(4, "0"));
+  }
+  assert.deepEqual(differ, [], `${differ.length} code points differ: U+${differ.join(" U+")}`);
+});
+
+// m1: Intl can write U+00A0 or U+202F inside dates and times (browsers do
+// in "12:30 PM"). Those are invisible for praetore_core, so the page turns
+// them into plain spaces before shown(): its own dates never show \u{..}.
+test("dates the page formats with Intl never show escaped spaces", async () => {
+  const p = page({ now: pendingNow() });
+  p.run(`{
+    const real = Date.prototype.toLocaleString;
+    Date.prototype.toLocaleString = function (...a) { return real.apply(this, a).replace(/ /g, "\u202f").replace(",", ",\u00a0"); };
+  }`);
+  await p.start(fixture("pending"));
+  const card = p.text("live-rest");
+  assert.ok(/\d\d:\d\d/.test(card), card);
+  assert.ok(!card.includes("\\u{202f}") && !card.includes("\\u{a0}"), card);
+});
+
+// B1: the checks list does not promise one use without the condition it
+// needs: both journals cut at the end let an approval run again, and only
+// the saved heads show it. Same text in Spanish, English and Portuguese.
+test("the integrity checks list says when one use per approval does not hold", async () => {
+  const p = page({ hash: "#/info/integrity" });
+  await p.start(fixture("healthy"));
+  for (const [code, words] of [
+    ["es", ["un uso por aprobación", "se recortan ambos del final de los journals", "pasa los dos heads guardados"]],
+    ["en", ["one use per approval", "are both cut from the end of the journals can run again", "pass both saved heads to detect it"]],
+    ["pt", ["um uso por aprovação", "são ambos cortados do fim dos journals", "passe os dois heads guardados"]],
+  ]) {
+    if (code !== "es") {
+      const select = p.byId.get("lang");
+      select.value = code;
+      select.listeners.get("change")[0]();
+    }
+    const text = p.text("info-integrity");
+    for (const w of words) assert.ok(text.includes(w), `${code}: ${w}\n${text}`);
+    assert.ok(!/single use|uso único/.test(text), `${code}: ${text}`);
   }
 });

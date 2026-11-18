@@ -2,8 +2,16 @@
 //!
 //! Tools: `echo` (returns its arguments), `delete_file` (pretends to
 //! delete `arguments.path`) and `append` (really appends `arguments.text` to
-//! `arguments.path`, for path-alias tests). Every executed tools/call is also logged to
+//! `arguments.path`, for path-alias tests). An unlisted `write_text` call
+//! does exactly what `append` does, for the evasion test of one tool used for
+//! another's effect (tests/evasion.rs). Every executed tools/call is also logged to
 //! stderr as `fake_server: EXECUTED <tool>` so tests can see what ran.
+//!
+//! A call with a numeric `arguments.amount` also logs the value this server
+//! read, as `fake_server: RECORDED amount <id> int <i128>` or `... float
+//! <f64>`. The literal is parsed with the standard library (`str::parse`),
+//! not with `serde_json`, so the value does not depend on how the proxy's
+//! JSON parser is built (tests/numeric_gate.rs).
 //!
 //! For `policy coverage` tests:
 //! - `FAKE_SERVER_TOOLS=filesystem-2.3.0` makes `tools/list` return the 16
@@ -34,6 +42,38 @@ const FILESYSTEM_2_3_0: [&str; 16] = [
     "get_file_info",
     "list_allowed_directories",
 ];
+
+/// The text of `params.arguments.amount` in `line`, when it is a number.
+fn amount_literal(line: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Message<'a> {
+        #[serde(borrow)]
+        params: Params<'a>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Params<'a> {
+        #[serde(borrow)]
+        arguments: Arguments<'a>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Arguments<'a> {
+        #[serde(borrow)]
+        amount: &'a serde_json::value::RawValue,
+    }
+    let message: Message = serde_json::from_str(line).ok()?;
+    let literal = message.params.arguments.amount.get();
+    literal
+        .starts_with(|c: char| c == '-' || c.is_ascii_digit())
+        .then(|| literal.to_owned())
+}
+
+/// `int <value>` or `float <value>`, as the standard library reads `literal`.
+fn recorded(literal: &str) -> String {
+    match literal.parse::<i128>() {
+        Ok(integer) => format!("int {integer}"),
+        Err(_) => format!("float {:?}", literal.parse::<f64>().unwrap_or(f64::NAN)),
+    }
+}
 
 fn env_set(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
@@ -108,7 +148,10 @@ fn main() {
             Some("tools/call") => {
                 let name = message["params"]["name"].as_str().unwrap_or("?").to_owned();
                 eprintln!("fake_server: EXECUTED {name}");
-                if name == "append" {
+                if let Some(literal) = amount_literal(&line) {
+                    eprintln!("fake_server: RECORDED amount {id} {}", recorded(&literal));
+                }
+                if name == "append" || name == "write_text" {
                     let arguments = &message["params"]["arguments"];
                     let path = arguments["path"].as_str().unwrap_or_default();
                     let text = arguments["text"].as_str().unwrap_or_default();

@@ -283,6 +283,28 @@ fn a_session_with_allow_deny_and_an_approval_writes_both_files() {
         header["approval_journal_head"],
         json!(verified.approval_head)
     );
+    // The command to check both heads later, as printed, with DIR for the
+    // home: it passes on the journal as it is at close.
+    let command = header["verify_command"].as_str().unwrap();
+    assert_eq!(
+        command,
+        format!(
+            "praetore-mcp verify --dir DIR --expected-head {} --expected-approval-head {}",
+            head.prev,
+            verified.approval_head.as_deref().unwrap()
+        )
+    );
+    let args: Vec<&str> = command.split(' ').skip(1).collect();
+    let home_dir = home.root.to_str().unwrap();
+    let args: Vec<&str> = args
+        .iter()
+        .map(|arg| if *arg == "DIR" { home_dir } else { arg })
+        .collect();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_praetore-mcp"))
+        .args(&args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
     assert_eq!(header["verify"]["result"], "passed");
     assert_eq!(header["verify"]["journal_receipts"], 4);
     assert_eq!(header["verify"]["session_verified"], 3);
@@ -1044,10 +1066,24 @@ fn a_sigterm_while_the_report_is_written_ends_wrap_by_it_after_the_report() {
         );
         return;
     }
-    eprintln!(
-        "SKIPPED a_sigterm_while_the_report_is_written_ends_wrap_by_it_after_the_report: \
-         the report was written before the signal in every round"
+    skip_or_fail_in_ci(
+        "a_sigterm_while_the_report_is_written_ends_wrap_by_it_after_the_report",
+        "the report was written before the signal in every round (seeds 150 and 300)",
     );
+}
+
+/// A test that could not reach the case it checks. On a developer's
+/// machine it says so on stderr; in CI (the `CI` variable is set), where
+/// stderr of a passing test is not shown, it fails with the cause, so a
+/// case that never ran is never reported as passed.
+fn skip_or_fail_in_ci(test: &str, cause: &str) {
+    if std::env::var_os("CI").is_some() {
+        panic!(
+            "{test} did not reach its case: {cause}. In CI a skip fails instead of passing \
+             unseen; raise the seed or make the window reachable on this runner"
+        );
+    }
+    eprintln!("SKIPPED {test}: {cause}");
 }
 
 #[test]

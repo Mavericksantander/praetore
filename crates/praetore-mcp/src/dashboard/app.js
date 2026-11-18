@@ -178,6 +178,7 @@ const I18N = {
     head_none: (c, u) => `Sin head (${c} encadenadas, ${u} sin encadenar)`,
     head_warn: "Guarda este head fuera de esta máquina y pásalo como --expected-head: sin él no se detectan entradas borradas al final del journal.",
     expected_head: (h) => `Comparado con --expected-head ${h}.`,
+    expected_approval_head: (h) => `Comparado con --expected-approval-head ${h}.`,
     failures: "Fallas reportadas por verify",
     appr_journal: "Journal de aprobaciones",
     appr_text: (d, e) => `${d} decisiones, ${e} ejecuciones`, appr_none: "Todavía no hay decisiones de aprobación.",
@@ -189,7 +190,7 @@ const I18N = {
       `Firma de la autoridad contra ${i} a la hora de la decisión`,
       "Vínculo de praetore.mode",
       "Orden del journal (seq y enlace hash)",
-      "Journal de aprobaciones: firma del aprobador, vínculo con la llamada retenida, vencimiento, uso único",
+      "Journal de aprobaciones: firma del aprobador, vínculo con la llamada retenida, vencimiento, un uso por aprobación (una aprobación cuya ejecución y cuyo recibo reenviado se recortan ambos del final de los journals puede volver a correr; pasa los dos heads guardados para detectarlo)",
     ],
     observe_note: "Un recibo observe registra una decisión que NO se aplicó.",
     verify_error: "verify no pudo correr",
@@ -347,6 +348,7 @@ const I18N = {
     head_none: (c, u) => `No head (${c} chained, ${u} unchained)`,
     head_warn: "Keep this head outside this machine and pass it as --expected-head: without it, entries removed at the end of the journal are not detected.",
     expected_head: (h) => `Compared with --expected-head ${h}.`,
+    expected_approval_head: (h) => `Compared with --expected-approval-head ${h}.`,
     failures: "Failures reported by verify",
     appr_journal: "Approval journal",
     appr_text: (d, e) => `${d} decision(s), ${e} execution(s)`, appr_none: "No approval decisions yet.",
@@ -358,7 +360,7 @@ const I18N = {
       `Authority signature against ${i} at decision time`,
       "praetore.mode binding",
       "Journal order (seq and hash link)",
-      "Approval journal: approver signature, binding to the held call, expiry, single use",
+      "Approval journal: approver signature, binding to the held call, expiry, one use per approval (an approval whose execution and forwarded receipt are both cut from the end of the journals can run again; pass both saved heads to detect it)",
     ],
     observe_note: "An observe receipt records a decision that was NOT enforced.",
     verify_error: "verify could not run",
@@ -516,6 +518,7 @@ const I18N = {
     head_none: (c, u) => `Sem head (${c} encadeadas, ${u} não encadeadas)`,
     head_warn: "Guarde este head fora desta máquina e passe-o como --expected-head: sem ele, entradas apagadas no fim do journal não são detectadas.",
     expected_head: (h) => `Comparado com --expected-head ${h}.`,
+    expected_approval_head: (h) => `Comparado com --expected-approval-head ${h}.`,
     failures: "Falhas reportadas pelo verify",
     appr_journal: "Journal de aprovações",
     appr_text: (d, e) => `${d} decisões, ${e} execuções`, appr_none: "Ainda não há decisões de aprovação.",
@@ -527,7 +530,7 @@ const I18N = {
       `Assinatura da autoridade contra ${i} na hora da decisão`,
       "Vínculo de praetore.mode",
       "Ordem do journal (seq e link hash)",
-      "Journal de aprovações: assinatura do aprovador, vínculo com a chamada retida, expiração, uso único",
+      "Journal de aprovações: assinatura do aprovador, vínculo com a chamada retida, expiração, um uso por aprovação (uma aprovação cuja execução e cujo recibo reencaminhado são ambos cortados do fim dos journals pode rodar de novo; passe os dois heads guardados para detectar)",
     ],
     observe_note: "Um recibo observe registra uma decisão que NÃO foi aplicada.",
     verify_error: "o verify não pôde rodar",
@@ -573,11 +576,41 @@ function t(key, ...args) {
   return typeof value === "function" ? value(...args) : value;
 }
 
+// m5, m1: paths and names come from the agent, the server and the file
+// system. shown() writes as \u{..} every character praetore_core escapes
+// (praetore_core::display::is_invisible, also used for the terminal and
+// the PDF in src/shown.rs): control characters (C0 with \r, \n, NUL and
+// ESC, DEL, C1), format characters (zero-width, bidi, the byte order mark,
+// soft hyphen, tag characters) and every Unicode space other than U+0020.
+// The class below is those ranges, from tests-js/fixtures/invisible-ranges.json;
+// the tests hold that file equal to praetore_core and this class equal to
+// that file, over every code point. A backslash is kept as is: in the page
+// it moves nothing, and commands shown for copying keep their $'\x..'
+// escapes readable. Every text the page writes goes through here: el()
+// text and titles, and clipText and wrapText for the canvases. Dates and
+// times the page formats with Intl go through intlText() first, which turns
+// the no-break spaces Intl may write (U+00A0, U+202F) into plain spaces.
+const INVISIBLE = /[\u0000-\u001f\u007f-\u00a0\u00ad\u034f\u0600-\u0605\u061c\u06dd\u070f\u115f-\u1160\u1680\u17b4-\u17b5\u180b-\u180f\u2000-\u200f\u2028-\u202f\u205f-\u206f\u3000\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff9-\ufffb\u{110bd}\u{110cd}\u{1bca0}-\u{1bca3}\u{1d173}-\u{1d17a}\u{e0000}-\u{e0fff}]/gu;
+
+function intlText(text) {
+  return String(text).replace(/[\u00a0\u202f]/g, " ");
+}
+
+function shown(text) {
+  return String(text).replace(INVISIBLE, (c) => `\\u{${c.codePointAt(0).toString(16)}}`);
+}
+
 function el(tag, attrs, ...children) {
   const node = document.createElement(tag);
+  // In <pre> the page's own line breaks stay; each line is escaped. Data
+  // shown there (canonical JSON, commands, journal lines) has no raw newline.
+  const text = tag === "pre"
+    ? (value) => String(value).split("\n").map(shown).join("\n")
+    : shown;
   for (const [k, v] of Object.entries(attrs || {})) {
     if (v === null || v === undefined || v === false) continue;
     if (k === "class") node.className = v;
+    else if (k === "title") node.setAttribute(k, shown(v));
     // The CSP has no 'unsafe-inline' for styles: a style attribute would be
     // dropped, so styles go through the CSSOM.
     else if (k === "style") node.style.cssText = v;
@@ -586,7 +619,7 @@ function el(tag, attrs, ...children) {
   }
   for (const child of children.flat()) {
     if (child === null || child === undefined || child === false) continue;
-    node.append(child instanceof Node ? child : String(child));
+    node.append(child instanceof Node ? child : text(child));
   }
   return node;
 }
@@ -661,9 +694,9 @@ function localText(iso) {
   if (!iso) return "-";
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return "-";
-  return date.toLocaleString(lang, {
+  return intlText(date.toLocaleString(lang, {
     year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
-  });
+  }));
 }
 
 function relativeText(iso) {
@@ -672,10 +705,10 @@ function relativeText(iso) {
   const seconds = Math.round((date.getTime() - Date.now()) / 1000);
   const rtf = new Intl.RelativeTimeFormat(lang, { numeric: "auto" });
   const abs = Math.abs(seconds);
-  if (abs < 45) return rtf.format(seconds, "second");
-  if (abs < 2700) return rtf.format(Math.round(seconds / 60), "minute");
-  if (abs < 79200) return rtf.format(Math.round(seconds / 3600), "hour");
-  return rtf.format(Math.round(seconds / 86400), "day");
+  if (abs < 45) return intlText(rtf.format(seconds, "second"));
+  if (abs < 2700) return intlText(rtf.format(Math.round(seconds / 60), "minute"));
+  if (abs < 79200) return intlText(rtf.format(Math.round(seconds / 3600), "hour"));
+  return intlText(rtf.format(Math.round(seconds / 86400), "day"));
 }
 
 function approvalLabel(value) {
@@ -865,7 +898,8 @@ function canvasWidth(canvas) {
 // Splits `text` into lines no wider than `width`, at spaces (a word wider
 // than a line is split). With more than `max` lines the last one ends in
 // "…" and `cut` is true.
-function wrapText(ctx, text, width, max) {
+function wrapText(ctx, raw, width, max) {
+  const text = shown(raw);
   const lines = [];
   let line = "";
   for (const word of text.split(" ")) {
@@ -914,7 +948,8 @@ function brackets(ctx, x, y, w, h, color, size = 7) {
   ctx.stroke();
 }
 
-function clipText(ctx, text, width) {
+function clipText(ctx, raw, width) {
+  const text = shown(raw);
   if (ctx.measureText(text).width <= width) return text;
   let out = text;
   while (out.length > 1 && ctx.measureText(`${out}…`).width > width) out = out.slice(0, -1);
@@ -1587,14 +1622,14 @@ function chartCard() {
     for (let i = 23; i >= 0; i -= 1) {
       const start = new Date(end.getTime() - i * 3600 * 1000);
       buckets.push({ start, end: new Date(start.getTime() + 3600 * 1000),
-        label: start.toLocaleTimeString(lang, { hour: "2-digit", minute: "2-digit" }) });
+        label: intlText(start.toLocaleTimeString(lang, { hour: "2-digit", minute: "2-digit" })) });
     }
   } else {
     const end = new Date(now); end.setHours(0, 0, 0, 0);
     for (let i = 13; i >= 0; i -= 1) {
       const start = new Date(end); start.setDate(end.getDate() - i);
       const stop = new Date(start); stop.setDate(start.getDate() + 1);
-      buckets.push({ start, end: stop, label: start.toLocaleDateString(lang, { day: "2-digit", month: "short" }) });
+      buckets.push({ start, end: stop, label: intlText(start.toLocaleDateString(lang, { day: "2-digit", month: "short" })) });
     }
   }
   for (const b of buckets) { b.ALLOW = 0; b.DENY = 0; b.REQUIRE_APPROVAL = 0; }
@@ -2122,6 +2157,7 @@ function renderIntegrity() {
   } else {
     appr.append(el("p", { class: "card-sub" }, t("appr_none")));
   }
+  if (v.approval.expected_head) appr.append(el("p", { class: "mono" }, t("expected_approval_head", v.approval.expected_head)));
   root.append(appr);
 
   root.append(el("div", { class: "card section-gap" }, el("h2", {}, t("home_dir")),

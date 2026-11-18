@@ -756,7 +756,7 @@ pub fn render_coverage(
         }
     }
     out.push_str(
-        "note: decisions are read from the rules for a call where no argument condition matches; observe mode records them and never blocks.\n",
+        "note: decisions are read from the rules for a call where no argument condition matches; observe mode records a DENY and forwards the call.\n",
     );
     out
 }

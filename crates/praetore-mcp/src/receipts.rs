@@ -2,7 +2,8 @@
 //! delegated to `praetore-core` (`Evidence::from_json` integrity,
 //! `verify_attester_signature`, `verify_agent_intent`, issuer pins).
 
-use crate::journal::{self, ChainCheck, Position};
+use crate::journal::{self, Chain, ChainLine, Position};
+use crate::shown::Show;
 use crate::{
     gate::MODE_CONTEXT_KEY,
     store::{self, AUDIENCE, Home},
@@ -21,8 +22,8 @@ pub struct JournalLine {
 pub fn read_journal(home: &Home) -> Result<Vec<JournalLine>, String> {
     let mut lines = Vec::new();
     for file in journal::journal_files(&home.receipts_dir())? {
-        let text = fs::read_to_string(&file)
-            .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+        let text =
+            fs::read_to_string(&file).map_err(|e| format!("cannot read {}: {e}", file.shown()))?;
         for (index, line) in text.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
@@ -139,7 +140,7 @@ pub fn render_table(
             }
             Err(error) => out.push_str(&format!(
                 "INVALID {}:{}: {error}\n",
-                line.file.display(),
+                line.file.shown(),
                 line.line_number
             )),
         }
@@ -168,6 +169,94 @@ pub struct VerifyReport {
     pub approval_head: Option<String>,
     /// One verdict per journal line, in journal order.
     pub lines: Vec<LineVerdict>,
+    /// Which journals were compared with a head given by the caller.
+    pub anchors: Anchors,
+}
+
+/// Which journals `verify` compared with a state kept by the caller: a
+/// head printed earlier, or `none` for a journal that must not exist yet.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Anchors {
+    pub receipts: bool,
+    pub approvals: bool,
+}
+
+/// What a `verify` result is worth.
+///
+/// The keys that sign receipts and approvals are files in the home. A
+/// process that can read them can write a different journal from the first
+/// entry to a new head, and every check that reads only the home passes on
+/// it. The only thing such a process cannot change is a head kept somewhere
+/// it cannot write. So a result without both heads is not a pass: it is
+/// its own state, with its own exit code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Assurance {
+    /// Every check passed, and both journals end exactly at the states the
+    /// caller gave.
+    Anchored,
+    /// Every check that reads only the home passed. `missing` names the
+    /// options that were not given.
+    Unanchored { missing: Vec<&'static str> },
+    /// A check failed.
+    Failed,
+}
+
+impl Assurance {
+    /// Exit code of `verify`: 0 only for [`Assurance::Anchored`].
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::Anchored => 0,
+            Self::Failed => 1,
+            Self::Unanchored { .. } => UNANCHORED_EXIT,
+        }
+    }
+
+    /// First word of the summary line of `verify`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Anchored => "OK",
+            Self::Failed => "FAIL",
+            Self::Unanchored { .. } => "UNANCHORED",
+        }
+    }
+}
+
+/// Exit code of `verify` when nothing failed but a head is missing. Not 0:
+/// a script that only checks for success must not take it for a pass. Not
+/// 1 or 2: those are a failed check and a usage error.
+pub const UNANCHORED_EXIT: i32 = 3;
+
+/// The value of `--expected-head` and `--expected-approval-head` for a
+/// journal that must be empty or absent.
+pub const NO_JOURNAL: &str = "none";
+
+impl VerifyReport {
+    pub fn assurance(&self) -> Assurance {
+        if !self.failures.is_empty() {
+            return Assurance::Failed;
+        }
+        let mut missing = Vec::new();
+        if !self.anchors.receipts {
+            missing.push("--expected-head");
+        }
+        if !self.anchors.approvals {
+            missing.push("--expected-approval-head");
+        }
+        if missing.is_empty() {
+            Assurance::Anchored
+        } else {
+            Assurance::Unanchored { missing }
+        }
+    }
+}
+
+/// A state the caller expects a journal to be in.
+#[derive(Clone, Copy)]
+enum Expected<T> {
+    /// The journal ends at this head.
+    Head(T),
+    /// The journal is empty or absent.
+    Nothing,
 }
 
 /// Verifies one journal line against the local pins. Returns the evidence.
@@ -364,24 +453,87 @@ pub struct LineVerdict {
     pub verified: bool,
 }
 
+/// Heads printed by an earlier `verify` and kept where the journals'
+/// writers cannot change them. Each journal must still end at its head.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExpectedHeads<'a> {
+    /// `--expected-head`: the receipts journal.
+    pub receipts: Option<&'a str>,
+    /// `--expected-approval-head`: `approvals/journal.jsonl`.
+    pub approvals: Option<&'a str>,
+}
+
+/// [`verify_journal_with`] with only the receipts head.
+pub fn verify_journal(home: &Home, expected_head: Option<&str>) -> Result<VerifyReport, String> {
+    verify_journal_with(
+        home,
+        ExpectedHeads {
+            receipts: expected_head,
+            approvals: None,
+        },
+    )
+}
+
 /// Verifies every receipt and the order of the journal: no entry removed,
 /// duplicated or reordered between the first and the last chained entry.
-/// Entries removed at the end are only detected with `expected_head`.
-pub fn verify_journal(home: &Home, expected_head: Option<&str>) -> Result<VerifyReport, String> {
-    let expected_head = expected_head
+/// Entries removed at the end are only detected with an expected head:
+/// `expected.receipts` for the receipts journal, `expected.approvals` for
+/// the approval journal.
+pub fn verify_journal_with(
+    home: &Home,
+    expected: ExpectedHeads<'_>,
+) -> Result<VerifyReport, String> {
+    let expected_approval_head = expected
+        .approvals
         .map(|text| {
+            if text == NO_JOURNAL {
+                return Ok(Expected::Nothing);
+            }
+            (text.len() == 64 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+                .then_some(Expected::Head(text))
+                .ok_or("--expected-approval-head must be 64 lowercase hex characters, or `none`")
+        })
+        .transpose()?;
+    let expected_head = expected
+        .receipts
+        .map(|text| {
+            if text == NO_JOURNAL {
+                return Ok(Expected::Nothing);
+            }
             praetore_core::journal_chain::ChainLink::from_hex(text)
-                .ok_or("--expected-head must be 64 lowercase hex characters")
+                .map(Expected::Head)
+                .ok_or("--expected-head must be 64 lowercase hex characters, or `none`")
         })
         .transpose()?;
     let attester = store::read_attester_pin(&home.attester_pin())?;
     let pins = store::read_issuer_pins(&home.issuer_pins())?;
     let mut report = VerifyReport::default();
-    let mut chain = ChainCheck::default();
+    let lines = read_journal(home)?;
+    let parsed: Vec<Result<journal::Entry, String>> = lines
+        .iter()
+        .map(|line| journal::parse_line(&line.text))
+        .collect();
+    let entries: Vec<ChainLine<'_>> = parsed
+        .iter()
+        .zip(&lines)
+        .map(|(entry, line)| match entry {
+            Ok(entry) => ChainLine::Entry(entry),
+            Err(_) => ChainLine::Unreadable(journal::claimed_position(&line.text)),
+        })
+        .collect();
+    // The one check of the journal's shape: its lines are exactly the chain
+    // that ends at the head (the expected one, or the last line's).
+    // #217's Expected<ChainLink> maps onto #216's Option<ChainLink>:
+    // Some(link) only for Expected::Head; Nothing or no option is None.
+    let rebuild_head = match expected_head {
+        Some(Expected::Head(link)) => Some(link),
+        Some(Expected::Nothing) | None => None,
+    };
+    let chain = Chain::rebuild(&entries, rebuild_head);
     let mut parsed_evidence = Vec::new();
-    for line in read_journal(home)? {
+    for ((line, entry), order) in lines.into_iter().zip(&parsed).zip(&chain.problems) {
         report.total += 1;
-        let at = format!("{}:{}", line.file.display(), line.line_number);
+        let at = format!("{}:{}", line.file.shown(), line.line_number);
         let mut verdict = LineVerdict {
             file: line.file,
             line_number: line.line_number,
@@ -391,18 +543,16 @@ pub fn verify_journal(home: &Home, expected_head: Option<&str>) -> Result<Verify
             order: None,
             verified: false,
         };
-        let entry = match journal::parse_line(&verdict.text) {
+        let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                chain.push_unreadable();
                 report.failures.push(format!("FAIL {at}: {error}"));
-                verdict.parse_error = Some(error);
+                verdict.parse_error = Some(error.clone());
                 report.lines.push(verdict);
                 continue;
             }
         };
         parsed_evidence.push(entry.evidence.clone());
-        let order = chain.push(&entry);
         let checks = check_evidence(&entry.evidence, &attester, &pins);
         match checks.first_failure() {
             None if order.is_none() => {
@@ -420,19 +570,44 @@ pub fn verify_journal(home: &Home, expected_head: Option<&str>) -> Result<Verify
             None => {}
             Some(error) => report.failures.push(format!("FAIL {at}: {error}")),
         }
-        if let Some(problem) = &order {
+        if let Some(problem) = order {
             report
                 .failures
                 .push(format!("FAIL {at}: journal order: {problem}"));
         }
         verdict.checks = Some(checks);
-        verdict.order = order;
+        verdict.order = order.clone();
         report.lines.push(verdict);
     }
     report.chained = chain.chained;
     report.unchained = chain.unchained;
-    report.head = chain.head();
-    if let Some(expected) = expected_head {
+    report.head = chain.head;
+    report.anchors = Anchors {
+        receipts: expected_head.is_some(),
+        approvals: expected_approval_head.is_some(),
+    };
+    if let Some(Expected::Nothing) = expected_head
+        && report.total > 0
+    {
+        report.failures.push(format!(
+            "FAIL journal has {} line(s), but --expected-head {NO_JOURNAL} says it was empty: entries were added",
+            report.total
+        ));
+    }
+    // chain.missing (#216) and Expected::Head mismatch (#217) both become
+    // failures. Failed beats Unanchored. Do not report the same mismatch twice.
+    if let Some(missing) = &chain.missing {
+        report.failures.push(match (expected_head, report.head) {
+            (Some(Expected::Head(expected)), Some(head)) if head.prev != expected => format!(
+                "FAIL journal head {} ({} chained entries present, next seq {}) does not match the expected head {expected}: entries were removed or added ({missing})",
+                head.prev, report.chained, head.seq
+            ),
+            (Some(Expected::Head(expected)), None) => format!(
+                "FAIL journal has no verifiable head; expected {expected} ({missing})"
+            ),
+            _ => format!("FAIL journal: {missing}"),
+        });
+    } else if let Some(Expected::Head(expected)) = expected_head {
         match report.head {
             Some(head) if head.prev == expected => {}
             Some(head) => report.failures.push(format!(
@@ -446,6 +621,24 @@ pub fn verify_journal(home: &Home, expected_head: Option<&str>) -> Result<Verify
     }
     let approvals = crate::approvals::verify(home, &parsed_evidence)?;
     report.failures.extend(approvals.failures);
+    if let (Some(Expected::Nothing), Some(head)) = (expected_approval_head, &approvals.head) {
+        report.failures.push(format!(
+            "FAIL approval journal exists (head {head}, {} decision(s), {} execution(s)), but --expected-approval-head {NO_JOURNAL} says there was none: records were added",
+            approvals.decisions, approvals.executions
+        ));
+    }
+    if let Some(Expected::Head(expected)) = expected_approval_head {
+        match approvals.head.as_deref() {
+            Some(head) if head == expected => {}
+            Some(head) => report.failures.push(format!(
+                "FAIL approval journal head {head} ({} decision(s), {} execution(s)) does not match the expected approval head {expected}: records were removed or added",
+                approvals.decisions, approvals.executions
+            )),
+            None => report.failures.push(format!(
+                "FAIL approval journal has no head (absent or empty); expected {expected}: records were removed"
+            )),
+        }
+    }
     report.approval_decisions = approvals.decisions;
     report.approval_executions = approvals.executions;
     report.approval_head = approvals.head;

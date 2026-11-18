@@ -146,7 +146,10 @@ fn assert_state_matches_verify(home: &Home) -> Value {
     let (code, report) = verify_cli(home);
     let state = dashboard::state(home, None);
     let v = &state["verify"];
-    assert_eq!(v["status"] == "ok", code == 0, "{report}\n{v}");
+    // `verify` ran without heads: 3 when nothing failed, 1 otherwise.
+    assert_eq!(v["status"] == "ok", code == 3, "{report}\n{v}");
+    assert_eq!(v["assurance"] == "unanchored", code == 3, "{report}\n{v}");
+    assert_eq!(v["assurance"] == "failed", code == 1, "{report}\n{v}");
     let cli_failures: Vec<&str> = report
         .lines()
         .filter(|l| l.starts_with("FAIL") && !l.contains(" receipts: "))
@@ -160,7 +163,7 @@ fn assert_state_matches_verify(home: &Home) -> Value {
     assert_eq!(cli_failures, state_failures);
     let summary = format!(
         "{} {} receipts: {} verified, {} failed",
-        if code == 0 { "OK" } else { "FAIL" },
+        if code == 3 { "UNANCHORED" } else { "FAIL" },
         v["total"],
         v["verified"],
         v["failed"]
@@ -428,6 +431,60 @@ fn verification_status_matches_verify_with_an_expected_head() {
     assert!(report.contains(failures[0].as_str().unwrap()), "{report}");
 }
 
+/// `dashboard --expected-approval-head` runs the check of `verify
+/// --expected-approval-head`: the page shows the head it compared with, and
+/// a head the approval journal does not end at is the same failure.
+#[test]
+fn verification_status_matches_verify_with_an_expected_approval_head() {
+    let (_temp, home) = home_with_receipts();
+    let pending = praetore_mcp::approvals::list_pending(&home).unwrap();
+    praetore_mcp::approvals::decide(
+        &home,
+        &pending[0].approval_id,
+        praetore_mcp::approvals::HumanOutcome::Approve,
+        None,
+    )
+    .unwrap();
+    let expected = |approvals| praetore_mcp::receipts::ExpectedHeads {
+        receipts: None,
+        approvals,
+    };
+    let state = dashboard::state_with(&home, expected(None));
+    let head = state["verify"]["approval"]["head"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let state = dashboard::state_with(&home, expected(Some(&head)));
+    assert_eq!(state["verify"]["status"], "ok", "{}", state["verify"]);
+    assert_eq!(state["verify"]["approval"]["expected_head"], head.as_str());
+
+    let wrong = "0".repeat(64);
+    let state = dashboard::state_with(&home, expected(Some(&wrong)));
+    let out = run(
+        &[
+            "verify",
+            "--dir",
+            home.root.to_str().unwrap(),
+            "--expected-approval-head",
+            &wrong,
+        ],
+        "",
+    );
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(state["verify"]["status"], "fail");
+    let failures = state["verify"]["failures"].as_array().unwrap();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+        failures[0]
+            .as_str()
+            .unwrap()
+            .contains("does not match the expected approval head"),
+        "{failures:?}"
+    );
+    assert!(report.contains(failures[0].as_str().unwrap()), "{report}");
+}
+
 #[test]
 fn checks_report_each_signature_and_first_failure_is_what_verify_prints() {
     let (_temp, home) = home_with_receipts();
@@ -560,7 +617,7 @@ fn host_header_matrix() {
     let served_home = home.clone();
     let count = cases.len();
     let server = std::thread::spawn(move || {
-        dashboard::serve(&listener, &served_home, None, Some(count)).unwrap();
+        dashboard::serve(&listener, &served_home, Default::default(), Some(count)).unwrap();
     });
     for (request, status) in &cases {
         let response = http(port, request);
@@ -593,7 +650,7 @@ fn server_answers_get_on_loopback_only_and_writes_nothing() {
     let port = listener.local_addr().unwrap().port();
     let served_home = home.clone();
     let server = std::thread::spawn(move || {
-        dashboard::serve(&listener, &served_home, None, Some(7)).unwrap();
+        dashboard::serve(&listener, &served_home, Default::default(), Some(7)).unwrap();
     });
     let host = format!("Host: 127.0.0.1:{port}");
 
@@ -669,7 +726,7 @@ fn favicon_is_answered_empty_and_stays_get_only_on_loopback() {
     let served_home = home.clone();
     let count = cases.len();
     let server = std::thread::spawn(move || {
-        dashboard::serve(&listener, &served_home, None, Some(count)).unwrap();
+        dashboard::serve(&listener, &served_home, Default::default(), Some(count)).unwrap();
     });
     for (request, status) in &cases {
         let response = http(port, request);
@@ -734,7 +791,7 @@ fn page_never_writes_journal_values_as_html() {
     let port = listener.local_addr().unwrap().port();
     let served_home = home.clone();
     let server = std::thread::spawn(move || {
-        dashboard::serve(&listener, &served_home, None, Some(1)).unwrap();
+        dashboard::serve(&listener, &served_home, Default::default(), Some(1)).unwrap();
     });
     let js = http(
         port,
@@ -943,7 +1000,7 @@ fn assert_no_event_handler_attributes(js: &str) {
 /// `/api/state` with `query`, through [`dashboard::respond_with`].
 fn api(home: &Home, cache: &mut dashboard::Cache, query: &str) -> (u16, Value) {
     let request = format!("GET /api/state{query} HTTP/1.1\r\nHost: 127.0.0.1:8787\r\n\r\n");
-    let response = dashboard::respond_with(&request, home, None, 8787, cache);
+    let response = dashboard::respond_with(&request, home, Default::default(), 8787, cache);
     let body = if response.status == 200 {
         serde_json::from_slice(&response.body).unwrap()
     } else {
@@ -1477,7 +1534,7 @@ fn a_corrupt_or_truncated_journal_shows_an_error_and_the_server_keeps_serving() 
     let port = listener.local_addr().unwrap().port();
     let served_home = home.clone();
     let server = std::thread::spawn(move || {
-        dashboard::serve(&listener, &served_home, None, Some(4)).unwrap();
+        dashboard::serve(&listener, &served_home, Default::default(), Some(4)).unwrap();
     });
     let get = |target: &str| {
         let response = http(
@@ -1893,8 +1950,25 @@ fn the_chain_is_cut_where_verify_fails_and_the_receipt_is_rebuilt() {
     assert_eq!(status, 200);
     let receipts = state["page"]["receipts"].as_array().unwrap();
     let cut: Vec<&Value> = receipts.iter().filter(|r| r["order"].is_string()).collect();
-    assert_eq!(cut.len(), 1, "{receipts:?}");
-    assert_eq!(cut[0]["verified"], false);
+    // Two lines fail: the entry after the gap, which names a predecessor
+    // that is not there, and the entry before the gap, which the chain that
+    // ends at the head no longer reaches.
+    assert_eq!(cut.len(), 2, "{receipts:?}");
+    assert!(
+        cut.iter()
+            .any(|r| r["order"].as_str().unwrap().contains("is missing")),
+        "{cut:?}"
+    );
+    assert!(
+        cut.iter().any(|r| r["order"]
+            .as_str()
+            .unwrap()
+            .contains("is outside the chain")),
+        "{cut:?}"
+    );
+    for r in &cut {
+        assert_eq!(r["verified"], false);
+    }
     for r in receipts {
         assert!(r["seq"].is_u64(), "{r}");
         assert!(r["prev"].is_string(), "{r}");

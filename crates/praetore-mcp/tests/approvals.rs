@@ -15,6 +15,13 @@ use std::{
     time::Duration,
 };
 
+/// Whether a `verify` run without the heads kept elsewhere found nothing
+/// wrong: the summary says UNANCHORED and the exit code is 3, not 0 (a
+/// result without both heads is not a pass).
+fn unanchored(out: &Output) -> bool {
+    out.status.code() == Some(3) && String::from_utf8_lossy(&out.stdout).starts_with("UNANCHORED ")
+}
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_praetore-mcp")
 }
@@ -179,13 +186,24 @@ fn verify(home: &Home) -> Output {
 /// Drives `approve` on a pseudo-terminal and types the code the command prints.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn approve_on_tty(home: &Home, id: &str) -> Output {
-    approve_on_tty_with(home, id, &|| {})
+    approve_on_tty_env(home, id, &[])
+}
+
+/// `approve` with `env`, so its TTL is the one `wrap` used to write the pending window.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn approve_on_tty_env(home: &Home, id: &str, env: &[(&str, &str)]) -> Output {
+    approve_on_tty_with(home, id, &|| {}, env)
 }
 
 /// Like [`approve_on_tty`], and runs `before_code` after the call is printed
 /// and before the confirmation code is typed.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn approve_on_tty_with(home: &Home, id: &str, before_code: &dyn Fn()) -> Output {
+fn approve_on_tty_with(
+    home: &Home,
+    id: &str,
+    before_code: &dyn Fn(),
+    env: &[(&str, &str)],
+) -> Output {
     use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -205,13 +223,14 @@ fn approve_on_tty_with(home: &Home, id: &str, before_code: &dyn Fn()) -> Output 
     let slave = unsafe { OwnedFd::from_raw_fd(slave_raw) };
     let slave_in = slave.try_clone().unwrap();
     let slave_out = slave.try_clone().unwrap();
-    let mut child = Command::new(bin())
+    let mut child = Command::new(bin());
+    child
         .args(["approve", id, "--dir", home.root.to_str().unwrap()])
+        .envs(env.iter().copied())
         .stdin(Stdio::from(slave_in))
         .stdout(Stdio::from(slave_out))
-        .stderr(Stdio::from(slave))
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::from(slave));
+    let mut child = child.spawn().unwrap();
     let mut master = std::fs::File::from(master);
     let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
     assert!(flags >= 0, "{}", std::io::Error::last_os_error());
@@ -376,7 +395,7 @@ fn enforce_holds_the_call_and_names_the_exact_command() {
     assert_eq!(recorded[0].context["praetore.mode"], "enforce");
     let verify = verify(&home);
     assert!(
-        verify.status.success(),
+        unanchored(&verify),
         "{}",
         String::from_utf8_lossy(&verify.stdout)
     );
@@ -553,7 +572,7 @@ fn approved_call_forwards_once_and_a_second_retry_asks_again() {
 
     let verify = verify(&home);
     let report = String::from_utf8_lossy(&verify.stdout);
-    assert!(verify.status.success(), "{report}");
+    assert!(unanchored(&verify), "{report}");
     assert!(report.contains("1 decision(s), 1 execution(s)"), "{report}");
 }
 
@@ -588,7 +607,7 @@ fn different_arguments_do_not_use_the_approval() {
     assert_ne!(other, id);
     let verify = verify(&home);
     assert!(
-        verify.status.success(),
+        unanchored(&verify),
         "{}",
         String::from_utf8_lossy(&verify.stdout)
     );
@@ -645,7 +664,7 @@ fn rejected_call_is_not_forwarded() {
     assert_eq!(by_id(&responses, 8)["result"]["isError"], true);
     let verify = verify(&home);
     let report = String::from_utf8_lossy(&verify.stdout);
-    assert!(verify.status.success(), "{report}");
+    assert!(unanchored(&verify), "{report}");
     assert!(report.contains("1 decision(s), 0 execution(s)"), "{report}");
     let table = run(&["receipts", "--dir", home.root.to_str().unwrap()], "");
     let table = String::from_utf8_lossy(&table.stdout);
@@ -681,7 +700,7 @@ fn expired_pending_and_expired_approval_do_not_pass() {
     let env = [("PRAETORE_MCP_APPROVAL_TTL_SECONDS", "4")];
     let (responses, _, _) = wrap(&home, "enforce", &session(echo(7, json!({"n": 1}))), &env);
     let id = approval_id_from(tool_text(by_id(&responses, 7)));
-    let approved = approve_on_tty(&home, &id);
+    let approved = approve_on_tty_env(&home, &id, &env);
     assert!(
         approved.status.success(),
         "{}",
@@ -693,7 +712,7 @@ fn expired_pending_and_expired_approval_do_not_pass() {
     assert_eq!(by_id(&responses, 8)["result"]["isError"], true);
     let verify = verify(&home);
     assert!(
-        verify.status.success(),
+        unanchored(&verify),
         "{}",
         String::from_utf8_lossy(&verify.stdout)
     );
@@ -709,7 +728,7 @@ fn verify_rejects_a_bad_signature_and_a_reused_approval() {
     assert!(approve_on_tty(&home, &id).status.success());
     let (_, stderr, _) = wrap(&home, "enforce", &session(echo(8, json!({"n": 1}))), &[]);
     assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
-    assert!(verify(&home).status.success());
+    assert!(unanchored(&verify(&home)));
 
     let path = home.root.join("approvals").join("journal.jsonl");
     let original = fs::read(&path).unwrap();
@@ -728,7 +747,7 @@ fn verify_rejects_a_bad_signature_and_a_reused_approval() {
     assert!(report.contains("signature"), "{report}");
 
     fs::write(&path, &original).unwrap();
-    assert!(verify(&home).status.success());
+    assert!(unanchored(&verify(&home)));
     let executed = evidence(&home)
         .into_iter()
         .rfind(|item| item.decision.outcome == DecisionOutcome::RequireApproval)
@@ -760,7 +779,7 @@ fn observe_does_not_hold_and_the_receipt_says_enforce_would_ask() {
     assert!(table.contains("enforce would ask"), "{table}");
     let verify = verify(&home);
     let report = String::from_utf8_lossy(&verify.stdout);
-    assert!(verify.status.success(), "{report}");
+    assert!(unanchored(&verify), "{report}");
     assert!(report.contains("approval journal: none"), "{report}");
 }
 
@@ -796,7 +815,7 @@ fn an_evidence_only_journal_still_verifies() {
     assert!(value.get("record").is_none(), "{line}");
     let verify = verify(&home);
     let report = String::from_utf8_lossy(&verify.stdout);
-    assert!(verify.status.success(), "{report}");
+    assert!(unanchored(&verify), "{report}");
     assert!(
         report.contains("1 receipts: 1 verified, 0 failed"),
         "{report}"
@@ -822,12 +841,17 @@ fn pending_changed_after_it_was_shown_is_not_signed() {
         .join("approvals")
         .join("pending")
         .join(format!("{id}.json"));
-    let approved = approve_on_tty_with(&home, &id, &|| {
-        let text = fs::read_to_string(&path).unwrap();
-        let edited = text.replace("\"shown\"", "\"changed\"");
-        assert_ne!(edited, text);
-        fs::write(&path, edited).unwrap();
-    });
+    let approved = approve_on_tty_with(
+        &home,
+        &id,
+        &|| {
+            let text = fs::read_to_string(&path).unwrap();
+            let edited = text.replace("\"shown\"", "\"changed\"");
+            assert_ne!(edited, text);
+            fs::write(&path, edited).unwrap();
+        },
+        &[],
+    );
     let text = String::from_utf8_lossy(&approved.stdout);
     let before = text.split("confirmation:").next().unwrap();
     assert!(
@@ -891,7 +915,7 @@ fn verify_rejects_an_execution_after_the_approval_window() {
     let env = [("PRAETORE_MCP_APPROVAL_TTL_SECONDS", "4")];
     let (responses, _, _) = wrap(&home, "enforce", &session(echo(7, json!({"n": 1}))), &env);
     let id = approval_id_from(tool_text(by_id(&responses, 7)));
-    let approved = approve_on_tty(&home, &id);
+    let approved = approve_on_tty_env(&home, &id, &env);
     assert!(
         approved.status.success(),
         "{}",
@@ -926,8 +950,14 @@ fn approvals_show_the_expiry_in_local_time_with_utc_and_what_is_left() {
     )
     .unwrap();
     let utc = file["expires_at"].as_str().unwrap();
-    // 2026-11-15T23:34:40Z -> "2026-11-15 23:34:40"
-    let utc_text = utc.trim_end_matches('Z').replace('T', " ");
+    // The stored timestamp can carry a fraction of a second. The line shows
+    // whole seconds: 2026-11-15T23:34:40.5Z -> "2026-11-15 23:34:40".
+    let utc_text = utc
+        .split('.')
+        .next()
+        .unwrap_or(utc)
+        .trim_end_matches('Z')
+        .replace('T', " ");
     let listed = run_env(
         &["approvals", "--dir", home.root.to_str().unwrap()],
         "",
@@ -952,7 +982,7 @@ fn the_status_tells_an_expired_unused_approval_from_an_executed_one() {
     let env = [("PRAETORE_MCP_APPROVAL_TTL_SECONDS", "3")];
     let (responses, _, _) = wrap(&home, "enforce", &session(echo(7, json!({"n": 1}))), &env);
     let id = approval_id_from(tool_text(by_id(&responses, 7)));
-    assert!(approve_on_tty(&home, &id).status.success());
+    assert!(approve_on_tty_env(&home, &id, &env).status.success());
     let held = held_evidence_id(&home);
     let status = praetore_mcp::approvals::status_by_evidence(&home).unwrap();
     assert!(status[&held].starts_with("approve by "), "{status:?}");
@@ -981,7 +1011,7 @@ fn the_status_tells_an_expired_unused_approval_from_an_executed_one() {
     let env = [("PRAETORE_MCP_APPROVAL_TTL_SECONDS", "3")];
     let (responses, _, _) = wrap(&home, "enforce", &session(echo(7, json!({"n": 1}))), &env);
     let id = approval_id_from(tool_text(by_id(&responses, 7)));
-    assert!(approve_on_tty(&home, &id).status.success());
+    assert!(approve_on_tty_env(&home, &id, &env).status.success());
     let (_, stderr, _) = wrap(&home, "enforce", &session(echo(8, json!({"n": 1}))), &[]);
     assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
     thread::sleep(Duration::from_secs(4));
@@ -1213,6 +1243,111 @@ fn approve_of_a_pending_call_with_an_unreadable_expiry_asks_for_no_code() {
 /// id (it could never be decided again, so the call would be stuck until
 /// it expired), and the rejected id is never executed.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+/// A decide that stopped after it appended the decision and before it
+/// removed the pending file: `approvals` prints the outcome and no
+/// commands for that id, and the session report counts it once, as
+/// decided, not also as pending. Seeded without hooks: the pending file is
+/// written back after a real decide.
+#[test]
+fn approvals_prints_no_commands_for_an_id_already_decided() {
+    use praetore_mcp::approvals::{self, HumanOutcome};
+    for (outcome, word) in [
+        (HumanOutcome::Reject, "reject"),
+        (HumanOutcome::Approve, "approve"),
+    ] {
+        let (_temp, home) = init_home();
+        require_echo(&home);
+        let (responses, _, _) = wrap(&home, "enforce", &session(echo(7, json!({"n": 1}))), &[]);
+        let decided = approval_id_from(tool_text(by_id(&responses, 7)));
+        let (responses, _, _) = wrap(&home, "enforce", &session(echo(8, json!({"n": 2}))), &[]);
+        let open = approval_id_from(tool_text(by_id(&responses, 8)));
+        let path = home
+            .root
+            .join("approvals")
+            .join("pending")
+            .join(format!("{decided}.json"));
+        let pending = fs::read(&path).unwrap();
+        approvals::decide(&home, &decided, outcome, None).unwrap();
+        fs::write(&path, &pending).unwrap();
+
+        let out = run(&["approvals", "--dir", home.root.to_str().unwrap()], "");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "{word}: {text}");
+        let block = |id: &str| {
+            text.split("\n\n")
+                .find(|block| block.starts_with(&format!("id         {id}\n")))
+                .unwrap_or_else(|| panic!("{word}: no block for {id}:\n{text}"))
+                .to_owned()
+        };
+        let decided_block = block(&decided);
+        assert!(
+            decided_block.contains(&format!("\ndecided: {word} already; ")),
+            "{word}: {decided_block}"
+        );
+        assert!(
+            !decided_block.contains("\napprove ") && !decided_block.contains("\nreject "),
+            "{word}: commands printed for a decided id: {decided_block}"
+        );
+        let open_block = block(&open);
+        assert!(
+            open_block.contains(&format!(" approve {open} --dir ")),
+            "{word}: {open_block}"
+        );
+
+        // Both sessions' reports, written again from the journal as it is
+        // now: the decided call is one approval row, decided, and only the
+        // open call is pending.
+        let names = |regen: bool| {
+            let mut names: Vec<String> = fs::read_dir(home.root.join("reports"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .filter(|name| name.ends_with(".json") && name.contains(".regen-") == regen)
+                .collect();
+            names.sort();
+            names
+        };
+        for name in names(false) {
+            let session = name
+                .trim_end_matches(".json")
+                .rsplit('-')
+                .next()
+                .unwrap()
+                .to_owned();
+            let out = run(
+                &[
+                    "report",
+                    "--dir",
+                    home.root.to_str().unwrap(),
+                    "--session",
+                    &session,
+                ],
+                "",
+            );
+            assert!(out.status.success(), "{word}: {out:?}");
+        }
+        let decided_key = if word == "reject" {
+            "rejected"
+        } else {
+            "approved"
+        };
+        let (mut decided_rows, mut pending_rows) = (0, 0);
+        for name in names(true) {
+            let document: Value = serde_json::from_str(
+                &fs::read_to_string(home.root.join("reports").join(&name)).unwrap(),
+            )
+            .unwrap();
+            let summary = &document["header"]["summary"];
+            decided_rows += summary[decided_key].as_u64().unwrap();
+            pending_rows += summary["pending"].as_u64().unwrap();
+        }
+        assert_eq!(decided_rows, 1, "{word}");
+        assert_eq!(
+            pending_rows, 1,
+            "{word}: the decided call is counted as pending too"
+        );
+    }
+}
+
 #[test]
 fn a_decided_id_whose_pending_file_was_left_is_not_reused() {
     use praetore_mcp::approvals::{self, HumanOutcome};
@@ -1269,9 +1404,368 @@ fn a_decided_id_whose_pending_file_was_left_is_not_reused() {
         assert_eq!(executions_of_decided, expected, "{outcome:?}");
         let verify = verify(&home);
         assert!(
-            verify.status.success(),
+            unanchored(&verify),
             "{}",
             String::from_utf8_lossy(&verify.stdout)
         );
     }
+}
+
+/// Runs `wrap` the way the MCP SDK's `stdio_client` launches a server: with
+/// only a few inherited variables (HOME, PATH, ...) and no
+/// `PRAETORE_MCP_APPROVAL_TTL_SECONDS` unless `env` names it.
+fn wrap_filtered_env(home: &Home, input: &str, env: &[(&str, &str)]) -> Output {
+    let server = fake_server();
+    let mut command = Command::new(bin());
+    command
+        .args([
+            "wrap",
+            "--dir",
+            home.root.to_str().unwrap(),
+            "--name",
+            "fake",
+            "--mode",
+            "enforce",
+            "--",
+            server.to_str().unwrap(),
+        ])
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for key in ["HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let mut child = command.spawn().unwrap();
+    // stdin is written and stdout and stderr are read on their own
+    // threads: written from here, a large input would block while `wrap`
+    // blocks writing its answers, and neither would end.
+    let mut stdin = child.stdin.take().unwrap();
+    let input = input.to_owned();
+    let writer = thread::spawn(move || match stdin.write_all(input.as_bytes()) {
+        Ok(()) => {}
+        // `wrap` refuses to start before it reads stdin (bad TTL).
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(error) => panic!("write stdin: {error}"),
+    });
+    let read = |mut pipe: Box<dyn std::io::Read + Send>| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).unwrap();
+            bytes
+        })
+    };
+    let stdout = read(Box::new(child.stdout.take().unwrap()));
+    let stderr = read(Box::new(child.stderr.take().unwrap()));
+    let status = wait_or_kill(&mut child, WRAP_TIMEOUT);
+    writer.join().unwrap();
+    Output {
+        status,
+        stdout: stdout.join().unwrap(),
+        stderr: stderr.join().unwrap(),
+    }
+}
+
+/// How long a wrap test waits for `wrap` to end.
+const WRAP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The exit status of `child`, waiting at most `limit`. Past it the
+/// process is killed and the test fails: a `wrap` that does not end must
+/// fail the test in seconds, not hang the run.
+fn wait_or_kill(child: &mut std::process::Child, limit: Duration) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "wrap did not finish within {} s; killed it",
+                limit.as_secs()
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Seconds between `created_at` and `expires_at` of the pending call that
+/// the response with `id` names.
+fn held_window(home: &Home, out: &Output, id: i64) -> i64 {
+    let stdout = String::from_utf8(out.stdout.clone()).unwrap();
+    let responses: Vec<Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let approval = approval_id_from(tool_text(by_id(&responses, id)));
+    let path = home
+        .root
+        .join("approvals")
+        .join("pending")
+        .join(format!("{approval}.json"));
+    let pending: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    let at = |key: &str| {
+        time::OffsetDateTime::parse(
+            pending[key].as_str().unwrap(),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap()
+    };
+    (at("expires_at") - at("created_at")).whole_seconds()
+}
+
+/// n18: `approval_ttl_seconds` in `config.toml` sets the approval window
+/// even when the client launches `wrap` with a filtered environment, and
+/// `PRAETORE_MCP_APPROVAL_TTL_SECONDS` wins over it when it is set.
+#[test]
+fn the_config_ttl_holds_under_a_filtered_environment_and_the_env_wins() {
+    let (_temp, home) = init_home();
+    require_echo(&home);
+    fs::write(
+        home.root.join("config.toml"),
+        "approval_ttl_seconds = 1800 # half an hour\n",
+    )
+    .unwrap();
+    let out = wrap_filtered_env(&home, &session(echo(7, json!({"n": 1}))), &[]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(held_window(&home, &out, 7), 1800, "{out:?}");
+
+    let out = wrap_filtered_env(
+        &home,
+        &session(echo(8, json!({"n": 2}))),
+        &[("PRAETORE_MCP_APPROVAL_TTL_SECONDS", "120")],
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(held_window(&home, &out, 8), 120, "{out:?}");
+
+    // m3: a quoted key is the key.
+    fs::write(
+        home.root.join("config.toml"),
+        "\"approval_ttl_seconds\" = 1800\n",
+    )
+    .unwrap();
+    let out = wrap_filtered_env(&home, &session(echo(10, json!({"n": 4}))), &[]);
+    assert_eq!(held_window(&home, &out, 10), 1800, "{out:?}");
+
+    // m4: the config wins over approvals/ttl-seconds.
+    fs::create_dir_all(home.root.join("approvals")).unwrap();
+    fs::write(home.root.join("approvals").join("ttl-seconds"), "300\n").unwrap();
+    fs::write(
+        home.root.join("config.toml"),
+        "approval_ttl_seconds = 1800\n",
+    )
+    .unwrap();
+    let out = wrap_filtered_env(&home, &session(echo(11, json!({"n": 5}))), &[]);
+    assert_eq!(
+        held_window(&home, &out, 11),
+        1800,
+        "config over ttl-seconds: {out:?}"
+    );
+    fs::remove_file(home.root.join("approvals").join("ttl-seconds")).unwrap();
+
+    // Without the config line, the old file and then the default apply.
+    fs::write(home.root.join("config.toml"), "report = true\n").unwrap();
+    let out = wrap_filtered_env(&home, &session(echo(9, json!({"n": 3}))), &[]);
+    assert_eq!(held_window(&home, &out, 9), 600, "{out:?}");
+}
+
+/// n18: an approval TTL out of 1..=86400, not a number, malformed, or a
+/// `config.toml` that cannot be read stops `wrap` at startup (exit 2, no
+/// server started, the cause on stderr) instead of using another value.
+#[test]
+fn a_bad_approval_ttl_stops_wrap_at_startup() {
+    let (_temp, home) = init_home();
+    let config = home.root.join("config.toml");
+    let cases: [(&str, Option<&str>, &str); 7] = [
+        (
+            "approval_ttl_seconds = 0\n",
+            None,
+            "from 1 to 86400 seconds, got 0",
+        ),
+        ("approval_ttl_seconds = 86401\n", None, "got 86401"),
+        (
+            "approval_ttl_seconds = abc\n",
+            None,
+            "\"abc\" is not an integer",
+        ),
+        ("approval_ttl_seconds 300\n", None, "line 1: expected"),
+        ("approval_ttl_seconds\t300\n", None, "line 1: expected"),
+        (
+            "",
+            Some("0"),
+            "PRAETORE_MCP_APPROVAL_TTL_SECONDS must be from 1",
+        ),
+        (
+            "",
+            Some("soon"),
+            "PRAETORE_MCP_APPROVAL_TTL_SECONDS \"soon\"",
+        ),
+    ];
+    for (text, env, says) in cases {
+        fs::write(&config, text).unwrap();
+        let env: Vec<_> = env
+            .map(|value| ("PRAETORE_MCP_APPROVAL_TTL_SECONDS", value))
+            .into_iter()
+            .collect();
+        // More than a pipe buffer: `wrap` exits before reading it, so the
+        // write always meets a closed pipe, as it did on a CI runner.
+        let padded = format!(
+            "{}{}",
+            session(echo(7, json!({"n": 1}))),
+            "\n".repeat(1 << 20)
+        );
+        let out = wrap_filtered_env(&home, &padded, &env);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{text:?} {env:?}: {stderr}");
+        assert!(out.stdout.is_empty(), "{text:?}: the server answered");
+        assert!(
+            stderr.contains("wrap did not start") && stderr.contains(says),
+            "{text:?} {env:?}: {stderr}"
+        );
+    }
+    // Unreadable: config.toml is a directory.
+    fs::remove_file(&config).unwrap();
+    fs::create_dir(&config).unwrap();
+    let out = wrap_filtered_env(&home, &session(echo(7, json!({"n": 1}))), &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("cannot read"), "{stderr}");
+}
+
+/// n2: an invalid `approvals/ttl-seconds` stops `wrap` even when a valid
+/// `PRAETORE_MCP_APPROVAL_TTL_SECONDS` would win. A home that kept a bad
+/// file next to the env var used to start; it no longer does (see the
+/// CHANGELOG).
+#[test]
+fn an_invalid_ttl_file_stops_wrap_even_with_a_valid_env_var() {
+    let (_temp, home) = init_home();
+    let file = home.root.join("approvals").join("ttl-seconds");
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    let mut failed = Vec::new();
+    for (value, says) in [
+        (
+            "0\n",
+            "approvals/ttl-seconds must be from 1 to 86400 seconds, got 0",
+        ),
+        ("soon\n", "approvals/ttl-seconds \"soon\" is not an integer"),
+    ] {
+        fs::write(&file, value).unwrap();
+        let env = [("PRAETORE_MCP_APPROVAL_TTL_SECONDS", "120")];
+        let out = wrap_filtered_env(&home, &session(echo(7, json!({"n": 1}))), &env);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if out.status.code() != Some(2)
+            || !out.stdout.is_empty()
+            || !stderr.contains("wrap did not start")
+            || !stderr.contains(says)
+        {
+            failed.push(format!(
+                "ttl-seconds {value:?} with env 120: exit {:?}, stderr {stderr}",
+                out.status.code()
+            ));
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// Runs `wrap` with `config.toml` holding `text` and checks that it refused
+/// to start (exit 2, no server output) with a message naming `config.toml`
+/// and containing `says`.
+fn assert_config_stops_wrap(text: &str, says: &str) {
+    let (_temp, home) = init_home();
+    fs::write(home.root.join("config.toml"), text).unwrap();
+    let out = wrap_filtered_env(&home, &session(echo(7, json!({"n": 1}))), &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{text:?}: {stderr}");
+    assert!(out.stdout.is_empty(), "{text:?}: the server answered");
+    assert!(
+        stderr.contains("wrap did not start")
+            && stderr.contains("config.toml")
+            && stderr.contains(says),
+        "{text:?}: {stderr}"
+    );
+}
+
+/// n1: `approval_ttl_seconds: 90000` (YAML style) names the key, so it is
+/// an error at startup, never a warning followed by the default 600.
+#[test]
+fn a_ttl_line_with_a_colon_stops_wrap_at_startup() {
+    assert_config_stops_wrap(
+        "approval_ttl_seconds: 90000\n",
+        "line 1: expected `approval_ttl_seconds = <seconds>`",
+    );
+}
+
+/// n1: a `config.toml` that starts with a byte order mark is an error at
+/// startup. Read as text, the BOM would hide the key on the first line and
+/// the default 600 would apply.
+#[test]
+fn a_config_toml_with_a_byte_order_mark_stops_wrap_at_startup() {
+    assert_config_stops_wrap("\u{feff}approval_ttl_seconds = 1800\n", "byte order mark");
+}
+
+/// M1: every TTL source that is set is read and checked, then the one of
+/// highest priority is used. An invalid value in any source stops `wrap`
+/// at startup (exit 2) and the message names that source, even when a
+/// source of higher priority is valid.
+#[test]
+fn every_ttl_source_is_checked_even_when_a_higher_one_wins() {
+    let (_temp, home) = init_home();
+    let config = home.root.join("config.toml");
+    let file = home.root.join("approvals").join("ttl-seconds");
+    let cases: [(&str, Option<&str>, Option<&str>, &str); 3] = [
+        (
+            "approval_ttl_seconds = 90000\n",
+            Some("120"),
+            None,
+            "config.toml approval_ttl_seconds must be from 1 to 86400 seconds, got 90000",
+        ),
+        (
+            "approval_ttl_seconds = abc\n",
+            Some("120"),
+            None,
+            "config.toml approval_ttl_seconds \"abc\" is not an integer",
+        ),
+        (
+            "approval_ttl_seconds = 1800\n",
+            None,
+            Some("0\n"),
+            "approvals/ttl-seconds must be from 1 to 86400 seconds, got 0",
+        ),
+    ];
+    let mut failed = Vec::new();
+    for (text, env, ttl_file, says) in cases {
+        fs::write(&config, text).unwrap();
+        match ttl_file {
+            Some(value) => {
+                fs::create_dir_all(file.parent().unwrap()).unwrap();
+                fs::write(&file, value).unwrap();
+            }
+            None => {
+                let _ = fs::remove_file(&file);
+            }
+        }
+        let env: Vec<_> = env
+            .map(|value| ("PRAETORE_MCP_APPROVAL_TTL_SECONDS", value))
+            .into_iter()
+            .collect();
+        let out = wrap_filtered_env(&home, &session(echo(7, json!({"n": 1}))), &env);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if out.status.code() != Some(2)
+            || !out.stdout.is_empty()
+            || !stderr.contains("wrap did not start")
+            || !stderr.contains(says)
+        {
+            failed.push(format!(
+                "{text:?} env {env:?} ttl-seconds {ttl_file:?}: exit {:?}, stderr {stderr}",
+                out.status.code()
+            ));
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
 }

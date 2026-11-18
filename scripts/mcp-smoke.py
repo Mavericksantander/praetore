@@ -307,7 +307,9 @@ def main():
     check("receipts: one DENY write_file deny-write",
           any("write_file" in l and "DENY" in l and "deny-write" in l for l in lines))
     verify = run(binary, "verify", "--dir", home)
-    check("verify exit 0", verify.returncode == 0)
+    # Without the heads kept elsewhere a clean journal is "not anchored": exit 3.
+    check("verify exits 3 (not anchored)", verify.returncode == 3, verify.stdout)
+    check("verify says UNANCHORED", verify.stdout.startswith("UNANCHORED "), verify.stdout)
     check("verify: 2 verified, 0 failed", "2 receipts: 2 verified, 0 failed" in verify.stdout)
 
     # Local approval, still on the same home: list_directory needs a person
@@ -399,7 +401,7 @@ def main():
         receipts.stdout,
     )
     verify = run(binary, "verify", "--dir", home)
-    check("verify after approval exits 0", verify.returncode == 0, verify.stdout)
+    check("verify after approval exits 3 (not anchored)", verify.returncode == 3, verify.stdout)
     check(
         "verify reports one approval execution",
         "0 failed" in verify.stdout and "1 decision(s), 1 execution(s)" in verify.stdout,

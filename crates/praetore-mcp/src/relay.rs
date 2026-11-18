@@ -10,6 +10,7 @@
 //! so whole lines are written under one mutex. The child's stderr is
 //! inherited and passes straight through.
 
+use crate::shown::Show;
 use crate::{
     gate::{Evaluator, Gate, GateError, Mode, Verdict},
     proxy::handle_client_line,
@@ -662,7 +663,7 @@ fn write_report(options: &WrapOptions, started_at: OffsetDateTime, log: &Session
         Ok(Ok(Some(generated))) => {
             eprintln!(
                 "praetore-mcp: session report: {}{}",
-                generated.pdf.display(),
+                generated.pdf.shown(),
                 if generated.verify_passed {
                     ""
                 } else {

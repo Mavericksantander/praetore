@@ -105,7 +105,7 @@ fn width(font: Font, size: f32, spacing: f32, text: &str) -> f32 {
 /// journal (control, zero-width and bidi characters become `\u{..}`), then
 /// reduced to printable ASCII.
 fn ascii(text: &str) -> String {
-    praetore_core::display::escape_bounded(text, 400)
+    crate::shown::bounded(text, 400)
         .chars()
         .map(|c| match c {
             ' '..='~' => c,
@@ -1023,6 +1023,23 @@ fn log_pages(report: &Report) -> Vec<Canvas> {
             "No approval record for this session.",
         );
     }
+    flow.y += 18.0;
+    flow.section("CHECK LATER // BOTH HEADS AT CLOSE", &[]);
+    for line in [
+        "Keep both heads off this machine. This command fails if either journal no longer ends at its head".to_owned(),
+        "(records removed or added since the session closed). DIR is the home; run it as one line:".to_owned(),
+    ]
+    .into_iter()
+    .chain(report.close_heads.verify_command_lines())
+    {
+        let y = flow.row_start("CHECK LATER", &[]);
+        let font = if line.starts_with("praetore-mcp") || line.starts_with("  --") {
+            Font::Mono
+        } else {
+            Font::Sans
+        };
+        flow.canvas().text(font, 7.6, INK, LEFT, y, &ascii(&line));
+    }
     flow.y += 10.0;
     if flow.y + 24.0 <= BODY_BOTTOM {
         let y = flow.y;
@@ -1234,6 +1251,30 @@ mod tests {
             assert_eq!(count(&pdf, format!("(tool_{index})").as_bytes()), 1);
         }
         assert_eq!(count(&pdf, b"VERIFY FAILED"), 0);
+    }
+
+    #[test]
+    fn the_pdf_prints_the_command_that_checks_both_heads_at_close() {
+        let mut report = sample(2, true);
+        let receipt = "a".repeat(64);
+        let approval = "b".repeat(64);
+        report.close_heads = crate::report::Heads {
+            receipt: Some((3, receipt.clone())),
+            approval: Some(approval.clone()),
+        };
+        let pdf = render(&report);
+        assert_eq!(count(&pdf, b"(praetore-mcp verify --dir DIR)"), 1);
+        assert_eq!(
+            count(&pdf, format!("(  --expected-head {receipt})").as_bytes()),
+            1
+        );
+        assert_eq!(
+            count(
+                &pdf,
+                format!("(  --expected-approval-head {approval})").as_bytes()
+            ),
+            1
+        );
     }
 
     #[test]

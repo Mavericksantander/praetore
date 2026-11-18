@@ -31,21 +31,21 @@ macOS arm64 run on 2026-10-30 did not include local approval.
 ### Without Rust
 
 Download one archive and `SHA256SUMS` from the published
-[v0.3.5 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.5)
-(commit `b6d668acb8e153a47a9478fe96b92a0c9eafb423`). That release is not a
+[v0.3.6 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.6)
+(commit `27ceddbbd295162ca351ea5dfa47fe8bb37315a3`). That release is not a
 build of the current `main` branch. You do not clone the repository.
 
 | Machine | Archive |
 | --- | --- |
-| macOS Apple silicon | `praetore-mcp-v0.3.5-aarch64-apple-darwin.tar.gz` |
-| macOS Intel | `praetore-mcp-v0.3.5-x86_64-apple-darwin.tar.gz` |
-| Linux x86_64 | `praetore-mcp-v0.3.5-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS Apple silicon | `praetore-mcp-v0.3.6-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `praetore-mcp-v0.3.6-x86_64-apple-darwin.tar.gz` |
+| Linux x86_64 | `praetore-mcp-v0.3.6-x86_64-unknown-linux-gnu.tar.gz` |
 
-v0.3.5 has no Windows binary and no Linux ARM binary, and there is no brew
+v0.3.6 has no Windows binary and no Linux ARM binary, and there is no brew
 installer. Check the archive before you open it. On macOS:
 `shasum -a 256 -c SHA256SUMS --ignore-missing`. On Linux:
 `sha256sum -c SHA256SUMS --ignore-missing`. The published digests are in
-[Install from the v0.3.5 release](../../docs/install-prebuilt.md). If
+[Install from the v0.3.6 release](../../docs/install-prebuilt.md). If
 `SHA256SUMS` does not match that list, stop. Then `tar -xzf` the archive.
 It contains a directory of the same name with `praetore-mcp`, `LICENSE` and
 `NOTICE`.
@@ -77,9 +77,16 @@ for a POSIX shell. They run as printed even when the binary is not on your
 `praetore-mcp`, which needs it on `PATH`. On Windows they are written as
 before.
 
+A path or a name that holds a control character (an escape sequence,
+`\r`, `\n`) or a zero-width or bidi character is never printed as is. In
+messages, in the dashboard and in the PDF report it is written as
+`\u{..}`: a home named `a<ESC>[2Kb` shows as `a\u{1b}[2Kb`. In a
+command to copy, such a path is written as `$'...'` with `\xHH` escapes,
+which bash and zsh read back as the exact path.
+
 Checking the Sigstore signature of `SHA256SUMS` is optional. It needs
-`cosign`. For v0.3.5, pass
-`--certificate-github-workflow-sha b6d668acb8e153a47a9478fe96b92a0c9eafb423`
+`cosign`. For v0.3.6, pass
+`--certificate-github-workflow-sha 27ceddbbd295162ca351ea5dfa47fe8bb37315a3`
 so the check does not need a clone. See
 [Release artifact integrity](../../docs/operations.md#release-artifact-integrity).
 The required check is the digest command above.
@@ -167,15 +174,16 @@ praetore-mcp receipts --tail 5
 praetore-mcp verify
 ```
 
-`OK 0 receipts` means the journal is empty. It does not mean a server was
+`UNANCHORED 0 receipts` means the journal is empty. It does not mean a server was
 wrapped.
 
 **From 0.3.5, the policy `init` writes is default deny.** It has no rules
 and no `allow-all-mcp-tool-calls` rule. In enforce mode every `tools/call`
 that no rule allows is denied, including tools you have not looked at and
-tools a server adds later. Observe mode does not block anything, so the
-observe step above works with no rules: the receipts show `DENY` with no
-rule id. `init` needs no rule for the client to start the server or list
+tools a server adds later. Observe mode forwards a DENY instead of blocking
+it, so the observe step above works with no rules: the receipts show `DENY`
+with no rule id. Observe still refuses what both modes refuse (see
+"Limits", item 6). `init` needs no rule for the client to start the server or list
 its tools: only `tools/call` is evaluated. `init` in v0.3.4 and earlier
 wrote an allow-all rule instead (`allow-all-mcp-tool-calls`); see "A home
 from v0.3.4" below.
@@ -238,14 +246,14 @@ wrapped.
 
 ```sh
 praetore-mcp receipts --tail 5
-praetore-mcp verify    # OK N receipts: N verified, 0 failed; prints the journal head
+praetore-mcp verify    # UNANCHORED N receipts: N verified, 0 failed (exit 3); prints the two heads to keep elsewhere
 ```
 
 The v0.3.3 `praetore-mcp verify` does not read 0.3.4 receipts. A 0.3.4
 journal line is `{"seq","prev","evidence"}`. v0.3.3 reads each line as a
-bare evidence document. This release's `praetore-mcp verify` still reads a
-v0.3.3 journal: those lines are unchained and may only come before the
-first chained entry.
+bare evidence document. This release's `praetore-mcp verify` fails on a
+v0.3.3 line wherever it is: it has no `seq` or `prev`, so it is outside
+the chain. Move a v0.3.3 journal out of `receipts/` to keep it.
 
 ### A home from v0.3.4
 
@@ -314,18 +322,31 @@ expired is marked expired, apart from one that was approved and executed.
 A held call nobody decided before it expired reads Expired (Vencida) in
 every view, and is no longer listed to decide: `approvals` prints
 `expired: run the agent again so the call is held again` for it in place
-of the `approve` and `reject` commands.
+of the `approve` and `reject` commands. If an `approve` or `reject` stopped
+after it signed the decision and before it removed the pending file,
+`approvals` prints `decided: <outcome> already; ...` for that id and no
+commands; holding the same call again removes the file.
 `praetore-mcp reject <id>` records a rejection, and that call is not
 forwarded. A pending call expires after 10 minutes by default. The
 terminal check is cooperative: a process that can act as this user can
 open a terminal and approve. It is not a guarantee that a person reviewed
-the call. Deleting or truncating `approvals/journal.jsonl` lets an
-approval be used again. A DENY rule on the same tool wins: the call is
+the call. Cutting or deleting `approvals/journal.jsonl` alone does not
+let a used approval run again; cutting the end of the receipts journal as
+well does, and only a saved head finds it (point 3 below). A DENY rule on the same tool wins: the call is
 refused and approval is not asked. Limits of that flow are in point 3
 below. The evidence id in the chat matches the `EVIDENCE ID`
 column. To undo:
 `praetore-mcp uninstall --client cursor --yes`, or restore the
 `.praetore-backup-*` file next to the config, then restart the client.
+
+If `wrap` writes the receipt of an approved call and then cannot write
+its execution record (a crash, a full disk, `approvals/journal.jsonl` not
+writable), the call is not forwarded. From then on `verify` reports that
+receipt, every time, with `has no execution of it for that receipt` and
+exit code 1. The approval is spent: the same call is held again under a
+new pending id. Fix the disk or the file mode, ask for the call again,
+and approve the new id. The old failure stays in `verify`; write down why
+it happened next to the heads you keep.
 
 ### Looking at the receipts in a browser
 
@@ -408,7 +429,7 @@ The verification status, per receipt and for the whole journal, comes from
 the same code as `praetore-mcp verify` and is also shown in the sidebar. It
 covers the receipts only. It includes the journal order (seq/prev) and the
 journal head. Keep the head outside this machine. `--expected-head HEX`
-works as it does for `verify`. The result is kept in memory and computed
+and `--expected-approval-head HEX` work as they do for `verify`. The result is kept in memory and computed
 again when any file `verify` reads (the journal files, the attester and
 issuer pins, the approver pin, the approval journal) changes length,
 modification time, change time or inode. On a platform without change times
@@ -498,7 +519,7 @@ When the report is written, `wrap` prints where to see it, after its path:
 
 ```
 praetore-mcp: session report: /home/user/.praetore/mcp/reports/session-20261116T030240Z-560f69f7.pdf
-praetore-mcp: to see and download it, run '/home/user/praetore-mcp-v0.3.5-x86_64-unknown-linux-gnu/praetore-mcp' dashboard --dir '/home/user/.praetore/mcp' --port 8787 and open http://127.0.0.1:8787/#/sessions/560f69f7 (a dashboard on another port: #/sessions/560f69f7 there)
+praetore-mcp: to see and download it, run '<dir>/praetore-mcp' dashboard --dir '/home/user/.praetore/mcp' --port 8787 and open http://127.0.0.1:8787/#/sessions/560f69f7 (a dashboard on another port: #/sessions/560f69f7 there)
 ```
 
 The dashboard writes nothing under the home, so `wrap` cannot tell whether
@@ -537,6 +558,45 @@ installs no handler: the signal ends it at once, as in 0.3.5.
 
 `report = false` in `DIR/config.toml` turns reports off for every session
 of that home. `praetore-mcp install` does not add `--no-report`.
+
+### Approval TTL
+
+A pending approval stays open 10 minutes by default. To change it for a
+home, add this line to `DIR/config.toml`:
+
+```toml
+approval_ttl_seconds = 1800
+```
+
+`wrap` reads and checks every source that is set, then uses the first
+one in this order:
+
+1. `PRAETORE_MCP_APPROVAL_TTL_SECONDS` in the environment of `wrap`;
+2. `approval_ttl_seconds` in `DIR/config.toml`;
+3. the integer in `DIR/approvals/ttl-seconds` (older setting, still read);
+4. 600 seconds.
+
+Use the config line when an MCP client starts `wrap`. Many clients pass
+only a few variables to the servers they start (the MCP Python SDK's
+`stdio_client` passes HOME, PATH and a few more), so an exported
+`PRAETORE_MCP_APPROVAL_TTL_SECONDS` may never reach `wrap`. The config
+file is read from the home, whatever the environment.
+
+`wrap` checks the TTL before it starts the server. A value outside 1 to
+86400 or not an integer in any of the three sources, a malformed or
+repeated `approval_ttl_seconds` line (`approval_ttl_seconds: 1800` with a
+colon included), a `config.toml` that starts with a byte order mark, or a
+`config.toml` or `ttl-seconds` that cannot be read stops `wrap` with exit code 2 and the cause, naming
+the source, on stderr. That holds even when a source of higher priority
+is valid: with `PRAETORE_MCP_APPROVAL_TTL_SECONDS=120` set,
+`approval_ttl_seconds = 90000` still stops `wrap`:
+
+```
+praetore-mcp: approval TTL: config.toml approval_ttl_seconds must be from 1 to 86400 seconds, got 90000; wrap did not start
+```
+
+A bad value is never skipped in favour of another source. Other problems in `config.toml`
+(a bad `report` value, an unknown key) stay warnings.
 
 The report is a view of the journal: it signs nothing, changes no journal
 and takes no part in a decision. If it cannot be written, the reason goes
@@ -577,8 +637,8 @@ Read these before relying on anything above.
    receipts.
 3. **Local approval is cooperative.** In enforce mode a REQUIRE_APPROVAL
    call is not forwarded. The tool error names an approval id and the
-   command to run, for example `'/home/user/praetore-mcp-v0.3.5-x86_64-unknown-linux-gnu/praetore-mcp' approve <id> --dir '/home/user/.praetore/mcp'`
-   (the real paths of the running binary, here in the directory the
+   command to run, for example `'<dir>/praetore-mcp' approve <id> --dir '/home/user/.praetore/mcp'`
+   (the real paths of the running binary, `<dir>` being the directory the
    archive was extracted to, and of the home).
    `praetore-mcp approvals` lists pending calls (server, tool, a short form
    of the arguments, expiry). `approve` works only in an interactive
@@ -587,16 +647,20 @@ Read these before relying on anything above.
    arguments. It continues only if that
    code is typed back. `reject <id>` records a rejection and the call is not
    forwarded. The approval matches one server, one tool and the canonical
-   arguments, expires after 10 minutes unless
-   `PRAETORE_MCP_APPROVAL_TTL_SECONDS` or `approvals/ttl-seconds` says
-   otherwise (1 to 86400 seconds), and is consumed by one later call. A
+   arguments, expires after 10 minutes unless the approval TTL says
+   otherwise (1 to 86400 seconds, see "Approval TTL" below), and is
+   consumed by one later call; see
+   [the evasion matrix](../../docs/security/evasion-matrix.md). A
    second identical call asks again. Different arguments do not match.
    A process that can act as this user can open a terminal and approve.
    That is not a guarantee that a person reviewed the call. The terminal
-   check is cooperative. Deleting or truncating `approvals/journal.jsonl`
-   lets an approval be used again. `verify` does not detect that deletion
-   or truncation unless you compare, by hand, the approval head it prints.
-   There is no flag for that head. The v0.3.3 `praetore-mcp verify` does
+   check is cooperative. The forwarded call's receipt names the approval
+   id, so cutting or deleting `approvals/journal.jsonl` alone does not let
+   a used approval run again, and `verify` fails on that receipt. Cutting
+   the end of the receipts journal as well lets it run again; `verify`
+   detects that only with `--expected-head HEX` or
+   `--expected-approval-head HEX`, a head printed earlier and kept off this
+   machine; the command is in the README, Local approval. The v0.3.3 `praetore-mcp verify` does
    not read 0.3.4 receipts. Observe mode
    does not hold the call; `praetore-mcp receipts` shows
    `enforce would ask` on that receipt.
@@ -625,10 +689,15 @@ Read these before relying on anything above.
    the file afterwards. Anything that changes the filesystem in between (for
    example replacing a directory with a symlink) is not seen by the
    decision.
-6. **Observe mode does not block anything.** It records what enforce would
-   have decided, labeled `praetore.mode: observe` in the signed receipt. Use
-   it to try a policy, not to stop calls. In enforce, a tool that no rule
-   allows is denied by default.
+6. **Observe mode does not block DENY.** It records what enforce would
+   have decided, labeled `praetore.mode: observe` in the signed receipt, and
+   forwards the call. Use it to try a policy, not to stop calls. It still
+   refuses, as enforce does: a `tools/call` the policy does not classify, a
+   client line it cannot parse that may name a `safety*` tool, a client
+   line over 32 MiB, and a whole batch when a `tools/call` in it is refused.
+   When the home cannot be loaded, every `tools/call` and every client line
+   that cannot be parsed is refused. In enforce, a tool that no rule allows
+   is denied by default.
 7. **The proxy is cooperative.** Whoever can edit the client config can
    remove the wrapper. The proxy does not see actions the server takes on its
    own initiative.
@@ -659,7 +728,7 @@ Read these before relying on anything above.
 | The server does not start; `wrap` exits with 127 | The client could not find the server command (for example `npx`) with the PATH apps get from the desktop | Put the absolute path in the config, e.g. `/opt/homebrew/bin/npx` (check with `which npx`), then `install` again. In the macOS check, both apps found Homebrew's `npx` without this. |
 | `install` says the config `is not strict JSON` | The file has comments or trailing commas (JSONC) | Remove them, or wrap the server by hand with `praetore-mcp wrap ... -- <command>`. The file is never rewritten in this case. |
 | `install --mode enforce` says `nothing to change` / `already wrapped` and exits 0 | The entry is already wrapped. `install` does not change `--mode` on a wrapped entry. Exit 0 leaves the mode already in the config | `praetore-mcp uninstall --client <client> --yes`, then `praetore-mcp install --client <client> --mode enforce --yes`, then restart the client. Or edit `--mode` in the config and restart. |
-| `install` or `uninstall` prints `not modifying ... without confirmation; re-run with --yes` and exits 1 | stdin is not a terminal, and `--yes` was not passed. The file was not changed | Read the dry-run, then re-run with `--yes`. A later `verify` that prints `OK 0 receipts` means the journal is empty. |
+| `install` or `uninstall` prints `not modifying ... without confirmation; re-run with --yes` and exits 1 | stdin is not a terminal, and `--yes` was not passed. The file was not changed | Read the dry-run, then re-run with `--yes`. A later `verify` that prints `UNANCHORED 0 receipts` means the journal is empty. |
 | The same Cursor file is listed twice when running `install` from `~` | A build up to `9735974`: `~/.cursor/mcp.json` and `./.cursor/mcp.json` are the same file | Harmless (the second pass is skipped). Current builds list it once ([#52](https://github.com/Mavericksantander/praetore/pull/52)). |
 | `praetore-mcp wrap --help` fails with `unexpected argument "--help"` | A build up to `9735974`, before per-command help ([#49](https://github.com/Mavericksantander/praetore/pull/49)) | Reinstall (see the README's Install section), or use `praetore-mcp --help`, which lists every option. |
 | `another praetore-mcp policy command is running (lock …)` | A previous `policy` command was interrupted | If no other `policy` command is running, delete `~/.praetore/mcp/policy.json.lock`. |
