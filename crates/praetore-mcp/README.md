@@ -687,7 +687,7 @@ Things to know:
 * **Ambiguous lines** are lines that this proxy and the server could split or
   read differently. Enforce refuses them with `-32700` (`id: null`). Observe
   forwards them unchanged, warns, and evaluates and records **every**
-  `tools/call` reading it can find. Two kinds are detected:
+  `tools/call` reading it can find. Three kinds are detected:
   * **Bare carriage returns.** The proxy frames on `\n`, and JSON treats
     `\r` as whitespace. Universal-newline readers end a line at `\r`, `\n`
     or `\r\n`: the MCP Python SDK (`TextIOWrapper`, `newline=None`) and
@@ -706,6 +706,18 @@ Things to know:
     if a message-level or `params` key is a case variant of `method`,
     `params`, `id`, `jsonrpc`, `name` or `arguments`. In observe, both the
     exact-key and the Go (case-folded, last-wins) readings are recorded.
+  * **Numbers not in canonical form.** The server gets the client's bytes
+    and parses each number itself. A number in the `params` of a
+    `tools/call` is canonical when its text is exactly what the value
+    prints as: `50`, `50.0`, `49.99999999999999`, `0.1`. Any other text
+    makes the line ambiguous: more digits than an f64 holds
+    (`49.9999999999999965` is 50.0 as an f64, and another value for a
+    decimal parser), `50.00`, an exponent form such as `1e2` or `1e+21`,
+    `-0`, and an integer above 2^64 - 1. The stderr line names the number
+    and the form to send. In observe the value recorded is the correctly
+    rounded f64. A client that prints large or small floats with an
+    exponent (JavaScript and Python do, for example `1e+21`) is refused in
+    enforce for those values.
 * Client lines over 32 MiB are refused in both modes, with a stderr
   warning: they are not parsed, so they cannot be checked for a `safety*`
   tool (G7).

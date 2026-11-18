@@ -67,6 +67,25 @@
   number literals through `wrap` in both modes and runs `verify`
   (`tests/journal_verified_line.rs`).
 
+- **praetore-mcp: the gate decided on a number the server did not read.**
+  `serde_json` was built without `float_roundtrip`, so the proxy read
+  `49.9999999999999965` as 49.99999999999999 while it forwarded the
+  original bytes, which the server reads as 50.0. A rule `DENY amount >=
+  50` let that call through with an ALLOW receipt that verified; the same
+  literal skipped a REQUIRE_APPROVAL rule and misread `Exact`, `In`, `>`
+  and `<=`. A literal such as `99.9999999999999929` also left a receipt
+  that `verify` could not read, after which enforce refused every call.
+  `serde_json` is now built with `float_roundtrip` in praetore-mcp,
+  praetore-core, praetore-verify and praetore-receipt, and a number in the
+  `params` of a `tools/call` whose text is not the canonical form of its
+  value makes the line ambiguous: enforce refuses it and names the form to
+  send, observe forwards it and warns. This also refuses `50.00`, exponent
+  forms such as `1e2`, `-0` and integers above 2^64 - 1 in enforce. CI
+  checks the feature in every package that ships `serde_json`
+  (`scripts/check-float-roundtrip.sh`) and runs a table of boundary
+  literals against a server that logs the value it read
+  (`tests/numeric_gate.rs`).
+
 - **praetore-mcp: what observe mode refuses, and what a DENY shows.** The
   help, the `init` output, the READMEs and the GUIDE said observe mode
   never blocks (the 0.3.5 entry below says so too). It records a DENY and

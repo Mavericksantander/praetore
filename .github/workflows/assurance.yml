@@ -118,6 +118,14 @@ jobs:
         run: make demo demo-verify
       - name: Receipt verification demo (DEMO/TEST-ONLY keys)
         run: ./demo/verify-receipt.sh
+      - name: serde_json is built with float_roundtrip in every package that ships it
+        run: scripts/check-float-roundtrip.sh
+      - name: The gate decides on the number the server reads (boundary literals, output shown)
+        run: |
+          set -euo pipefail
+          output="$(cargo test --locked -p praetore-mcp --test numeric_gate -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok\. 2 passed" <<<"$output" || { echo "::error::expected the 2 tests of tests/numeric_gate.rs to run and pass"; exit 1; }
       - name: Every appended receipt verifies (random floats and literals, output shown)
         run: |
           set -euo pipefail
