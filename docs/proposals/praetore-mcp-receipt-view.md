@@ -61,9 +61,12 @@ estado no es esta vista: es `{status: "error", error}` y cada `check` del
 recibo queda `not_run` porque no hay resultado.
 
 El objeto hermano `verify` (función `verify_view`, no este esquema) tiene,
-cuando `verify` termina: `status` (`ok` o `fail`), `total`, `verified`,
+cuando `verify` termina: `status` (`ok` o `fail`), `assurance`
+(`anchored`, `unanchored` o `failed`), `total`, `verified`,
 `failed`, `failures`, `chained`, `unchained`, `head` (`{next_seq, prev}`
 o `null`), `expected_head`, `attester_pin`, `issuer_pins` y `approval`
-(`{decisions, executions, head}`). `failed` cuenta entradas de
+(`{decisions, executions, head, expected_head}`). `failed` cuenta entradas de
 `failures`, no líneas sin verificar: un `--expected-head` que no coincide
-deja `verified == total` y `failed == 1`.
+deja `verified == total` y `failed == 1`. `status` sigue siendo `ok`
+cuando no hay fallos aunque falten las anclas; en ese caso `assurance` es
+`unanchored`.

@@ -135,6 +135,7 @@ fn assert_check(check: &Value, status: &str, error: Option<&str>) {
 
 const VERIFY_KEYS: &[&str] = &[
     "approval",
+    "assurance",
     "attester_pin",
     "chained",
     "expected_head",
@@ -180,6 +181,9 @@ fn a_valid_receipt_is_ok_and_exposes_the_view_fields() {
     let view = &state["verify"];
     assert_eq!(keys(view), keys(&json_keys(VERIFY_KEYS)));
     assert_eq!(view["status"], "ok");
+    // No heads were given, so verify would exit 3. The dashboard view still
+    // reports status ok; assurance is the field that names that gap.
+    assert_eq!(view["assurance"], "unanchored");
     assert_eq!(view["total"], 1);
     assert_eq!(view["verified"], 1);
     assert_eq!(view["failed"], 0);
@@ -192,11 +196,17 @@ fn a_valid_receipt_is_ok_and_exposes_the_view_fields() {
     assert_eq!(view["head"]["prev"].as_str().unwrap().len(), 64);
     assert_eq!(
         keys(&view["approval"]),
-        keys(&json_keys(&["decisions", "executions", "head"]))
+        keys(&json_keys(&[
+            "decisions",
+            "executions",
+            "expected_head",
+            "head"
+        ]))
     );
     assert_eq!(view["approval"]["decisions"], 0);
     assert_eq!(view["approval"]["executions"], 0);
     assert!(view["approval"]["head"].is_null());
+    assert!(view["approval"]["expected_head"].is_null());
 
     let row = &state["receipts"][0];
     assert_eq!(keys(row), keys(&json_keys(RECEIPT_KEYS)));
