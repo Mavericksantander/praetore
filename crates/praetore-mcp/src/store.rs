@@ -71,19 +71,19 @@ impl Home {
         self.root.join("keys")
     }
     pub fn issuer_key(&self) -> PathBuf {
-        self.keys_dir().join("issuer.local-dev.key")
+        self.keys_dir().join(crate::keys::ISSUER_FILE)
     }
     pub fn agent_key(&self) -> PathBuf {
-        self.keys_dir().join("agent.local-dev.key")
+        self.keys_dir().join(crate::keys::AGENT_FILE)
     }
     pub fn attester_key(&self) -> PathBuf {
-        self.keys_dir().join("attester.local-dev.key")
+        self.keys_dir().join(crate::keys::ATTESTER_FILE)
     }
     /// Local approver key, distinct from the issuer, agent and attester.
     /// Not part of [`Self::is_initialized`]: a home from v0.3.3 does not
     /// have it until `init` is run again.
     pub fn approver_key(&self) -> PathBuf {
-        self.keys_dir().join("approver.local-dev.key")
+        self.keys_dir().join(crate::keys::APPROVER_FILE)
     }
     pub fn agent(&self) -> PathBuf {
         self.root.join("agent.json")
@@ -146,6 +146,8 @@ pub enum InitOutcome {
 /// untouched; a partially initialized one is an error.
 pub fn init(home: &Home) -> Result<InitOutcome, String> {
     if home.is_initialized() {
+        // A symlink at keys/ or at a key file must not count as initialized.
+        crate::keys::check_installed(&home.keys_dir())?;
         return if ensure_approver_key(home)? {
             Ok(InitOutcome::ApproverKeyAdded)
         } else {
@@ -195,9 +197,14 @@ pub fn init(home: &Home) -> Result<InitOutcome, String> {
         .validate()
         .map_err(|e| format!("default policy invalid: {e}"))?;
 
-    write_secret(home.issuer_key(), "issuer", &issuer_secret)?;
-    write_secret(home.agent_key(), "agent", &agent_secret)?;
-    write_secret(home.attester_key(), "evidence-attester", &attester_secret)?;
+    write_secret(home, crate::keys::ISSUER_FILE, "issuer", &issuer_secret)?;
+    write_secret(home, crate::keys::AGENT_FILE, "agent", &agent_secret)?;
+    write_secret(
+        home,
+        crate::keys::ATTESTER_FILE,
+        "evidence-attester",
+        &attester_secret,
+    )?;
     write_new(&home.agent(), &to_pretty(&agent)?, 0o644)?;
     write_new(&home.authority(), &to_pretty(&authority)?, 0o644)?;
     let pin_line = pin
@@ -253,12 +260,12 @@ fn public_matches_existing(
     home: &Home,
     public: &praetore_core::VerifiedPublicKey,
 ) -> Result<bool, String> {
-    for (path, role) in [
-        (home.issuer_key(), "issuer"),
-        (home.agent_key(), "agent"),
-        (home.attester_key(), "evidence-attester"),
+    for (name, role) in [
+        (crate::keys::ISSUER_FILE, "issuer"),
+        (crate::keys::AGENT_FILE, "agent"),
+        (crate::keys::ATTESTER_FILE, "evidence-attester"),
     ] {
-        let secret = read_secret(&path, role)?;
+        let secret = read_secret(home, name, role)?;
         if AgentKeyPair::from_secret_bytes(&secret).public_key() == *public {
             return Ok(true);
         }
@@ -268,7 +275,7 @@ fn public_matches_existing(
 
 fn write_approver_pair(home: &Home, secret: &[u8; 32]) -> Result<(), String> {
     let public = AgentKeyPair::from_secret_bytes(secret).public_key();
-    write_secret(home.approver_key(), "approver", secret)?;
+    write_secret(home, crate::keys::APPROVER_FILE, "approver", secret)?;
     write_new(
         &home.approver_pin(),
         &format!("{}\n", hex::encode(public.as_bytes())),
@@ -307,7 +314,7 @@ fn random_secret() -> Zeroizing<[u8; 32]> {
     secret
 }
 
-fn write_secret(path: PathBuf, role: &str, secret: &[u8; 32]) -> Result<(), String> {
+fn write_secret(home: &Home, name: &str, role: &str, secret: &[u8; 32]) -> Result<(), String> {
     let file = KeyFile {
         warning: KEY_WARNING.into(),
         role: role.into(),
@@ -317,7 +324,7 @@ fn write_secret(path: PathBuf, role: &str, secret: &[u8; 32]) -> Result<(), Stri
     let text = Zeroizing::new(to_pretty(&file)?);
     // Wipe the hex copy of the secret held by the struct.
     drop(Zeroizing::new(file.secret_key_hex));
-    write_new(&path, &text, 0o600)
+    crate::keys::KeyPath::create(&home.keys_dir(), name, &text)
 }
 
 /// Writes a file that must not exist yet (O_EXCL), with Unix `mode`.
@@ -393,9 +400,10 @@ fn read(path: &Path) -> Result<String, String> {
     fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.shown()))
 }
 
-fn read_secret(path: &Path, role: &str) -> Result<Zeroizing<[u8; 32]>, String> {
-    check_secret_permissions(path)?;
-    let text = Zeroizing::new(read(path)?);
+fn read_secret(home: &Home, name: &str, role: &str) -> Result<Zeroizing<[u8; 32]>, String> {
+    let path = home.keys_dir().join(name);
+    let mut key = crate::keys::KeyPath::open(&home.keys_dir(), name)?;
+    let text = key.read_to_string()?;
     let file: KeyFile = serde_json::from_str(&text)
         .map_err(|_| format!("{} is not a praetore-mcp key file", path.shown()))?;
     let hex_secret = Zeroizing::new(file.secret_key_hex);
@@ -419,35 +427,12 @@ fn read_secret(path: &Path, role: &str) -> Result<Zeroizing<[u8; 32]>, String> {
     Ok(secret)
 }
 
-#[cfg(unix)]
-fn check_secret_permissions(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = fs::metadata(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.shown()))?
-        .permissions()
-        .mode();
-    if mode & 0o077 != 0 {
-        return Err(format!(
-            "{} is accessible by group/others (mode {:o}); run: chmod 600 {}",
-            path.shown(),
-            mode & 0o777,
-            path.shown()
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn check_secret_permissions(_path: &Path) -> Result<(), String> {
-    Ok(())
-}
-
 pub(crate) fn approver_secret(home: &Home) -> Result<Zeroizing<[u8; 32]>, String> {
-    read_secret(&home.approver_key(), "approver")
+    read_secret(home, crate::keys::APPROVER_FILE, "approver")
 }
 
 pub(crate) fn attester_secret(home: &Home) -> Result<Zeroizing<[u8; 32]>, String> {
-    read_secret(&home.attester_key(), "evidence-attester")
+    read_secret(home, crate::keys::ATTESTER_FILE, "evidence-attester")
 }
 
 pub fn read_attester_pin(path: &Path) -> Result<praetore_core::VerifiedPublicKey, String> {
@@ -494,9 +479,10 @@ pub fn load(home: &Home) -> Result<LoadedHome, String> {
             crate::commands::command("init", &home.root)
         ));
     }
-    let agent_secret = read_secret(&home.agent_key(), "agent")?;
+    crate::keys::check_installed(&home.keys_dir())?;
+    let agent_secret = read_secret(home, crate::keys::AGENT_FILE, "agent")?;
     let agent_key = AgentKeyPair::from_secret_bytes(&agent_secret);
-    let attester_secret = read_secret(&home.attester_key(), "evidence-attester")?;
+    let attester_secret = read_secret(home, crate::keys::ATTESTER_FILE, "evidence-attester")?;
     let attester_key = EvidenceAttesterKey::from_secret_bytes(&attester_secret);
     let agent = AgentIdentity::from_json(&read(&home.agent())?)
         .map_err(|e| format!("{}: {e}", home.agent().shown()))?;

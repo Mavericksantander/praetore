@@ -1301,6 +1301,7 @@ dependencies = [
  "pdf-writer",
  "praetore-core",
  "rand_core 0.6.4",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.11.0",

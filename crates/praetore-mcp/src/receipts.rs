@@ -395,6 +395,10 @@ pub fn verify_journal_with(
     home: &Home,
     expected: ExpectedHeads<'_>,
 ) -> Result<VerifyReport, String> {
+    // Key files are not inputs of a receipt check. An absent keys/
+    // directory is a home published without its private keys. A symlink
+    // at keys/ or at a key file is refused.
+    crate::keys::check_installed_if_present(&home.keys_dir())?;
     let expected_approval_head = expected
         .approvals
         .map(|text| {

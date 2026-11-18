@@ -14,6 +14,7 @@ pub mod install;
 pub mod journal;
 pub(crate) mod journal_io;
 pub mod json;
+mod keys;
 pub mod policy;
 pub mod proxy;
 pub mod receipts;

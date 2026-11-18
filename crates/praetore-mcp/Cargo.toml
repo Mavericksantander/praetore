@@ -36,6 +36,11 @@ zeroize = "1"
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 libc = "0.2.189"
 
+# Key files: lstat, O_NOFOLLOW, and the effective uid. Not libc, so the
+# open stays on the descriptor rustix returns.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "process"] }
+
 [dev-dependencies]
 # G7 runtime tests count engine calls with the test-only probe.
 praetore-core = { path = "../praetore-core", features = ["test-probe"] }
