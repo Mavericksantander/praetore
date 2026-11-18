@@ -159,7 +159,7 @@ Run the dry-run again. A wrapped entry is reported as
 (exit 0). Open the config and check that the entry's `command` is the
 absolute path of `~/.local/bin/praetore-mcp` and that its args start with
 `wrap`. If `command` is still the original server program, the install did
-not apply. `praetore-mcp verify` can then print `OK 0 receipts`, which
+not apply. `praetore-mcp verify` can then print `UNANCHORED 0 receipts`, which
 means the journal is empty.
 
 Restart the client after `install`. A running client keeps the old config.

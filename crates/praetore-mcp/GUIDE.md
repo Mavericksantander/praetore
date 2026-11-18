@@ -246,7 +246,7 @@ wrapped.
 
 ```sh
 praetore-mcp receipts --tail 5
-praetore-mcp verify    # OK N receipts: N verified, 0 failed; prints the journal head
+praetore-mcp verify    # UNANCHORED N receipts: N verified, 0 failed (exit 3); prints the two heads to keep elsewhere
 ```
 
 The v0.3.3 `praetore-mcp verify` does not read 0.3.4 receipts. A 0.3.4

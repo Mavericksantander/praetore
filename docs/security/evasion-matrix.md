@@ -2,7 +2,7 @@
 
 This page lists what an agent, or another process running as the same OS user, can try to get a `tools/call` past praetore-mcp or to remove its trace. It records what happens on main after praetore-mcp 0.3.6.
 
-Each row names the test that pins the behaviour. All of them are in `crates/praetore-mcp/tests/evasion.rs`. A test pins a limitation as well as a defence. When a limitation is closed, its test fails and has to be changed together with this table.
+Each row names the test that pins the behaviour. They are in `crates/praetore-mcp/tests/evasion.rs`, unless the row names another file. A test pins a limitation as well as a defence. When a limitation is closed, its test fails and has to be changed together with this table.
 
 Status:
 
@@ -30,6 +30,7 @@ The threat model behind these rows is in [../threat-model.md](../threat-model.md
 | c, d | Cut the forwarded receipt in half, so its line keeps `praetore.approval_id` but is not JSON, and drop the execution record | bloqueado (`wrap` cannot read which approval the line names and holds the call); detectado después | `a_cut_receipt_line_that_names_an_approval_holds_the_retry_and_fails_verify` | Already blocked |
 | c, d | Write a second receipt that names a used approval, signed with the keys in the home | detectado después | `two_receipts_naming_one_approval_fail_verify` | Already detected |
 | c | Write a receipt that names a rejected approval, or a malformed approval id | detectado después; a malformed id also holds every approved call until it is removed | `a_receipt_naming_a_rejected_or_malformed_approval_fails_verify` | Already detected |
+| c | Read the keys in the home and write another journal, signed and consistent from the first entry to a new head | detectado después con los dos heads guardados fuera de la máquina (`verify` exit 1); sin ellos `verify` no dice OK: dice UNANCHORED y sale con 3 | `a_journal_rewritten_with_the_keys_fails_against_the_saved_anchor` and `without_an_anchor_no_journal_is_ok`, in `crates/praetore-mcp/tests/verify_anchor.rs` | Keys the agent's user cannot read (another user, an HSM, a signer outside the machine) |
 | d | Send the approved call twice | bloqueado | `an_approval_is_used_once` | Already blocked |
 | e | Change the arguments after approval | bloqueado | `an_approval_does_not_cover_other_arguments` | Already blocked |
 | e | Same tool and arguments under another `--name`, or another held tool with the same arguments | bloqueado | `an_approval_does_not_cover_another_server_or_another_held_tool` | Already blocked |
