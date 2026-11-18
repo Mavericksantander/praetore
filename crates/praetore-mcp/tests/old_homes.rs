@@ -2,13 +2,6 @@
 //! homes are shared with praetore-verify:
 //! `crates/praetore-verify/tests/fixtures/praetore-mcp-homes/` (see its
 //! README). They hold no private keys; `verify` reads none.
-//!
-//! Those decisions stored `created_at` from the hold clock, truncated to
-//! the second. The retained receipt's `decided_at` keeps a fraction
-//! (`2026-11-17T05:13:18Z` against `2026-11-17T05:13:18.289873Z`). verify
-//! requires the two strings to be equal, so the approval record fails that
-//! check. The receipt chain and the approval chain are otherwise the ones
-//! saved with the fixture.
 
 use std::{
     fs,
@@ -51,11 +44,10 @@ fn verify(home: &Path, receipts_head: &str, approval_head: &str) -> Output {
 }
 
 /// A 0.3.6 home: no receipt names an approval, and the forwarded call is
-/// tied to its approval only by the execution record. The chains still
-/// match the saved heads. The decision's `created_at` is the truncated
-/// hold clock, so verify reports that one mismatch and exits 1.
+/// tied to its approval only by the execution record. It still verifies,
+/// with both heads it had at 0.3.6.
 #[test]
-fn a_home_written_by_0_3_6_keeps_its_heads_and_fails_the_window_check() {
+fn a_home_written_by_0_3_6_still_verifies_with_both_heads() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     copy_dir(&fixture("0.3.6"), &home);
@@ -68,29 +60,20 @@ fn a_home_written_by_0_3_6_keeps_its_heads_and_fails_the_window_check() {
         "ee7b4d244ad58a58367dc40c96731264c7b92fa7131e7a6baeb7d0cbddbb7005",
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(out.status.success(), "{stdout}");
     assert!(
-        stdout.contains("4 receipts: 4 verified, 1 failed"),
+        stdout.starts_with("OK 4 receipts: 4 verified, 0 failed"),
         "{stdout}"
     );
     assert!(
-        stdout.contains("created_at does not match the signed timestamp of the retained receipt"),
-        "{stdout}"
-    );
-    assert!(
-        stdout.contains("head 8bb82a68865e714262fef57ce0f506834e2b6e1e0968f39f96fb07f7bd015446"),
-        "{stdout}"
-    );
-    assert!(
-        stdout.contains("head ee7b4d244ad58a58367dc40c96731264c7b92fa7131e7a6baeb7d0cbddbb7005"),
+        stdout.contains("approval journal: 1 decision(s), 1 execution(s)"),
         "{stdout}"
     );
 }
 
-/// The home written after 0.3.6 has the same truncated `created_at`.
-/// Deleting its approval journal then fails `verify` because a receipt
-/// names that approval. Deleting the 0.3.6 journal does not: no receipt
-/// names an approval.
+/// The home written after 0.3.6 verifies too; its forwarded receipt names
+/// the approval, and deleting the approval journal then fails `verify`,
+/// which it does not for the 0.3.6 home.
 #[test]
 fn a_deleted_approval_journal_fails_only_the_home_whose_receipts_name_it() {
     let temp = tempfile::tempdir().unwrap();
@@ -101,11 +84,10 @@ fn a_deleted_approval_journal_fails_only_the_home_whose_receipts_name_it() {
         "97176c3c5aac8471ec5fa87ed01aecc27aca233559477f5b2b7f9e8a7b1df8cf",
         "f871c9b0b5783891c6d4c92719f022919ea19d80d4a491aae565716f1e65ae3b",
     );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(out.status.code(), Some(1), "{stdout}");
     assert!(
-        stdout.contains("created_at does not match the signed timestamp of the retained receipt"),
-        "{stdout}"
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
     );
 
     let plain = |home: &Path| {
