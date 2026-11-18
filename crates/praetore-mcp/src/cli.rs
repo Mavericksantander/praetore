@@ -794,6 +794,7 @@ fn cmd_verify(args: &[String]) -> Result<i32, String> {
         false,
     )?;
     let home = parsed.home()?;
+    crate::keypath::check_home_keys(&home)?;
     let report = receipts::verify_journal_with(
         &home,
         receipts::ExpectedHeads {
@@ -1173,6 +1174,7 @@ fn cmd_policy(args: &[String]) -> Result<i32, String> {
         "check" => {
             let parsed = parse(rest, &["--dir"], &[], false)?;
             let home = parsed.home()?;
+            crate::keypath::check_home_keys(&home)?;
             let path = home.policy();
             let text = fs::read_to_string(&path)
                 .map_err(|e| format!("cannot read {}: {e}", path.shown()))?;
