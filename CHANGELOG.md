@@ -64,6 +64,13 @@
   holds for a bad `approval_ttl_seconds` in `config.toml`. Action: fix or
   delete the file the message names.
 
+### Changed
+
+- **Observability: praetore-mcp observe warnings for ambiguous client lines
+  include the SHA-256 and length of the raw line.** The warning names the
+  line the same way the warning for an unparseable line does, so the
+  forwarded line can be matched in a capture.
+
 ### Fixed
 
 - **praetore-mcp: a condition key `arguments.a.b` is not a nested field.**
@@ -71,6 +78,13 @@
   controls. `policy check` used to warn and exit 0. It now exits 1.
   `wrap --mode enforce` refuses to load a policy that contains one, and
   every `tools/call` is refused until the rule is removed.
+
+- **praetore-mcp: a `[table]` line in `config.toml` stops `wrap`.** The file
+  is a flat list of `key = value` lines. A header such as `[tabla]` or
+  `[[tabla]]` used to be a warning (`expected key = value; ignored`) and
+  the keys under it were still applied. `wrap` now exits 2 and does not
+  start the server. A bad `report` value or an unknown key is still a
+  warning.
 
 - **praetore-mcp: `verify --expected-head` passed with receipts added
   before the chain.** A bare evidence line placed before the first chained

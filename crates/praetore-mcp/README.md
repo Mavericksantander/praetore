@@ -692,7 +692,8 @@ Things to know:
   JSON-RPC error `-32700` (`id: null`). Observe forwards them unchanged.
 * **Ambiguous lines** are lines that this proxy and the server could split or
   read differently. Enforce refuses them with `-32700` (`id: null`). Observe
-  forwards them unchanged, warns, and evaluates and records **every**
+  forwards them unchanged, warns with the SHA-256 and the length of the
+  line, and evaluates and records **every**
   `tools/call` reading it can find. Three kinds are detected:
   * **Bare carriage returns.** The proxy frames on `\n`, and JSON treats
     `\r` as whitespace. Universal-newline readers end a line at `\r`, `\n`
@@ -990,4 +991,4 @@ each evidence receipt on its own.
 | `receipts/YYYY-MM-DD.jsonl` | hash-linked evidence journal (`seq`, `prev`, `evidence`) |
 | `receipts/.journal.lock` | lock held while one entry is appended |
 | `reports/session-<start UTC>-<id>.json`, `.pdf` | report of one `wrap` session, written when it ends (0600); a view of the journal, see GUIDE.md |
-| `config.toml` | optional; `report = false` turns the session reports off; `approval_ttl_seconds = <1..86400>` sets the approval lifetime |
+| `config.toml` | optional flat `key = value` file; `report = false` turns the session reports off; `approval_ttl_seconds = <1..86400>` sets the approval lifetime. A `[table]` header stops `wrap` (exit 2) |
