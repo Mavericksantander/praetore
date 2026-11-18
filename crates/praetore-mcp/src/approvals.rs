@@ -211,6 +211,67 @@ impl ApprovalWindow {
     }
 }
 
+/// How `created_at` on a signed decision sits against the retained
+/// receipt's timestamp.
+///
+/// [`HoldInstant::Exact`] is a new decision: `decide` copies that
+/// timestamp, and the strings are equal.
+///
+/// [`HoldInstant::HistoricalWholeSecond`] is a 0.3.6 decision. Its
+/// `created_at` is the receipt timestamp truncated to a whole UTC second
+/// (no fractional part). Truncating the receipt the same way yields that
+/// second, so the two instants differ by less than one second. `decided_at`
+/// is not truncated: `created_at <= decided_at <= expires_at` stays at full
+/// precision. The window is still at most [`MAX_TTL_SECONDS`].
+enum HoldInstant {
+    Exact,
+    HistoricalWholeSecond,
+}
+
+impl HoldInstant {
+    fn check(decision_created: &str, receipt_at: &str) -> Result<Self, String> {
+        if decision_created == receipt_at {
+            return Ok(Self::Exact);
+        }
+        Self::historical_whole_second(decision_created, receipt_at)
+    }
+
+    /// 0.3.6 shape only: `decision_created` has no fraction, and both
+    /// timestamps fall in the same UTC second.
+    fn historical_whole_second(decision_created: &str, receipt_at: &str) -> Result<Self, String> {
+        if decision_created.contains('.') {
+            return Err(hold_instant_mismatch());
+        }
+        let decision = parse_time(decision_created)?;
+        let receipt = parse_time(receipt_at)?;
+        if decision.nanosecond() != 0 {
+            return Err(hold_instant_mismatch());
+        }
+        let decision_second = decision
+            .replace_nanosecond(0)
+            .map_err(|error| error.to_string())?;
+        let receipt_second = receipt
+            .replace_nanosecond(0)
+            .map_err(|error| error.to_string())?;
+        if decision_second != receipt_second {
+            return Err(hold_instant_mismatch());
+        }
+        let skew = if receipt >= decision {
+            receipt - decision
+        } else {
+            decision - receipt
+        };
+        if skew.is_negative() || skew >= Duration::seconds(1) {
+            return Err(hold_instant_mismatch());
+        }
+        Ok(Self::HistoricalWholeSecond)
+    }
+}
+
+fn hold_instant_mismatch() -> String {
+    "created_at does not match the signed timestamp of the retained receipt".into()
+}
+
 #[derive(Debug, Clone)]
 pub struct Decided {
     pub approval_id: String,
@@ -985,10 +1046,8 @@ fn verify_decision(
         .decided_at
         .as_deref()
         .ok_or("retained receipt has no signed timestamp")?;
-    if required_str(&entry.record, "created_at")? != receipt_at {
-        return Err(
-            "created_at does not match the signed timestamp of the retained receipt".into(),
-        );
+    match HoldInstant::check(required_str(&entry.record, "created_at")?, receipt_at)? {
+        HoldInstant::Exact | HoldInstant::HistoricalWholeSecond => {}
     }
     if evidence.decision.outcome != DecisionOutcome::RequireApproval {
         return Err("pending evidence is not a REQUIRE_APPROVAL receipt".into());
@@ -1855,6 +1914,14 @@ mod tests {
             spec.contains("DecisionWindowWithinSignedHoldPlusTtl =="),
             "the spec no longer defines DecisionWindowWithinSignedHoldPlusTtl =="
         );
+        assert!(
+            spec.contains("whole_second(held_timestamp)"),
+            "the spec no longer truncates a 0.3.6 hold to a whole second"
+        );
+        assert!(
+            spec.contains("MaxTtl * Second"),
+            "the spec no longer bounds the window by MaxTtl"
+        );
         assert!(cfg.contains("DecisionWindowWithinSignedHoldPlusTtl"));
     }
 
@@ -1913,6 +1980,34 @@ mod tests {
         let signed = sign_record(&record, DECISION_DOMAIN, &approver).unwrap();
         with_lock(&home, |journal| append_signed(journal, &[], &signed)).unwrap();
 
+        let (code, stdout, stderr) = run_verify(&home);
+        assert_eq!(code, Some(1), "{stdout}\n{stderr}");
+        assert!(stdout.contains("maximum is 86400"), "{stdout}\n{stderr}");
+    }
+
+    fn sign_decision(home: &Home, id: &str, created: &str, expires: &str) {
+        let pending: Value =
+            serde_json::from_str(&fs::read_to_string(pending_path(home, id)).unwrap()).unwrap();
+        let approver = store::approver_secret(home).unwrap();
+        let record = json!({
+            "schema": 1,
+            "kind": "decision",
+            "approval_id": id,
+            "approver_key_id": public_hex(&approver),
+            "outcome": "approve",
+            "server": pending["server"],
+            "tool": pending["tool"],
+            "arguments": pending["arguments"],
+            "pending_evidence_id": pending["evidence_id"],
+            "created_at": created,
+            "expires_at": expires,
+            "decided_at": created,
+        });
+        let signed = sign_record(&record, DECISION_DOMAIN, &approver).unwrap();
+        with_lock(home, |journal| append_signed(journal, &[], &signed)).unwrap();
+    }
+
+    fn run_verify(home: &Home) -> (Option<i32>, String, String) {
         use crate::shown::Show;
         let bin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/debug/praetore-mcp");
@@ -1925,10 +2020,61 @@ mod tests {
             .args(["verify", "--dir", home.root.to_str().unwrap()])
             .output()
             .unwrap();
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
-        assert!(stdout.contains("maximum is 86400"), "{stdout}\n{stderr}");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    /// A signed `created_at` in 2099 is not the receipt timestamp, even at
+    /// whole-second precision. The span itself is within the TTL cap.
+    /// `verify` exits 1.
+    #[test]
+    fn verify_rejects_a_created_at_in_2099() {
+        let (_temp, home) = crate::journal_io::temp_home();
+        let id = hold_echo(&home);
+        sign_decision(&home, &id, "2099-01-01T00:00:00Z", "2099-01-01T00:10:00Z");
+        let (code, stdout, stderr) = run_verify(&home);
+        assert_eq!(code, Some(1), "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("does not match the signed timestamp"),
+            "{stdout}\n{stderr}"
+        );
+    }
+
+    /// Same UTC second as the receipt, but a different fraction. That is not
+    /// an exact new decision and not the 0.3.6 whole-second form.
+    #[test]
+    fn verify_rejects_a_different_fraction_in_the_receipt_second() {
+        let (_temp, home) = crate::journal_io::temp_home();
+        let id = hold_echo(&home);
+        let receipt = held_receipt(&home).decided_at.unwrap();
+        let created_at = parse_time(&receipt).unwrap();
+        let other = created_at
+            .replace_nanosecond(if created_at.nanosecond() == 500_000_000 {
+                100_000_000
+            } else {
+                500_000_000
+            })
+            .unwrap()
+            .format(&Rfc3339)
+            .unwrap();
+        assert_ne!(other, receipt);
+        let expires = (parse_time(&other).unwrap() + Duration::seconds(600))
+            .format(&Rfc3339)
+            .unwrap();
+        sign_decision(&home, &id, &other, &expires);
+        let (code, stdout, stderr) = run_verify(&home);
+        assert_eq!(code, Some(1), "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("does not match the signed timestamp"),
+            "{stdout}\n{stderr}"
+        );
+        assert!(
+            !stdout.contains("maximum is 86400"),
+            "the TTL cap is not what failed:\n{stdout}"
+        );
     }
 
     fn hold_echo(home: &Home) -> String {
