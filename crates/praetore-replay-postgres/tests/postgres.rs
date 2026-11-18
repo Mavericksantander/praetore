@@ -12219,4 +12219,186 @@ mod journal_position {
 
         open.rollback().unwrap();
     }
+
+    /// LOCAL REVIEW TESTS (CTO dictamen #163).
+    mod r163_review {
+        use super::*;
+        use postgres::IsolationLevel;
+        use std::{sync::mpsc, thread, time::Duration as StdDuration};
+
+        fn runtime(scratch: &ScratchDatabase, role: &TestRole) -> Client {
+            let mut client = connect_scratch_as(scratch, &role.name);
+            verify_runtime_role(&mut client).unwrap();
+            client
+        }
+
+        fn runtime_role(scratch: &ScratchDatabase) -> TestRole {
+            let role = TestRole::create("LOGIN NOBYPASSRLS");
+            scratch
+                .connect()
+                .batch_execute(&format!("GRANT praetore_runtime TO {}", role.name))
+                .unwrap();
+            role
+        }
+
+        fn next_seq(client: &mut Client) -> i64 {
+            client
+                .query_one(
+                    "SELECT next_seq FROM praetore.journal_positions WHERE tenant_id = $1",
+                    &[&TENANT_A],
+                )
+                .unwrap()
+                .get(0)
+        }
+
+        fn positions(client: &mut Client) -> Vec<i64> {
+            client
+                .query(
+                    "SELECT chain_seq FROM praetore.execution_journal \
+                     WHERE tenant_id = $1 ORDER BY chain_seq",
+                    &[&TENANT_A],
+                )
+                .unwrap()
+                .iter()
+                .map(|row| row.get(0))
+                .collect()
+        }
+
+        fn raw(
+            transaction: &mut postgres::Transaction<'_>,
+            evidence: &Evidence,
+            tail: &str,
+        ) -> Result<u64, postgres::Error> {
+            transaction.execute(
+                "SELECT pg_catalog.set_config('praetore.tenant_id', $1, true)",
+                &[&TENANT_A.to_string()],
+            )?;
+            let agent = *evidence.agent.id.as_uuid();
+            transaction.execute(
+                &format!(
+                    "INSERT INTO praetore.execution_journal \
+                     (tenant_id, agent_id, request_id, request_digest, action_digest, \
+                      authorization_status, execution_status, evidence_json, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $4, 'allowed', 'authorized', $5, \
+                             clock_timestamp(), clock_timestamp()) {tail}"
+                ),
+                &[
+                    &TENANT_A,
+                    &agent,
+                    &evidence.request_id,
+                    &"ab".repeat(32),
+                    &evidence.to_json().unwrap(),
+                ],
+            )
+        }
+
+        fn outcome(result: Result<u64, postgres::Error>) -> String {
+            match result {
+                Ok(n) => format!("Ok({n})"),
+                Err(error) => format!(
+                    "Err({:?}: {})",
+                    error.code().map(|c| c.code().to_owned()),
+                    db_message(error)
+                ),
+            }
+        }
+
+        /// ON CONFLICT with an explicit target and DO UPDATE.
+        #[test]
+        #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+        fn r163_on_conflict_do_update_and_explicit_target() {
+            let scratch = migrated();
+            let role = runtime_role(&scratch);
+            let mut rt = runtime(&scratch, &role);
+            let mut admin = scratch.connect();
+            let first = receipt(TENANT_A, None, None);
+            insert_committed(&mut rt, TENANT_A, &first);
+            for tail in [
+                "ON CONFLICT (tenant_id, agent_id, request_id) DO NOTHING",
+                "ON CONFLICT (tenant_id, agent_id, request_id) DO UPDATE SET updated_at = EXCLUDED.updated_at",
+            ] {
+                let mut tx = rt.transaction().unwrap();
+                let result = raw(&mut tx, &first, tail);
+                let ok = result.is_ok();
+                eprintln!("R163 [{tail}] -> {}", outcome(result));
+                if ok {
+                    tx.commit().unwrap();
+                } else {
+                    drop(tx);
+                }
+                eprintln!(
+                    "R163 [{tail}] next_seq={} positions={:?}",
+                    next_seq(&mut admin),
+                    positions(&mut admin)
+                );
+            }
+            let later = receipt(TENANT_A, None, None);
+            insert_committed(&mut rt, TENANT_A, &later);
+            let p = positions(&mut admin);
+            eprintln!("R163 explicit/do-update final positions={p:?}");
+            assert_eq!(
+                p,
+                vec![0, 1],
+                "no gap after explicit-target DO NOTHING and DO UPDATE"
+            );
+            export_tenant(&mut admin, TENANT_A, &pins()).expect("export after conflicts");
+        }
+
+        /// A duplicate key sent by a second session while the first holds the
+        /// tenant lock (READ COMMITTED and REPEATABLE READ).
+        #[test]
+        #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+        fn r163_concurrent_duplicate_on_conflict() {
+            for isolation in [
+                IsolationLevel::ReadCommitted,
+                IsolationLevel::RepeatableRead,
+            ] {
+                let scratch = migrated();
+                let role = runtime_role(&scratch);
+                let mut a = runtime(&scratch, &role);
+                let mut admin = scratch.connect();
+                let key = receipt(TENANT_A, None, None);
+                // Seed a first row so the counter row exists.
+                insert_committed(&mut a, TENANT_A, &receipt(TENANT_A, None, None));
+                let mut b = runtime(&scratch, &role);
+                let mut tx_a = a.transaction().unwrap();
+                insert(&mut tx_a, TENANT_A, &key, None).unwrap();
+                let (send, recv) = mpsc::channel();
+                let key_b = key.clone();
+                let handle = thread::spawn(move || {
+                    let mut tx = b
+                        .build_transaction()
+                        .isolation_level(isolation)
+                        .start()
+                        .unwrap();
+                    tx.query_one("SELECT 1", &[]).unwrap(); // snapshot before A commits
+                    let result = raw(&mut tx, &key_b, "ON CONFLICT DO NOTHING");
+                    let ok = result.is_ok();
+                    let text = outcome(result);
+                    if ok {
+                        tx.commit().unwrap();
+                    } else {
+                        drop(tx);
+                    }
+                    send.send(text).unwrap();
+                });
+                thread::sleep(StdDuration::from_millis(700));
+                let blocked = recv.try_recv().is_err();
+                tx_a.commit().unwrap();
+                let text = recv.recv_timeout(StdDuration::from_secs(20)).unwrap();
+                handle.join().unwrap();
+                let p = positions(&mut admin);
+                let n = next_seq(&mut admin);
+                eprintln!(
+                    "R163 concurrent {isolation:?}: B blocked while A held lock={blocked}; B -> {text}; next_seq={n} positions={p:?}"
+                );
+                let later = receipt(TENANT_A, None, None);
+                insert_committed(&mut a, TENANT_A, &later);
+                let p = positions(&mut admin);
+                eprintln!("R163 concurrent {isolation:?}: after later insert positions={p:?}");
+                assert!(blocked, "B waits for the tenant lock");
+                assert_eq!(p, vec![0, 1, 2], "{isolation:?}: no gap");
+            }
+        }
+    }
 }

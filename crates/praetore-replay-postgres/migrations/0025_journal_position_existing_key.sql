@@ -31,7 +31,7 @@ AS $$
 DECLARE
     assigned BIGINT;
 BEGIN
-    -- The row lock on the tenant's counter is held until this statement
+    -- The row lock on the tenant's counter is held until the transaction
     -- ends. A primary key that is already present raises below, which
     -- aborts the statement and undoes this update, so the position is not
     -- consumed. A new row keeps the value assigned here.

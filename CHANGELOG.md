@@ -73,6 +73,22 @@
 
 ### Fixed
 
+- **A repeated journal INSERT no longer takes a position (migration 0025).**
+  Before 0025, `INSERT ... ON CONFLICT DO NOTHING` or `DO UPDATE` on a
+  primary key already in `praetore.execution_journal` discarded the row
+  but committed the counter update in `praetore.journal_positions`. The
+  gap in `chain_seq` is permanent, and every later export of that tenant
+  fails. The position trigger now refuses the existing key after it takes
+  the tenant lock, so the counter update is undone. **Visible change:
+  `ON CONFLICT` on an existing journal key now returns SQLSTATE 23505
+  (`unique_violation`; 40001 under REPEATABLE READ) instead of doing
+  nothing.** Gaps already present are not repaired, and export still
+  fails for them. Applying 0025 holds ACCESS EXCLUSIVE on
+  `praetore.execution_journal` only for the `DROP TRIGGER`/`CREATE
+  TRIGGER` (it does not rewrite rows): apply it with the gateways
+  stopped or in a maintenance window. Manual rollback:
+  `docs/rollback/0025-journal-position-existing-key.sql`.
+
 - **praetore-mcp: a client line over 32 MiB gets a JSON-RPC error.** The
   line is still not parsed and not forwarded (both modes). The client used
   to get no reply and wait for its own timeout. It now gets `-32600` with

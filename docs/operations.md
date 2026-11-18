@@ -1184,6 +1184,29 @@ this is resolved, and exporting only settled history is no longer needed.
   5 s), so run it with every gateway stopped too. It drops the column and
   the table, so exports order rows by `created_at` again.
 
+### Existing journal keys (migration 0025)
+
+Before 0025, `INSERT ... ON CONFLICT DO NOTHING` or `DO UPDATE` on a
+primary key already in `praetore.execution_journal` discarded the row
+and still advanced `praetore.journal_positions`. The resulting gap in
+`chain_seq` is permanent. An export fails for that tenant the same way
+it fails for a row deleted from the middle of the chain, or a position
+written by hand. Migration 0025 does not repair gaps that already
+exist; export keeps failing for them. After 0025, the same statement
+returns SQLSTATE 23505 (`unique_violation`), or 40001 under REPEATABLE
+READ, and does not take a position.
+
+Applying 0025 holds ACCESS EXCLUSIVE on `praetore.execution_journal`
+for a short `DROP TRIGGER`/`CREATE TRIGGER`. It does not rewrite
+rows. Apply it with every gateway stopped, or in a maintenance window.
+
+Manual rollback: `docs/rollback/0025-journal-position-existing-key.sql`.
+It points the trigger back at `assign_execution_journal_position_v1` and
+drops `assign_execution_journal_position_v2`, with a `lock_timeout` of
+5 s. It also takes ACCESS EXCLUSIVE on the journal, so run it with
+every gateway stopped too. After rollback, a new `ON CONFLICT` on an
+existing key can take a position again.
+
 Planned, when evidence sets 04 and 05 are re-recorded with HighAssurance
 receipts (required before 2027-01-29, when their authorities and issuer pins
 expire): `--require-decision-time` becomes the default, with an explicit
