@@ -136,7 +136,7 @@ mod unix {
             .map_err(|error| open_error(error, path))?;
             let opened = rustix::fs::fstat(&fd)
                 .map_err(|error| format!("cannot stat {}: {}", path.shown(), io_error(error)))?;
-            if file_id(&opened) != file_id(&looked) {
+            if !same_file(&opened, &looked) {
                 return Err(format!("{} changed while it was opened", path.shown()));
             }
             require_type(&opened, path, FileType::Directory)?;
@@ -185,7 +185,7 @@ mod unix {
             .map_err(|error| open_error(error, &path))?;
             let opened = rustix::fs::fstat(&fd)
                 .map_err(|error| format!("cannot stat {}: {}", path.shown(), io_error(error)))?;
-            if file_id(&opened) != file_id(&looked) {
+            if !same_file(&opened, &looked) {
                 return Err(format!("{} changed while it was opened", path.shown()));
             }
             require_type(&opened, &path, FileType::RegularFile)?;
@@ -299,12 +299,16 @@ mod unix {
     }
 
     fn require_private(stat: &rustix::fs::Stat, path: &Path) -> Result<(), String> {
-        let mode = mode_bits(stat);
-        if mode & 0o077 != 0 {
+        // `st_mode` is `mode_t` (`u16` on macOS, `u32` on Linux). The mask
+        // uses that width, so the check does not narrow the value.
+        let mode = stat.st_mode;
+        let group_or_other: rustix::fs::RawMode = 0o077;
+        let shown: rustix::fs::RawMode = 0o777;
+        if mode & group_or_other != 0 {
             return Err(format!(
                 "{} is accessible by group/others (mode {:o}); run: chmod 600 {}",
                 path.shown(),
-                mode & 0o777,
+                mode & shown,
                 path.shown()
             ));
         }
@@ -312,7 +316,7 @@ mod unix {
     }
 
     fn file_type(stat: &rustix::fs::Stat) -> FileType {
-        FileType::from_raw_mode(mode_bits(stat))
+        FileType::from_raw_mode(stat.st_mode)
     }
 
     fn open_error(errno: rustix::io::Errno, path: &Path) -> String {
@@ -327,14 +331,8 @@ mod unix {
         std::io::Error::from(errno)
     }
 
-    #[allow(clippy::unnecessary_cast)]
-    fn file_id(stat: &rustix::fs::Stat) -> (u64, u64) {
-        (stat.st_dev as u64, stat.st_ino as u64)
-    }
-
-    #[allow(clippy::unnecessary_cast)]
-    fn mode_bits(stat: &rustix::fs::Stat) -> u32 {
-        stat.st_mode as u32
+    fn same_file(opened: &rustix::fs::Stat, looked: &rustix::fs::Stat) -> bool {
+        opened.st_dev == looked.st_dev && opened.st_ino == looked.st_ino
     }
 }
 
