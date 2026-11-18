@@ -10,19 +10,83 @@
 //! The workspace `serde_json` is built without `preserve_order`, and enabling
 //! it would change map ordering for every crate in the workspace, so this
 //! type is kept local. `serde_json`'s recursion limit still applies.
+//!
+//! A number keeps the text it was written with ([`JsonNumber`]). The proxy
+//! forwards the client's bytes, so the server parses that text itself; the
+//! gate may only decide on a number whose text every parser reads alike.
 
 use serde::{
-    Deserialize, Deserializer, Serialize, Serializer,
-    de::{MapAccess, SeqAccess, Visitor},
+    Deserializer, Serialize, Serializer,
+    de::{DeserializeSeed, MapAccess, SeqAccess, Visitor},
     ser::{SerializeMap, SerializeSeq},
 };
-use std::fmt;
+use std::{cell::Cell, fmt};
+
+/// A JSON number together with the literal it was parsed from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JsonNumber {
+    value: serde_json::Number,
+    literal: String,
+}
+
+impl JsonNumber {
+    /// The parsed value (correctly rounded: `serde_json` is built with
+    /// `float_roundtrip`).
+    pub fn value(&self) -> &serde_json::Number {
+        &self.value
+    }
+
+    /// The number as written in the document.
+    pub fn literal(&self) -> &str {
+        &self.literal
+    }
+
+    /// Whether the literal is exactly what this value serializes to. Only
+    /// then is the value the gate evaluates the one any other parser gets
+    /// from the same bytes: `49.9999999999999965` (an f64 parser reads
+    /// 50.0, a decimal parser reads it as written), `1e2`, `-0` and an
+    /// integer beyond `u64` are not canonical.
+    pub fn is_canonical(&self) -> bool {
+        self.value.to_string() == self.literal
+    }
+}
+
+/// The number literals of `input`, in document order. `input` is checked to
+/// be JSON by the parse that consumes this list; outside a string, only a
+/// number starts with `-` or a digit.
+fn number_literals(input: &str) -> Vec<&str> {
+    let bytes = input.as_bytes();
+    let mut literals = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != b'"' {
+                    index += if bytes[index] == b'\\' { 2 } else { 1 };
+                }
+                index += 1;
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = index;
+                while index < bytes.len()
+                    && matches!(bytes[index], b'0'..=b'9' | b'+' | b'-' | b'.' | b'e' | b'E')
+                {
+                    index += 1;
+                }
+                literals.push(&input[start..index]);
+            }
+            _ => index += 1,
+        }
+    }
+    literals
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum JsonValue {
     Null,
     Bool(bool),
-    Number(serde_json::Number),
+    Number(JsonNumber),
     String(String),
     Array(Vec<JsonValue>),
     Object(Vec<(String, JsonValue)>),
@@ -32,8 +96,15 @@ impl JsonValue {
     /// Parses one complete JSON document, rejecting duplicate keys and
     /// trailing data.
     pub fn parse(input: &str) -> Result<Self, String> {
+        let literals = number_literals(input);
+        let seed = Seed {
+            literals: &literals,
+            next: &Cell::new(0),
+        };
         let mut deserializer = serde_json::Deserializer::from_str(input);
-        let value = JsonValue::deserialize(&mut deserializer).map_err(|e| e.to_string())?;
+        let value = seed
+            .deserialize(&mut deserializer)
+            .map_err(|e| e.to_string())?;
         deserializer.end().map_err(|e| e.to_string())?;
         Ok(value)
     }
@@ -102,7 +173,7 @@ impl JsonValue {
         match self {
             JsonValue::Null => serde_json::Value::Null,
             JsonValue::Bool(value) => serde_json::Value::Bool(*value),
-            JsonValue::Number(value) => serde_json::Value::Number(value.clone()),
+            JsonValue::Number(number) => serde_json::Value::Number(number.value.clone()),
             JsonValue::String(value) => serde_json::Value::String(value.clone()),
             JsonValue::Array(values) => {
                 serde_json::Value::Array(values.iter().map(JsonValue::to_value).collect())
@@ -121,8 +192,8 @@ impl JsonValue {
     }
 
     pub fn to_pretty(&self) -> String {
-        // Serializing this type cannot fail: keys are strings and numbers are
-        // already valid `serde_json::Number`s.
+        // Serializing this type cannot fail: keys are strings and a number
+        // literal was accepted by the JSON parser.
         serde_json::to_string_pretty(self).unwrap_or_default()
     }
 
@@ -136,7 +207,13 @@ impl Serialize for JsonValue {
         match self {
             JsonValue::Null => serializer.serialize_unit(),
             JsonValue::Bool(value) => serializer.serialize_bool(*value),
-            JsonValue::Number(value) => value.serialize(serializer),
+            // The literal, so a document is written back as it was read.
+            JsonValue::Number(number) => {
+                match serde_json::value::RawValue::from_string(number.literal.clone()) {
+                    Ok(raw) => raw.serialize(serializer),
+                    Err(_) => number.value.serialize(serializer),
+                }
+            }
             JsonValue::String(value) => serializer.serialize_str(value),
             JsonValue::Array(values) => {
                 let mut seq = serializer.serialize_seq(Some(values.len()))?;
@@ -156,15 +233,38 @@ impl Serialize for JsonValue {
     }
 }
 
-impl<'de> Deserialize<'de> for JsonValue {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(JsonValueVisitor)
+/// Deserializes a [`JsonValue`], giving each number the next literal of the
+/// document. Numbers are visited in document order.
+#[derive(Clone, Copy)]
+struct Seed<'a> {
+    literals: &'a [&'a str],
+    next: &'a Cell<usize>,
+}
+
+impl Seed<'_> {
+    fn number<E: serde::de::Error>(self, value: serde_json::Number) -> Result<JsonValue, E> {
+        let index = self.next.get();
+        self.next.set(index + 1);
+        let literal = self
+            .literals
+            .get(index)
+            .ok_or_else(|| E::custom("a number has no literal in the document"))?;
+        Ok(JsonValue::Number(JsonNumber {
+            value,
+            literal: (*literal).to_owned(),
+        }))
     }
 }
 
-struct JsonValueVisitor;
+impl<'de> DeserializeSeed<'de> for Seed<'_> {
+    type Value = JsonValue;
 
-impl<'de> Visitor<'de> for JsonValueVisitor {
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<JsonValue, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Seed<'_> {
     type Value = JsonValue;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -183,18 +283,18 @@ impl<'de> Visitor<'de> for JsonValueVisitor {
         Ok(JsonValue::Bool(value))
     }
 
-    fn visit_i64<E>(self, value: i64) -> Result<JsonValue, E> {
-        Ok(JsonValue::Number(value.into()))
+    fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<JsonValue, E> {
+        self.number(value.into())
     }
 
-    fn visit_u64<E>(self, value: u64) -> Result<JsonValue, E> {
-        Ok(JsonValue::Number(value.into()))
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<JsonValue, E> {
+        self.number(value.into())
     }
 
     fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<JsonValue, E> {
-        serde_json::Number::from_f64(value)
-            .map(JsonValue::Number)
-            .ok_or_else(|| E::custom("non-finite number"))
+        let number =
+            serde_json::Number::from_f64(value).ok_or_else(|| E::custom("non-finite number"))?;
+        self.number(number)
     }
 
     fn visit_str<E>(self, value: &str) -> Result<JsonValue, E> {
@@ -207,7 +307,7 @@ impl<'de> Visitor<'de> for JsonValueVisitor {
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<JsonValue, A::Error> {
         let mut values = Vec::new();
-        while let Some(value) = seq.next_element::<JsonValue>()? {
+        while let Some(value) = seq.next_element_seed(self)? {
             values.push(value);
         }
         Ok(JsonValue::Array(values))
@@ -222,7 +322,7 @@ impl<'de> Visitor<'de> for JsonValueVisitor {
                     "duplicate object key {key:?}"
                 )));
             }
-            let value = map.next_value::<JsonValue>()?;
+            let value = map.next_value_seed(self)?;
             entries.push((key, value));
         }
         Ok(JsonValue::Object(entries))
@@ -261,5 +361,59 @@ mod tests {
         assert_eq!(value.to_compact(), r#"{"command":"b","args":[],"env":{}}"#);
         value.remove("args");
         assert_eq!(value.to_compact(), r#"{"command":"b","env":{}}"#);
+    }
+
+    fn number(text: &str) -> JsonNumber {
+        match JsonValue::parse(text).unwrap() {
+            JsonValue::Number(number) => number,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn numbers_keep_their_literal_in_document_order() {
+        let input = r#"{"a-1":[1,-2.50,"3 \" 4e5",{"b":6E+1}],"c":0.1}"#;
+        let value = JsonValue::parse(input).unwrap();
+        // Serializing writes each literal back where it was read.
+        assert_eq!(value.to_compact(), input);
+        assert_eq!(number("-2.50").literal(), "-2.50");
+        assert_eq!(number(" 7 ").literal(), "7");
+    }
+
+    #[test]
+    fn floats_are_rounded_correctly() {
+        // Without serde_json's `float_roundtrip` this reads 49.99999999999999.
+        assert_eq!(number("49.9999999999999965").value().as_f64(), Some(50.0));
+        assert_eq!(number("99.9999999999999929").value().as_f64(), Some(100.0));
+    }
+
+    #[test]
+    fn only_a_literal_equal_to_its_serialized_value_is_canonical() {
+        for text in [
+            "0",
+            "50",
+            "-7",
+            "50.0",
+            "49.99999999999999",
+            "0.1",
+            "9007199254740993",
+            "18446744073709551615",
+        ] {
+            assert!(number(text).is_canonical(), "{text}");
+        }
+        for text in [
+            "49.9999999999999965",
+            "99.9999999999999929",
+            "50.00000000000000001",
+            "50.00",
+            "5e1",
+            "1e2",
+            "-0",
+            "18446744073709551616",
+            "0.1000000000000000055511151231257827",
+        ] {
+            assert!(!number(text).is_canonical(), "{text}");
+        }
+        assert!(JsonValue::parse("1e400").is_err());
     }
 }

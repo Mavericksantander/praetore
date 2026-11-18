@@ -2,7 +2,7 @@
 
 This page lists what an agent, or another process running as the same OS user, can try to get a `tools/call` past praetore-mcp or to remove its trace. It records what happens on main after praetore-mcp 0.3.6.
 
-Each row names the test that pins the behaviour. All of them are in `crates/praetore-mcp/tests/evasion.rs`. A test pins a limitation as well as a defence. When a limitation is closed, its test fails and has to be changed together with this table.
+Each row names the test that pins the behaviour. They are in `crates/praetore-mcp/tests/evasion.rs`, unless the row names another file. A test pins a limitation as well as a defence. When a limitation is closed, its test fails and has to be changed together with this table.
 
 Status:
 
@@ -30,7 +30,11 @@ The threat model behind these rows is in [../threat-model.md](../threat-model.md
 | c, d | Cut the forwarded receipt in half, so its line keeps `praetore.approval_id` but is not JSON, and drop the execution record | bloqueado (`wrap` cannot read which approval the line names and holds the call); detectado después | `a_cut_receipt_line_that_names_an_approval_holds_the_retry_and_fails_verify` | Already blocked |
 | c, d | Write a second receipt that names a used approval, signed with the keys in the home | detectado después | `two_receipts_naming_one_approval_fail_verify` | Already detected |
 | c | Write a receipt that names a rejected approval, or a malformed approval id | detectado después; a malformed id also holds every approved call until it is removed | `a_receipt_naming_a_rejected_or_malformed_approval_fails_verify` | Already detected |
+| c | Read the keys in the home and write another journal, signed and consistent from the first entry to a new head | detectado después con los dos heads guardados fuera de la máquina (`verify` exit 1); sin ellos `verify` no dice OK: dice UNANCHORED y sale con 3 | `a_journal_rewritten_with_the_keys_fails_against_the_saved_anchor` and `without_an_anchor_no_journal_is_ok`, in `crates/praetore-mcp/tests/verify_anchor.rs` | Keys the agent's user cannot read (another user, an HSM, a signer outside the machine) |
+| c | Add a signed receipt to the journal without changing its head: a bare evidence line (or a chained line) before the first entry, or after the last one | detectado después, con y sin `--expected-head` (the line is outside the chain that ends at the head). Signing the receipt needs the keys in the home | `a_signed_line_before_the_chain_fails_verify`, `a_chained_line_before_the_chain_fails_verify` and `a_line_after_the_head_fails_verify`, in `crates/praetore-mcp/tests/journal_exact_chain.rs` | Already detected. Rewriting the whole chain with the keys is still only found by a head kept elsewhere |
 | d | Send the approved call twice | bloqueado | `an_approval_is_used_once` | Already blocked |
+| d | Send a number whose receipt does not read back (`99.9999999999999929`), to stop the journal: later calls refused in enforce, or run without a receipt in observe | bloqueado (the line is never written and that call is refused in both modes) | `the_poison_literal_never_reaches_the_journal_in_enforce`, `observe_never_runs_a_call_without_a_receipt_because_of_a_number` and `appended_receipts_always_verify`, in `crates/praetore-mcp/tests/journal_verified_line.rs` | Already blocked |
+| d | Send a number whose text the proxy and the server read as different values (`49.9999999999999965` against `DENY amount >= 50`, `50.00000000000000001`, `1e400`, 2^53 + 1) | bloqueado | `the_decision_matches_the_value_the_server_recorded` and `a_non_canonical_literal_is_refused_in_enforce`, in `crates/praetore-mcp/tests/numeric_gate.rs` | Already blocked |
 | e | Change the arguments after approval | bloqueado | `an_approval_does_not_cover_other_arguments` | Already blocked |
 | e | Same tool and arguments under another `--name`, or another held tool with the same arguments | bloqueado | `an_approval_does_not_cover_another_server_or_another_held_tool` | Already blocked |
 | f | Use another allowed tool with the same effect | limitación conocida | `another_allowed_tool_with_the_same_effect_is_forwarded` | Rules over the effect (paths, resources) for every tool of the server; `policy coverage` shows which tools a rule leaves open |
@@ -73,6 +77,7 @@ The defences above were checked by removing each one and running `tests/evasion.
 | A receipt naming an approval with no execution for it (`verify` check removed) | `truncating_the_approval_journal_holds_a_used_approval_and_fails_verify` |
 | A malformed approval id in a receipt (`verify` ignores it) | `a_receipt_naming_a_rejected_or_malformed_approval_fails_verify` |
 | The execution record that cannot be written ignored (`let _ = append_execution(..)`, the call forwarded anyway) | `an_execution_record_that_cannot_be_written_spends_the_approval_and_fails_verify` |
+| c | Sign with another home's keys without reading them: a scratch home whose `keys`, key files or parent directory are symlinks (or whose key files are hard links) to that home's, with a policy of its own | bloqueado (the scratch home does not load; `wrap` refuses every call) | `keys_dir_as_a_symlink_is_refused`, `a_key_file_as_a_symlink_is_refused`, `a_key_file_as_a_hard_link_is_refused` and `a_parent_directory_as_a_symlink_is_refused`, in `crates/praetore-mcp/tests/keys_symlinks.rs` | Already blocked. Reading and copying the key files is still possible for the same user |
 
 The duplicate and the rejected checks are caught by the message the test asserts, not by the exit code. With either check removed, `verify` still exits 1 because another check fails on the same journals:
 

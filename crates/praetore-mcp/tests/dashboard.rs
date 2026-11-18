@@ -146,7 +146,10 @@ fn assert_state_matches_verify(home: &Home) -> Value {
     let (code, report) = verify_cli(home);
     let state = dashboard::state(home, None);
     let v = &state["verify"];
-    assert_eq!(v["status"] == "ok", code == 0, "{report}\n{v}");
+    // `verify` ran without heads: 3 when nothing failed, 1 otherwise.
+    assert_eq!(v["status"] == "ok", code == 3, "{report}\n{v}");
+    assert_eq!(v["assurance"] == "unanchored", code == 3, "{report}\n{v}");
+    assert_eq!(v["assurance"] == "failed", code == 1, "{report}\n{v}");
     let cli_failures: Vec<&str> = report
         .lines()
         .filter(|l| l.starts_with("FAIL") && !l.contains(" receipts: "))
@@ -160,7 +163,7 @@ fn assert_state_matches_verify(home: &Home) -> Value {
     assert_eq!(cli_failures, state_failures);
     let summary = format!(
         "{} {} receipts: {} verified, {} failed",
-        if code == 0 { "OK" } else { "FAIL" },
+        if code == 3 { "UNANCHORED" } else { "FAIL" },
         v["total"],
         v["verified"],
         v["failed"]
@@ -1947,8 +1950,25 @@ fn the_chain_is_cut_where_verify_fails_and_the_receipt_is_rebuilt() {
     assert_eq!(status, 200);
     let receipts = state["page"]["receipts"].as_array().unwrap();
     let cut: Vec<&Value> = receipts.iter().filter(|r| r["order"].is_string()).collect();
-    assert_eq!(cut.len(), 1, "{receipts:?}");
-    assert_eq!(cut[0]["verified"], false);
+    // Two lines fail: the entry after the gap, which names a predecessor
+    // that is not there, and the entry before the gap, which the chain that
+    // ends at the head no longer reaches.
+    assert_eq!(cut.len(), 2, "{receipts:?}");
+    assert!(
+        cut.iter()
+            .any(|r| r["order"].as_str().unwrap().contains("is missing")),
+        "{cut:?}"
+    );
+    assert!(
+        cut.iter().any(|r| r["order"]
+            .as_str()
+            .unwrap()
+            .contains("is outside the chain")),
+        "{cut:?}"
+    );
+    for r in &cut {
+        assert_eq!(r["verified"], false);
+    }
     for r in receipts {
         assert!(r["seq"].is_u64(), "{r}");
         assert!(r["prev"].is_string(), "{r}");

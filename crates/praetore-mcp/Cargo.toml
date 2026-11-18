@@ -25,7 +25,7 @@ pdf-writer = "0.15"
 praetore-core = { path = "../praetore-core" }
 rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = { version = "1.0", features = ["raw_value"] }
+serde_json = { version = "1.0", features = ["raw_value", "float_roundtrip"] }
 sha2 = "0.11.0"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 unicode-normalization = "0.1.26"
@@ -40,6 +40,8 @@ libc = "0.2.189"
 # G7 runtime tests count engine calls with the test-only probe.
 praetore-core = { path = "../praetore-core", features = ["test-probe"] }
 libc = "0.2.189"
+# tests/journal_verified_line.rs: random numbers through wrap, then verify.
+proptest = "1"
 tempfile = "3"
 # tests/lint_guard.rs reads Cargo.toml and .cargo/config.toml tables.
 toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
