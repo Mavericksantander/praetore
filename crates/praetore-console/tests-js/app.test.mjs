@@ -339,3 +339,42 @@ test("the card shows its deadline in local time with its offset and in UTC, with
   assert.match(caja.textContent, /\(UTC[+-]\d\d:\d\d\) · 2026-11-13 06:50 UTC/);
   assert.ok(caja.textContent.includes(catalogos.en["agent.numbered"].replace("{numero}", "1")));
 });
+
+test("a change of language during the first catalog load is kept", async () => {
+  let soltarIngles;
+  const esperas = { en: new Promise((listo) => (soltarIngles = listo)) };
+  const { document, local } = await abrirPagina({ guardado: "en", esperas });
+  const selector = document.getElementById("idioma");
+  selector.value = "pt";
+  selector.disparar("change");
+  await calma();
+  soltarIngles();
+  await calma();
+  assert.equal(local.datos.get("praetore_idioma"), "pt");
+  assert.equal(selector.value, "pt");
+  assert.equal(document.documentElement.getAttribute("lang"), "pt-BR");
+});
+
+test("choosing the language the page is still loading is kept", async () => {
+  let soltarIngles;
+  const esperas = { en: new Promise((listo) => (soltarIngles = listo)) };
+  const { document, local } = await abrirPagina({ guardado: null, navegador: ["en-US"], esperas });
+  const selector = document.getElementById("idioma");
+  selector.value = "en";
+  selector.disparar("change");
+  await calma();
+  soltarIngles();
+  await calma();
+  assert.equal(local.datos.get("praetore_idioma"), "en");
+  assert.equal(selector.value, "en");
+  assert.equal(document.documentElement.getAttribute("lang"), "en");
+});
+
+test("a chosen catalog that fails still falls back to Spanish", async () => {
+  const fallo = Promise.reject(new Error("sin catálogo"));
+  fallo.catch(() => {});
+  const { document, pedidos } = await abrirPagina({ guardado: "en", esperas: { en: fallo } });
+  assert.equal(document.documentElement.getAttribute("lang"), "es");
+  assert.equal(document.getElementById("idioma").value, "es");
+  assert.deepEqual(pedidos.filter((p) => p.url.startsWith("/i18n/")).map((p) => p.url), ["/i18n/en.json", "/i18n/es.json"]);
+});

@@ -4,7 +4,7 @@
 use praetore_core::{DecisionOutcome, Evidence, Policy, PolicyCondition, PolicyEffect, PolicyRule};
 use praetore_mcp::{
     receipts,
-    store::{self, ACTION_TYPE, CAPABILITY, DEFAULT_ALLOW_RULE, Home},
+    store::{self, ACTION_TYPE, CAPABILITY, Home, LEGACY_ALLOW_ALL_RULE},
 };
 use serde_json::{Value, json};
 use std::{
@@ -13,6 +13,13 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
 };
+
+/// Whether a `verify` run without the heads kept elsewhere found nothing
+/// wrong: the summary says UNANCHORED and the exit code is 3, not 0 (a
+/// result without both heads is not a pass).
+fn unanchored(out: &Output) -> bool {
+    out.status.code() == Some(3) && String::from_utf8_lossy(&out.stdout).starts_with("UNANCHORED ")
+}
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_praetore-mcp")
@@ -59,7 +66,7 @@ fn init_home() -> (tempfile::TempDir, Home) {
 
 fn write_policy(home: &Home, extra: Vec<PolicyRule>) {
     let mut rules = vec![
-        PolicyRule::new(DEFAULT_ALLOW_RULE, ACTION_TYPE, PolicyEffect::Allow)
+        PolicyRule::new(LEGACY_ALLOW_ALL_RULE, ACTION_TYPE, PolicyEffect::Allow)
             .with_capability(CAPABILITY),
     ];
     rules.extend(extra);
@@ -189,7 +196,7 @@ fn observe_forwards_and_records_verifiable_observe_receipt() {
 
     let verify = verify_cli(&home);
     let text = String::from_utf8_lossy(&verify.stdout);
-    assert!(verify.status.success(), "{text}");
+    assert!(unanchored(&verify), "{text}");
     assert!(text.contains("1 verified, 0 failed"), "{text}");
     assert!(text.contains("observe=1"), "{text}");
 
@@ -276,7 +283,7 @@ fn enforce_blocks_deny_and_approval_and_allows_the_rest() {
 
     let verify = verify_cli(&home);
     let report = String::from_utf8_lossy(&verify.stdout);
-    assert!(verify.status.success(), "{report}");
+    assert!(unanchored(&verify), "{report}");
     assert!(report.contains("3 verified, 0 failed"), "{report}");
 }
 
@@ -292,7 +299,7 @@ fn tampered_journal_line_fails_verify() {
         ]),
     );
     assert!(out.status.success(), "{stderr}");
-    assert!(verify_cli(&home).status.success());
+    assert!(unanchored(&verify_cli(&home)));
 
     // Re-label an observe receipt as enforce: the mode is signed, so this
     // must not verify.
@@ -424,6 +431,17 @@ fn rules_generated_by_policy_commands_enforce_end_to_end() {
     let ok_path = fs::canonicalize(temp.path()).unwrap().join("ok");
     let ok_path = ok_path.to_str().unwrap();
     for args in [
+        // `init` writes a default-deny policy: allow what this test runs.
+        vec![
+            "policy",
+            "allow",
+            "--id",
+            "allow-echo",
+            "--server",
+            "fake",
+            "--tool",
+            "echo",
+        ],
         vec![
             "policy",
             "deny",
@@ -497,7 +515,7 @@ fn rules_generated_by_policy_commands_enforce_end_to_end() {
             DecisionOutcome::RequireApproval
         ]
     );
-    assert!(verify_cli(&home).status.success());
+    assert!(unanchored(&verify_cli(&home)));
 }
 
 /// Security review regressions: bare-CR line splitting (Python/Node
@@ -541,7 +559,7 @@ fn enforce_refuses_line_split_and_case_fold_differentials() {
             .iter()
             .all(|e| e.action.parameters["tool"] == "delete_file")
     );
-    assert!(verify_cli(&home).status.success());
+    assert!(unanchored(&verify_cli(&home)));
 }
 
 fn write_rules(home: &Home, rules: Vec<PolicyRule>) {
@@ -639,7 +657,7 @@ fn allow_path_prefix_does_not_allow_a_symlink_that_leaves_it() {
 
     let verify = verify_cli(&home);
     let report = String::from_utf8_lossy(&verify.stdout);
-    assert!(verify.status.success(), "{report}");
+    assert!(unanchored(&verify), "{report}");
     assert!(report.contains("5 verified, 0 failed"), "{report}");
 }
 
@@ -682,10 +700,11 @@ fn deny_path_prefix_catches_symlinks_into_it_and_unresolvable_paths() {
         }
     }
     assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
-    assert!(verify_cli(&home).status.success());
+    assert!(unanchored(&verify_cli(&home)));
 }
 
-/// Observe still forwards everything, and its receipts record the check.
+/// Observe forwards these path-checked calls, DENY included, and its
+/// receipts record the check.
 #[cfg(unix)]
 #[test]
 fn observe_records_the_path_check_and_forwards() {
@@ -779,7 +798,7 @@ fn deny_path_prefix_catches_case_and_nfd_variants_of_a_missing_name_on_apfs() {
             "ambiguous"
         ]
     );
-    assert!(verify_cli(&home).status.success());
+    assert!(unanchored(&verify_cli(&home)));
 }
 
 /// Independent review of `a9dbbdf`, Alta 1, as the reviewer ran it: DENY on
@@ -829,7 +848,7 @@ fn deny_path_prefix_catches_sharp_s_variants_of_dot_ssh_on_apfs() {
     );
     assert!(refused(&step2, 64), "{stderr}");
     assert_eq!(stderr.matches("EXECUTED echo").count(), 0, "{stderr}");
-    assert!(verify_cli(&home).status.success());
+    assert!(unanchored(&verify_cli(&home)));
 }
 
 /// Independent review of `a9dbbdf`, Alta 2: `realpath` keeps the
@@ -871,7 +890,7 @@ fn deny_path_prefix_catches_firmlink_spellings_on_macos() {
         assert_eq!(reply["result"]["isError"], refused, "id {id}: {stderr}");
     }
     assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
-    assert!(verify_cli(&home).status.success());
+    assert!(unanchored(&verify_cli(&home)));
 }
 
 /// Independent review of `c5dc165`, Media 1, as the reviewer ran it: DENY on
@@ -913,7 +932,7 @@ fn deny_on_the_macos_data_volume_covers_firmlinked_spellings() {
         assert_eq!(reply["result"]["isError"], refused, "id {id}: {stderr}");
     }
     assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
-    assert!(verify_cli(&home).status.success());
+    assert!(unanchored(&verify_cli(&home)));
 }
 
 /// Independent review of `d300e25`, Media 1, as the reviewer ran it:
@@ -957,7 +976,7 @@ fn deny_on_the_macos_data_volume_covers_dot_root_aliases() {
         assert_eq!(reply["result"]["isError"], refused, "id {id}: {stderr}");
     }
     assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
-    assert!(verify_cli(&home).status.success());
+    assert!(unanchored(&verify_cli(&home)));
 }
 
 /// Independent review of `f9ae433`, Media 1, as the reviewer ran it: the
@@ -1019,7 +1038,7 @@ fn deny_path_prefix_catches_dev_fd_aliases_of_server_descriptors() {
         fs::read_to_string(root.join("notes.txt")).unwrap(),
         "PWNED\n"
     );
-    assert!(verify_cli(&home).status.success());
+    assert!(unanchored(&verify_cli(&home)));
 }
 
 /// Independent review of `419e66f`, Media 1, as the reviewer ran it, on a
@@ -1080,7 +1099,7 @@ fn deny_path_prefix_catches_hfs_ignorable_aliases_of_a_missing_name() {
         "the agent created the denied entry: {stderr}"
     );
     fs::remove_file(hfs.join("notes.txt")).unwrap();
-    assert!(verify_cli(&home).status.success());
+    assert!(unanchored(&verify_cli(&home)));
 }
 
 /// G7: the default policy plus `safety:halt` declared Safety.
@@ -1175,7 +1194,7 @@ fn g7_undeclared_safety_call_is_refused_in_both_modes() {
         assert!(text.contains(&evidence[0].evidence_id.to_string()));
         let verify = verify_cli(&home);
         let report = String::from_utf8_lossy(&verify.stdout);
-        assert!(verify.status.success(), "{mode}: {report}");
+        assert!(unanchored(&verify), "{mode}: {report}");
         assert!(report.contains("1 verified, 0 failed"), "{mode}: {report}");
     }
 }
@@ -1381,15 +1400,22 @@ fn verify_detects_removed_duplicated_reordered_and_truncated_entries() {
         assert_eq!(value["prev"].as_str().unwrap().len(), 64);
     }
     let (code, report) = verify_output(&home, &[]);
-    assert_eq!(code, Some(0), "{report}");
+    assert_eq!(code, Some(3), "{report}");
     assert!(report.contains("3 verified, 0 failed"), "{report}");
     assert!(
         report.contains("journal head: 3 chained entries"),
         "{report}"
     );
     let head = head_of(&report);
+    // One head alone is not a pass; both are (this home has no approvals).
     let (code, report) = verify_output(&home, &["--expected-head", &head]);
+    assert_eq!(code, Some(3), "{report}");
+    let (code, report) = verify_output(
+        &home,
+        &["--expected-head", &head, "--expected-approval-head", "none"],
+    );
     assert_eq!(code, Some(0), "{report}");
+    assert!(report.starts_with("OK 3 receipts"), "{report}");
 
     let write = |kept: &[&String]| {
         let text: String = kept.iter().map(|l| format!("{l}\n")).collect();
@@ -1421,7 +1447,7 @@ fn verify_detects_removed_duplicated_reordered_and_truncated_entries() {
     // kept elsewhere shows it.
     write(&[&lines[0], &lines[1]]);
     let (code, report) = verify_output(&home, &[]);
-    assert_eq!(code, Some(0), "{report}");
+    assert_eq!(code, Some(3), "{report}");
     let (code, report) = verify_output(&home, &["--expected-head", &head]);
     assert_eq!(code, Some(1), "{report}");
     assert!(
@@ -1457,7 +1483,7 @@ fn chain_continues_across_daily_files_and_a_removed_file_is_detected() {
     let last: Value = serde_json::from_str(&all.last().unwrap().text).unwrap();
     assert_eq!(last["seq"], 3, "{last}");
     let (code, report) = verify_output(&home, &[]);
-    assert_eq!(code, Some(0), "{report}");
+    assert_eq!(code, Some(3), "{report}");
     assert!(
         report.contains("journal head: 4 chained entries"),
         "{report}"
@@ -1469,10 +1495,13 @@ fn chain_continues_across_daily_files_and_a_removed_file_is_detected() {
     assert!(report.contains("journal order"), "{report}");
 }
 
-/// Receipts written before the chain existed (bare evidence lines) still
-/// verify, are counted apart, and the chain starts after them.
+/// A bare evidence line (the format before the chain existed) has no `seq`
+/// or `prev`, so it is not an entry of the chain: `verify` fails on it
+/// wherever it is. Before, such lines verified when they came before the
+/// first chained entry, which let a signed receipt be added to a journal
+/// without changing its head.
 #[test]
-fn unchained_entries_from_earlier_versions_still_verify_before_the_chain() {
+fn a_bare_evidence_line_is_outside_the_chain_wherever_it_is() {
     let (_temp, home, file, lines) = journal_of_three();
     // Rewrite the first two entries in the earlier format.
     let bare = |line: &String| {
@@ -1487,14 +1516,17 @@ fn unchained_entries_from_earlier_versions_still_verify_before_the_chain() {
     let (_, stderr, out) = wrap(&home, "observe", &session(vec![call]));
     assert!(out.status.success(), "{stderr}");
     let (code, report) = verify_output(&home, &[]);
-    assert_eq!(code, Some(0), "{report}");
-    assert!(report.contains("3 verified, 0 failed"), "{report}");
-    assert!(
-        report.contains("1 chained entries") && report.contains("2 unchained"),
+    assert_eq!(code, Some(1), "{report}");
+    assert!(report.contains("1 verified, 2 failed"), "{report}");
+    assert_eq!(
+        report.matches("journal order: unchained line").count(),
+        2,
         "{report}"
     );
+    assert!(report.contains("2001-01-01.jsonl:1"), "{report}");
+    assert!(report.contains("2001-01-01.jsonl:2"), "{report}");
 
-    // An unchained line after the chain started is reported.
+    // After the chain too.
     let today = receipts::read_journal(&home)
         .unwrap()
         .last()
@@ -1506,8 +1538,9 @@ fn unchained_entries_from_earlier_versions_still_verify_before_the_chain() {
     fs::write(&today, text).unwrap();
     let (code, report) = verify_output(&home, &[]);
     assert_eq!(code, Some(1), "{report}");
-    assert!(
-        report.contains("unchained line after the chain started"),
+    assert_eq!(
+        report.matches("journal order: unchained line").count(),
+        3,
         "{report}"
     );
 }
@@ -1531,6 +1564,40 @@ fn torn_journal_tail_refuses_in_enforce() {
     assert!(!stderr.contains("EXECUTED"), "{stderr}");
 }
 
+/// A literal argument key `"a.b"` must not satisfy a condition written as
+/// the nested path `arguments.a.b`. Enforce refuses to load that policy, so
+/// the call is not executed.
+#[test]
+fn enforce_does_not_load_a_rule_on_arguments_a_dot_b() {
+    let (_temp, home) = init_home();
+    let mut policy = store::default_policy();
+    policy.rules.push(
+        PolicyRule::new("allow-dotted", ACTION_TYPE, PolicyEffect::Allow)
+            .with_capability(CAPABILITY)
+            .with_parameter_condition(PolicyCondition::exact("tool", json!("echo")))
+            .with_parameter_condition(PolicyCondition::exact("arguments.a.b", json!("x"))),
+    );
+    fs::write(
+        home.policy(),
+        serde_json::to_string_pretty(&policy).unwrap(),
+    )
+    .unwrap();
+    let call = json!({
+        "jsonrpc": "2.0",
+        "id": "c",
+        "method": "tools/call",
+        "params": {"name": "echo", "arguments": {"a.b": "x"}}
+    });
+    let (responses, stderr, out) = wrap(&home, "enforce", &session(vec![call]));
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("refusing to load policy") && stderr.contains("arguments.a.b"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("EXECUTED echo"), "{stderr}");
+    assert_eq!(by_id(&responses, &json!("c"))["result"]["isError"], true);
+}
+
 /// Oversized client lines: a client line over 32 MiB is not parsed, so it cannot be
 /// checked for a `safety*` tool; it is refused in observe too, and the
 /// traffic after it still flows.
@@ -1547,11 +1614,20 @@ fn oversized_lines_are_refused_in_observe_too() {
     assert!(stderr.contains("REFUSED client message over"), "{stderr}");
     assert!(!stderr.contains("EXECUTED safety"), "{stderr}");
     assert!(stderr.contains("EXECUTED echo"), "{stderr}");
+    let refusal = by_id(&responses, &json!("big"));
+    assert_eq!(refusal["jsonrpc"], "2.0");
+    assert_eq!(refusal["error"]["code"], -32600, "{refusal}");
+    assert!(
+        refusal["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("32 MiB"),
+        "{refusal}"
+    );
     assert_eq!(
         by_id(&responses, &json!("after"))["result"]["isError"],
         false
     );
-    assert!(responses.iter().all(|r| r["id"] != "big"));
 }
 
 /// The head line counts the chained entries present in the journal, not the

@@ -4,11 +4,15 @@
 //! live under `DIR/approvals/pending/`. Signed decisions and the one
 //! execution that consumes an approval live in `DIR/approvals/journal.jsonl`,
 //! a hash-linked file that `verify` reads next to the receipts journal.
+//! Both journals append through `journal_io`: a short or failed write is
+//! truncated back to the previous length.
 //!
 //! The receipts journal itself is unchanged: a held call and the later
 //! retry are ordinary evidence lines. Putting decisions in that chain would
 //! have changed how v0.3.3 lines are linked.
 
+use crate::journal::JournalError;
+use crate::shown::Show;
 use crate::store::{self, Home};
 use ed25519_dalek::{Signer, SigningKey};
 use praetore_core::{DecisionOutcome, Evidence, VerifiedPublicKey};
@@ -32,6 +36,7 @@ const MAX_TTL_SECONDS: i64 = 86_400;
 /// One approval record stays small enough to append in one write.
 const MAX_RECORD_BYTES: usize = 48 * 1024;
 const MODE_KEY: &str = "praetore.mode";
+const APPROVAL_KEY: &str = crate::gate::APPROVAL_CONTEXT_KEY;
 
 const DECISION_KEYS: &[&str] = &[
     "approval_id",
@@ -80,16 +85,40 @@ impl HumanOutcome {
 struct Binding {
     server: String,
     tool: String,
+    /// Raw call arguments. Not the copy the engine saw.
     arguments: Value,
+    /// `praetore.path_check` from the retained receipt, or from the receipt
+    /// of the call being evaluated. `Null` when that receipt has none.
+    path_check: Value,
 }
 
 /// What enforce does with a `REQUIRE_APPROVAL` verdict.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum HoldOrForward {
-    /// The call was not forwarded. `message` is the MCP tool error text.
-    Hold { message: String },
+    /// The call was not forwarded. The held receipt is in the journal at
+    /// `journaled`; `message` is the MCP tool error text.
+    Hold { journaled: PathBuf, message: String },
     /// One unused approval matched this exact call and was consumed.
-    Forward { approval_id: String },
+    /// `evidence` is the receipt that names `approval_id` in its signed
+    /// context, journaled at `journaled`; the held receipt was not written.
+    Forward {
+        approval_id: String,
+        evidence: Box<Evidence>,
+        journaled: PathBuf,
+    },
+    /// The call was not forwarded. `evidence` is the receipt written for it
+    /// (or that could not be written: `journaled` is the error).
+    Failed {
+        evidence: Box<Evidence>,
+        journaled: Result<PathBuf, JournalError>,
+        error: String,
+    },
+}
+
+/// The receipt written for a call on the approval path, and where.
+struct Written {
+    evidence: Evidence,
+    journaled: Result<PathBuf, JournalError>,
 }
 
 #[derive(Debug, Clone)]
@@ -98,8 +127,154 @@ pub struct PendingInfo {
     pub server: String,
     pub tool: String,
     pub arguments_preview: String,
-    pub expires_at: String,
+    pub expiry: Expiry,
     pub evidence_id: String,
+}
+
+/// The `expires_at` of a pending call, read once with the pending file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Expiry {
+    text: String,
+    at: Option<OffsetDateTime>,
+}
+
+impl Expiry {
+    pub fn parse(text: &str) -> Self {
+        Self {
+            text: text.to_owned(),
+            at: parse_time(text).ok(),
+        }
+    }
+
+    /// `expires_at` as written in the pending file.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// The time, to show it; `None` when `expires_at` is not RFC 3339.
+    /// `clippy.toml` refuses a call to it unless it is marked display only.
+    pub fn at(&self) -> Option<OffsetDateTime> {
+        self.at
+    }
+
+    /// Whether the call can no longer be decided at `now`: strictly past
+    /// `expires_at`, or with an `expires_at` that cannot be read. Holding a
+    /// call again, `approve`, `reject`, the dashboard and the session
+    /// report use this one rule.
+    pub fn is_expired_at(&self, now: OffsetDateTime) -> bool {
+        self.at.is_none_or(|expires| now > expires)
+    }
+}
+
+/// The signed approval window. Built only from the retained receipt's
+/// signed timestamp and the configured TTL. The pending file's
+/// `created_at` and `expires_at` are not inputs.
+struct ApprovalWindow {
+    created_at: String,
+    expires_at: String,
+}
+
+impl ApprovalWindow {
+    fn from_retained(evidence: &Evidence, ttl: Duration) -> Result<Self, String> {
+        let created_at = evidence
+            .decided_at
+            .clone()
+            .filter(|text| !text.is_empty())
+            .ok_or("retained receipt has no signed timestamp")?;
+        let created = parse_time(&created_at)?;
+        let seconds = ttl.whole_seconds();
+        if !(1..=MAX_TTL_SECONDS).contains(&seconds) {
+            return Err(format!(
+                "approval TTL must be from 1 to {MAX_TTL_SECONDS} seconds, got {seconds}"
+            ));
+        }
+        let expires = created
+            .checked_add(Duration::seconds(seconds))
+            .ok_or("approval expiry is outside the representable range")?;
+        let expires_at = expires
+            .format(&Rfc3339)
+            .map_err(|error| error.to_string())?;
+        let span = expires - created;
+        if span.is_negative() || span.whole_seconds() > MAX_TTL_SECONDS {
+            return Err(format!(
+                "approval window is {} seconds; the maximum is {MAX_TTL_SECONDS}",
+                span.whole_seconds()
+            ));
+        }
+        Ok(Self {
+            created_at,
+            expires_at,
+        })
+    }
+
+    fn created_at(&self) -> &str {
+        &self.created_at
+    }
+
+    fn expires_at(&self) -> &str {
+        &self.expires_at
+    }
+}
+
+/// How `created_at` on a signed decision sits against the retained
+/// receipt's timestamp.
+///
+/// [`HoldInstant::Exact`] is a new decision: `decide` copies that
+/// timestamp, and the strings are equal.
+///
+/// [`HoldInstant::HistoricalWholeSecond`] is a 0.3.6 decision. Its
+/// `created_at` is the receipt timestamp truncated to a whole UTC second
+/// (no fractional part). Truncating the receipt the same way yields that
+/// second, so the two instants differ by less than one second. `decided_at`
+/// is not truncated: `created_at <= decided_at <= expires_at` stays at full
+/// precision. The window is still at most [`MAX_TTL_SECONDS`].
+enum HoldInstant {
+    Exact,
+    HistoricalWholeSecond,
+}
+
+impl HoldInstant {
+    fn check(decision_created: &str, receipt_at: &str) -> Result<Self, String> {
+        if decision_created == receipt_at {
+            return Ok(Self::Exact);
+        }
+        Self::historical_whole_second(decision_created, receipt_at)
+    }
+
+    /// 0.3.6 shape only: `decision_created` has no fraction, and both
+    /// timestamps fall in the same UTC second.
+    fn historical_whole_second(decision_created: &str, receipt_at: &str) -> Result<Self, String> {
+        if decision_created.contains('.') {
+            return Err(hold_instant_mismatch());
+        }
+        let decision = parse_time(decision_created)?;
+        let receipt = parse_time(receipt_at)?;
+        if decision.nanosecond() != 0 {
+            return Err(hold_instant_mismatch());
+        }
+        let decision_second = decision
+            .replace_nanosecond(0)
+            .map_err(|error| error.to_string())?;
+        let receipt_second = receipt
+            .replace_nanosecond(0)
+            .map_err(|error| error.to_string())?;
+        if decision_second != receipt_second {
+            return Err(hold_instant_mismatch());
+        }
+        let skew = if receipt >= decision {
+            receipt - decision
+        } else {
+            decision - receipt
+        };
+        if skew.is_negative() || skew >= Duration::seconds(1) {
+            return Err(hold_instant_mismatch());
+        }
+        Ok(Self::HistoricalWholeSecond)
+    }
+}
+
+fn hold_instant_mismatch() -> String {
+    "created_at does not match the signed timestamp of the retained receipt".into()
 }
 
 #[derive(Debug, Clone)]
@@ -108,7 +283,7 @@ pub struct Decided {
     pub outcome: String,
     pub server: String,
     pub tool: String,
-    pub expires_at: String,
+    pub expiry: Expiry,
     pub approver_key_id: String,
 }
 
@@ -130,71 +305,171 @@ struct JournalEntry {
     canonical: Vec<u8>,
 }
 
-/// Enforce path: do not forward. Either consume one matching approval or
-/// register (or reuse) a pending id the person can approve from a terminal.
+/// Enforce path for a `REQUIRE_APPROVAL` receipt `held`, not journaled yet.
+///
+/// Under the approval lock: if an approval of this exact call is unused, the
+/// call is signed again with the approval id in its context
+/// (`sign_forward`), that receipt is journaled (`journal`), then the
+/// execution is recorded, and the call may be forwarded once. An approval is
+/// used when the approval journal has its execution or when a receipt in the
+/// receipts journal names it, so cutting the approval journal alone does not
+/// free it. Otherwise `held` is journaled and a pending id is registered (or
+/// reused) for the person to approve from a terminal.
 pub fn on_require_approval(
     home: &Home,
     server: &str,
     params: &Value,
-    evidence: &Evidence,
+    held: &Evidence,
+    sign_forward: &dyn Fn(&str) -> Result<Evidence, String>,
+    journal: &dyn Fn(&Evidence) -> Result<PathBuf, JournalError>,
+) -> HoldOrForward {
+    let mut written = None;
+    match hold_or_forward(
+        home,
+        server,
+        params,
+        held,
+        sign_forward,
+        journal,
+        &mut written,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let written = written.unwrap_or_else(|| Written {
+                evidence: held.clone(),
+                journaled: journal(held),
+            });
+            HoldOrForward::Failed {
+                evidence: Box::new(written.evidence),
+                journaled: written.journaled,
+                error,
+            }
+        }
+    }
+}
+
+fn hold_or_forward(
+    home: &Home,
+    server: &str,
+    params: &Value,
+    held: &Evidence,
+    sign_forward: &dyn Fn(&str) -> Result<Evidence, String>,
+    journal: &dyn Fn(&Evidence) -> Result<PathBuf, JournalError>,
+    written: &mut Option<Written>,
 ) -> Result<HoldOrForward, String> {
-    let binding = binding_from_call(server, params)?;
-    if evidence.decision.outcome != DecisionOutcome::RequireApproval {
+    let binding = binding_from_call(server, params, held)?;
+    if held.decision.outcome != DecisionOutcome::RequireApproval {
         return Err("approval handling called for a call that is not REQUIRE_APPROVAL".into());
     }
-    binding_matches_evidence(&binding, evidence)?;
-    with_lock(home, |journal| {
-        let entries = read_journal(journal)?;
+    binding_matches_evidence(&binding, held)?;
+    with_lock(home, |journal_path| {
+        let entries = read_journal(home, journal_path)?;
         let now = now_utc()?;
-        if let Some(approval_id) = first_unused_approval(home, &entries, &binding, now)? {
+        let named = approvals_named_in_receipts(home)?;
+        if let Some(approval_id) = first_unused_approval(home, &entries, &binding, &named, now)? {
+            let evidence = sign_forward(&approval_id)?;
+            if evidence.decision.outcome != DecisionOutcome::RequireApproval {
+                return Err("the call signed with its approval is not REQUIRE_APPROVAL".into());
+            }
+            binding_matches_evidence(&binding, &evidence)?;
+            if approval_named(&evidence)? != Some(approval_id.as_str()) {
+                return Err("the call signed with its approval does not name it".into());
+            }
+            let journaled = journal(&evidence);
+            *written = Some(Written {
+                evidence: evidence.clone(),
+                journaled: journaled.clone(),
+            });
+            let path = journaled?;
             append_execution(
                 home,
-                journal,
+                journal_path,
                 &entries,
                 &approval_id,
                 &binding,
                 &evidence.evidence_id.to_string(),
-                now,
+                OffsetDateTime::now_utc(),
             )?;
-            return Ok(HoldOrForward::Forward { approval_id });
+            return Ok(HoldOrForward::Forward {
+                approval_id,
+                evidence: Box::new(evidence),
+                journaled: path,
+            });
         }
-        let pending = reuse_or_create_pending(
-            home,
-            &binding,
-            &evidence.evidence_id.to_string(),
-            now,
-            ttl(home)?,
-        )?;
+        let journaled = journal(held);
+        *written = Some(Written {
+            evidence: held.clone(),
+            journaled: journaled.clone(),
+        });
+        let path = journaled?;
+        let pending =
+            reuse_or_create_pending(home, &entries, &binding, held, now, approval_ttl(home)?)?;
         Ok(HoldOrForward::Hold {
+            journaled: path,
             message: hold_message(home, &pending),
         })
     })
 }
 
-/// Pending approvals, soonest expiry first.
+/// The approval id a receipt names in its signed context, if any. A value
+/// that is not 64 lowercase hex characters is an error.
+pub fn approval_named(evidence: &Evidence) -> Result<Option<&str>, String> {
+    match evidence.context.get(APPROVAL_KEY) {
+        None => Ok(None),
+        Some(value) => match value.as_str() {
+            Some(id) if valid_id(id) => Ok(Some(id)),
+            _ => Err(format!("{APPROVAL_KEY} is not 64 lowercase hex characters")),
+        },
+    }
+}
+
+/// Approval ids named by receipts in the receipts journal. Only lines that
+/// contain the context key are parsed; one that cannot be read is an error,
+/// so the call is not forwarded.
+fn approvals_named_in_receipts(home: &Home) -> Result<BTreeSet<String>, String> {
+    let mut named = BTreeSet::new();
+    for line in crate::receipts::read_journal(home)? {
+        if !line.text.contains(APPROVAL_KEY) {
+            continue;
+        }
+        let entry = crate::journal::parse_line(&line.text).map_err(|e| {
+            format!(
+                "cannot read {}:{} to check which approvals were used: {e}",
+                line.file.shown(),
+                line.line_number
+            )
+        })?;
+        if let Some(id) = approval_named(&entry.evidence)? {
+            named.insert(id.to_owned());
+        }
+    }
+    Ok(named)
+}
+
 pub fn list_pending(home: &Home) -> Result<Vec<PendingInfo>, String> {
     let mut listed = Vec::new();
     let dir = pending_dir(home);
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(listed),
-        Err(error) => return Err(format!("cannot read {}: {error}", dir.display())),
+        Err(error) => return Err(format!("cannot read {}: {error}", dir.shown())),
     };
     for entry in entries {
-        let entry = entry.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+        let entry = entry.map_err(|e| format!("cannot read {}: {e}", dir.shown()))?;
         let path = entry.path();
         if path.extension().is_none_or(|ext| ext != "json") {
             continue;
         }
-        let text = fs::read_to_string(&path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let text =
+            fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.shown()))?;
         let value: Value = serde_json::from_str(&text)
-            .map_err(|e| format!("{} is not JSON: {e}", path.display()))?;
-        listed.push(pending_info(&value).map_err(|e| format!("{}: {e}", path.display()))?);
+            .map_err(|e| format!("{} is not JSON: {e}", path.shown()))?;
+        listed.push(pending_info(&value).map_err(|e| format!("{}: {e}", path.shown()))?);
     }
     listed.sort_by(|a, b| {
-        a.expires_at
-            .cmp(&b.expires_at)
+        a.expiry
+            .text()
+            .cmp(b.expiry.text())
             .then(a.approval_id.cmp(&b.approval_id))
     });
     Ok(listed)
@@ -205,7 +480,7 @@ pub fn list_pending(home: &Home) -> Result<Vec<PendingInfo>, String> {
 pub struct PendingCall {
     pub server: String,
     pub tool: String,
-    pub expires_at: String,
+    pub expiry: Expiry,
     pub evidence_id: String,
     /// Canonical JSON of the arguments, not truncated.
     pub arguments_canonical: String,
@@ -223,10 +498,10 @@ pub fn pending_call(home: &Home, approval_id: &str) -> Result<PendingCall, Strin
         format!("no pending approval {approval_id} (unknown id, or already decided)")
     })?;
     let pending: Value =
-        serde_json::from_str(&text).map_err(|e| format!("{} is not JSON: {e}", path.display()))?;
+        serde_json::from_str(&text).map_err(|e| format!("{} is not JSON: {e}", path.shown()))?;
     let info = pending_info(&pending)?;
     if info.approval_id != approval_id {
-        return Err(format!("{} does not match its approval id", path.display()));
+        return Err(format!("{} does not match its approval id", path.shown()));
     }
     let arguments = pending
         .get("arguments")
@@ -237,7 +512,7 @@ pub fn pending_call(home: &Home, approval_id: &str) -> Result<PendingCall, Strin
     Ok(PendingCall {
         server: info.server,
         tool: info.tool,
-        expires_at: info.expires_at,
+        expiry: info.expiry,
         evidence_id: info.evidence_id,
         arguments_canonical: canonical,
     })
@@ -248,7 +523,7 @@ fn load_signed_receipt(home: &Home, evidence_id: &str) -> Result<Evidence, Strin
     let pins = store::read_issuer_pins(&home.issuer_pins())?;
     for line in crate::receipts::read_journal(home)? {
         let parsed = crate::journal::parse_line(&line.text)
-            .map_err(|error| format!("{}:{}: {error}", line.file.display(), line.line_number))?;
+            .map_err(|error| format!("{}:{}: {error}", line.file.shown(), line.line_number))?;
         if parsed.evidence.evidence_id.to_string() != evidence_id {
             continue;
         }
@@ -261,6 +536,24 @@ fn load_signed_receipt(home: &Home, evidence_id: &str) -> Result<Evidence, Strin
     Err(format!(
         "pending evidence {evidence_id} is not in the receipts journal; nothing was signed and the pending file was kept"
     ))
+}
+
+/// Why `approve` or `reject` of an expired pending call signs nothing, and
+/// what to do next.
+#[expect(clippy::disallowed_methods, reason = "display only")]
+pub fn expired_message(approval_id: &str, expiry: &Expiry, outcome: HumanOutcome) -> String {
+    let at = expiry.at().map_or_else(
+        || format!("an unreadable time ({:?})", expiry.text()),
+        crate::when::clock_local,
+    );
+    match outcome {
+        HumanOutcome::Approve => format!(
+            "this approval expired at {at}; run the agent again so the call is held again, then approve the new id. Approval {approval_id} expired; nothing was signed"
+        ),
+        HumanOutcome::Reject => format!(
+            "this approval expired at {at}; the call was not forwarded and there is nothing left to reject. Approval {approval_id} expired; nothing was signed"
+        ),
+    }
 }
 
 /// Signs a decision for a pending id and appends it to the approval journal.
@@ -277,7 +570,7 @@ pub fn decide(
         ));
     }
     with_lock(home, |journal| {
-        if let Some(existing) = find_decision(&read_journal(journal)?, approval_id)? {
+        if let Some(existing) = find_decision(&read_journal(home, journal)?, approval_id)? {
             let previous = existing["outcome"].as_str().unwrap_or("?");
             return Err(format!(
                 "approval {approval_id} was already decided ({previous}); nothing new was signed"
@@ -288,19 +581,12 @@ pub fn decide(
             format!("no pending approval {approval_id} (unknown id, or already decided)")
         })?;
         let pending: Value = serde_json::from_str(&text)
-            .map_err(|e| format!("{} is not JSON: {e}", path.display()))?;
+            .map_err(|e| format!("{} is not JSON: {e}", path.shown()))?;
         let info = pending_info(&pending)?;
         if info.approval_id != approval_id {
-            return Err(format!("{} does not match its approval id", path.display()));
+            return Err(format!("{} does not match its approval id", path.shown()));
         }
         let now = now_utc()?;
-        let expires = parse_time(&info.expires_at)?;
-        if now > expires {
-            return Err(format!(
-                "approval {approval_id} expired at {}; nothing was signed",
-                info.expires_at
-            ));
-        }
         let binding = binding_from_pending(&pending)?;
         if let Some(shown) = shown {
             let current = String::from_utf8(canonical_bytes(&binding.arguments)?)
@@ -322,6 +608,22 @@ pub fn decide(
         binding_matches_evidence(&binding, &evidence).map_err(|error| {
             format!("{error}; nothing was signed and the pending file was kept")
         })?;
+        // The signed window is the retained receipt's timestamp plus the
+        // TTL. A pending file that names another window is not signed.
+        let window = ApprovalWindow::from_retained(&evidence, approval_ttl(home)?)?;
+        let pending_created = pending["created_at"].as_str().unwrap_or("");
+        if pending_created != window.created_at() || info.expiry.text() != window.expires_at() {
+            if info.expiry.is_expired_at(now) {
+                return Err(expired_message(approval_id, &info.expiry, outcome));
+            }
+            return Err(
+                "pending approval window does not match the retained receipt; nothing was signed and the pending file was kept"
+                    .into(),
+            );
+        }
+        if info.expiry.is_expired_at(now) {
+            return Err(expired_message(approval_id, &info.expiry, outcome));
+        }
         let approver = store::approver_secret(home)?;
         let approver_key_id = public_hex(&approver);
         let pin = read_approver_pin(home)?;
@@ -331,10 +633,6 @@ pub fn decide(
                     .into(),
             );
         }
-        let created_at = pending["created_at"]
-            .as_str()
-            .ok_or("pending approval has no created_at")?
-            .to_owned();
         let arguments = pending
             .get("arguments")
             .cloned()
@@ -349,20 +647,24 @@ pub fn decide(
             "tool": info.tool,
             "arguments": arguments,
             "pending_evidence_id": info.evidence_id,
-            "created_at": created_at,
-            "expires_at": info.expires_at,
-            "decided_at": timestamp(now)?,
+            "created_at": window.created_at(),
+            "expires_at": window.expires_at(),
+            // Full precision. Truncating to the second can put this before
+            // the receipt timestamp taken earlier in the same second.
+            "decided_at": OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .map_err(|error| error.to_string())?,
         });
         let signed = sign_record(&record, DECISION_DOMAIN, &approver)?;
-        let entries = read_journal(journal)?;
+        let entries = read_journal(home, journal)?;
         append_signed(journal, &entries, &signed)?;
-        fs::remove_file(&path).map_err(|e| format!("cannot remove {}: {e}", path.display()))?;
+        fs::remove_file(&path).map_err(|e| format!("cannot remove {}: {e}", path.shown()))?;
         Ok(Decided {
             approval_id: approval_id.to_owned(),
             outcome: outcome.as_str().to_owned(),
             server: info.server,
             tool: info.tool,
-            expires_at: info.expires_at,
+            expiry: info.expiry,
             approver_key_id,
         })
     })
@@ -382,7 +684,7 @@ pub fn record_duplicate_execution(
         return Err("approval id is not 64 lowercase hex characters".into());
     }
     with_lock(home, |journal| {
-        let entries = read_journal(journal)?;
+        let entries = read_journal(home, journal)?;
         let decision = find_decision(&entries, approval_id)?
             .ok_or_else(|| format!("no signed decision for {approval_id}"))?;
         if decision["outcome"] != "approve" {
@@ -397,16 +699,64 @@ pub fn record_duplicate_execution(
             approval_id,
             &binding,
             &evidence.evidence_id.to_string(),
-            now_utc()?,
+            OffsetDateTime::now_utc(),
         )
     })
+}
+
+/// The approval journal records (decisions and executions) in file order,
+/// for read-only views such as the session report. Nothing is checked here:
+/// `verify` checks signatures, bindings and order.
+pub fn records(home: &Home) -> Result<Vec<Value>, String> {
+    Ok(read_journal_unlocked(home)?
+        .into_iter()
+        .map(|entry| entry.record)
+        .collect())
+}
+
+/// Each line of the approval journal exactly as written, with its record.
+/// Fails if the journal cannot be read or a line is not a valid entry.
+pub fn raw_records(home: &Home) -> Result<Vec<(String, Value)>, String> {
+    let path = journal_path(home);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text =
+        fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.shown()))?;
+    let mut out = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let entry =
+            parse_journal_text(line).map_err(|e| format!("{}:{}: {e}", path.shown(), index + 1))?;
+        out.push((line.to_owned(), entry.record));
+    }
+    Ok(out)
 }
 
 /// Evidence id → short status for `receipts`. Not a signature check; `verify`
 /// does that. A missing approval directory yields an empty map.
 pub fn status_by_evidence(home: &Home) -> Result<BTreeMap<String, String>, String> {
+    status_by_evidence_at(home, OffsetDateTime::now_utc())
+}
+
+/// [`status_by_evidence`] at `now`. A held call nobody decided is
+/// `pending` until its `expires_at`, then `expired`. The held receipt of an approved call
+/// reads `approve by KEY` while the approval can still be used,
+/// `approve by KEY, executed once` once the retried call ran, and
+/// `approve by KEY, expired unused` when it expired before any retry ran.
+pub fn status_by_evidence_at(
+    home: &Home,
+    now: OffsetDateTime,
+) -> Result<BTreeMap<String, String>, String> {
     let mut status = BTreeMap::new();
     if let Ok(entries) = read_journal_unlocked(home) {
+        let executed: BTreeSet<&str> = entries
+            .iter()
+            .filter(|entry| entry.record["kind"].as_str() == Some("execution"))
+            .filter_map(|entry| entry.record["approval_id"].as_str())
+            .collect();
         for entry in &entries {
             match entry.record["kind"].as_str() {
                 Some("decision") => {
@@ -420,7 +770,19 @@ pub fn status_by_evidence(home: &Home) -> Result<BTreeMap<String, String>, Strin
                         .chars()
                         .take(16)
                         .collect();
-                    status.insert(id.to_owned(), format!("{outcome} by {key}"));
+                    let mut text = format!("{outcome} by {key}");
+                    if outcome == HumanOutcome::Approve.as_str() {
+                        let approval_id = entry.record["approval_id"].as_str().unwrap_or("");
+                        let expires = entry.record["expires_at"]
+                            .as_str()
+                            .and_then(|t| parse_time(t).ok());
+                        if executed.contains(approval_id) {
+                            text.push_str(", executed once");
+                        } else if expires.is_some_and(|expires| now > expires) {
+                            text.push_str(", expired unused");
+                        }
+                    }
+                    status.insert(id.to_owned(), text);
                 }
                 Some("execution") => {
                     let Some(id) = entry.record["evidence_id"].as_str() else {
@@ -434,20 +796,51 @@ pub fn status_by_evidence(home: &Home) -> Result<BTreeMap<String, String>, Strin
     }
     if let Ok(pending) = list_pending(home) {
         for item in pending {
+            let open = !item.expiry.is_expired_at(now);
             status
                 .entry(item.evidence_id)
-                .or_insert_with(|| "pending".into());
+                .or_insert_with(|| if open { "pending" } else { "expired" }.into());
         }
     }
     Ok(status)
 }
 
+/// Evidence id of a held call -> `decided_at` of the human decision on it
+/// (approve or reject), from the approval journal. Not a signature check;
+/// `verify` does that. An unreadable or absent journal yields an empty map.
+pub fn decided_at_by_evidence(home: &Home) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    if let Ok(entries) = read_journal_unlocked(home) {
+        for entry in &entries {
+            if entry.record["kind"].as_str() != Some("decision") {
+                continue;
+            }
+            if let (Some(id), Some(at)) = (
+                entry.record["pending_evidence_id"].as_str(),
+                entry.record["decided_at"].as_str(),
+            ) {
+                out.insert(id.to_owned(), at.to_owned());
+            }
+        }
+    }
+    out
+}
+
 /// Checks the approval journal: signatures, binding to the named receipts,
-/// expiry, and single use. An absent journal is success (homes from v0.3.3).
+/// expiry, and one use per approval (an approval whose execution and
+/// forwarded receipt are both cut from the end of the journals can run
+/// again; only the saved heads, `--expected-head` and
+/// `--expected-approval-head`, detect it). Then the receipts that name an
+/// approval in their signed context: one receipt per approval, a signed
+/// approve decision for it, and its execution for that receipt. An absent
+/// journal is success when no receipt names an approval (homes from
+/// v0.3.3).
 pub fn verify(home: &Home, evidence: &[Evidence]) -> Result<ApprovalReport, String> {
     let path = journal_path(home);
     if !path.exists() {
-        return Ok(ApprovalReport::default());
+        let mut report = ApprovalReport::default();
+        check_named_approvals(&[], evidence, &mut report.failures);
+        return Ok(report);
     }
     let entries = read_journal_unlocked(home)?;
     let mut report = ApprovalReport::default();
@@ -468,7 +861,7 @@ pub fn verify(home: &Home, evidence: &[Evidence]) -> Result<ApprovalReport, Stri
     let mut executions_of: BTreeMap<String, usize> = BTreeMap::new();
     let mut seen_decision: BTreeSet<String> = BTreeSet::new();
     for entry in &entries {
-        let at = format!("{} seq {}", path.display(), entry.seq);
+        let at = format!("{} seq {}", path.shown(), entry.seq);
         if entry.seq != expected_seq || entry.prev != expected_prev {
             report.failures.push(format!(
                 "FAIL {at}: approval journal does not follow the previous record (expected seq {expected_seq})"
@@ -541,10 +934,73 @@ pub fn verify(home: &Home, evidence: &[Evidence]) -> Result<ApprovalReport, Stri
             ));
         }
     }
+    check_named_approvals(&entries, evidence, &mut report.failures);
     if !entries.is_empty() {
         report.head = Some(head);
     }
     Ok(report)
+}
+
+/// Receipts that name an approval id in their signed context. Old receipts
+/// (v0.3.6 and before) name none and are not checked here.
+fn check_named_approvals(
+    entries: &[JournalEntry],
+    evidence: &[Evidence],
+    failures: &mut Vec<String>,
+) {
+    let mut named: BTreeMap<&str, Vec<&Evidence>> = BTreeMap::new();
+    for receipt in evidence {
+        match approval_named(receipt) {
+            Ok(Some(id)) => named.entry(id).or_default().push(receipt),
+            Ok(None) => {}
+            Err(error) => failures.push(format!(
+                "FAIL approvals: receipt {}: {error}",
+                receipt.evidence_id
+            )),
+        }
+    }
+    for (approval_id, receipts) in &named {
+        if receipts.len() > 1 {
+            failures.push(format!(
+                "FAIL approvals: {} forwarded receipts name approval {approval_id}, and an approval authorizes one call",
+                receipts.len()
+            ));
+        }
+        let decision = entries.iter().find(|entry| {
+            entry.record["kind"] == "decision" && entry.record["approval_id"] == *approval_id
+        });
+        match decision {
+            None => {
+                for receipt in receipts {
+                    failures.push(format!(
+                        "FAIL approvals: receipt {} names approval {approval_id}, which has no signed decision in the approval journal",
+                        receipt.evidence_id
+                    ));
+                }
+                continue;
+            }
+            Some(decision) if decision.record["outcome"] != "approve" => {
+                failures.push(format!(
+                    "FAIL approvals: a forwarded receipt names approval {approval_id}, which was rejected"
+                ));
+                continue;
+            }
+            Some(_) => {}
+        }
+        for receipt in receipts {
+            let evidence_id = receipt.evidence_id.to_string();
+            let executed = entries.iter().any(|entry| {
+                entry.record["kind"] == "execution"
+                    && entry.record["approval_id"] == *approval_id
+                    && entry.record["evidence_id"] == evidence_id.as_str()
+            });
+            if !executed {
+                failures.push(format!(
+                    "FAIL approvals: receipt {evidence_id} names approval {approval_id} and the approval journal has no execution of it for that receipt"
+                ));
+            }
+        }
+    }
 }
 
 fn verify_decision(
@@ -582,8 +1038,22 @@ fn verify_decision(
     if created > decided || decided > expires {
         return Err("decision times are not created_at <= decided_at <= expires_at".into());
     }
+    let span = expires - created;
+    if span.is_negative() || span.whole_seconds() > MAX_TTL_SECONDS {
+        return Err(format!(
+            "approval window is {} seconds; the maximum is {MAX_TTL_SECONDS}",
+            span.whole_seconds()
+        ));
+    }
     let pending_id = required_str(&entry.record, "pending_evidence_id")?;
     let evidence = find_evidence(evidence, pending_id)?;
+    let receipt_at = evidence
+        .decided_at
+        .as_deref()
+        .ok_or("retained receipt has no signed timestamp")?;
+    match HoldInstant::check(required_str(&entry.record, "created_at")?, receipt_at)? {
+        HoldInstant::Exact | HoldInstant::HistoricalWholeSecond => {}
+    }
     if evidence.decision.outcome != DecisionOutcome::RequireApproval {
         return Err("pending evidence is not a REQUIRE_APPROVAL receipt".into());
     }
@@ -644,24 +1114,42 @@ fn execution_within_window(
     Ok(())
 }
 
+/// The first approval of `binding` that is signed, not expired and not used:
+/// no execution in the approval journal and not in `named`, the ids that
+/// receipts in the receipts journal name.
 fn first_unused_approval(
     home: &Home,
     entries: &[JournalEntry],
     binding: &Binding,
+    named: &BTreeSet<String>,
     now: OffsetDateTime,
 ) -> Result<Option<String>, String> {
-    let used: BTreeSet<&str> = entries
+    // A path that no longer resolves the way it did when the call was held
+    // does not consume an approval. `same` is required on every checked
+    // argument; an absent path check has nothing to disagree with.
+    if !path_check_is_same(&binding.path_check) {
+        return Ok(None);
+    }
+    let mut used: BTreeSet<&str> = entries
         .iter()
         .filter(|entry| entry.record["kind"] == "execution")
         .filter_map(|entry| entry.record["approval_id"].as_str())
         .collect();
+    used.extend(named.iter().map(String::as_str));
     let approver = read_approver_pin(home).ok();
     for entry in entries {
         if entry.record["kind"] != "decision" || entry.record["outcome"] != "approve" {
             continue;
         }
         let id = required_str(&entry.record, "approval_id")?;
-        if used.contains(id) || binding_from_record(&entry.record)? != *binding {
+        if used.contains(id) {
+            continue;
+        }
+        let pending_id = required_str(&entry.record, "pending_evidence_id")?;
+        let retained = load_signed_receipt(home, pending_id)?;
+        let mut held = binding_from_record(&entry.record)?;
+        held.path_check = path_check_of(&retained);
+        if held != *binding {
             continue;
         }
         let expires = parse_time(required_str(&entry.record, "expires_at")?)?;
@@ -669,10 +1157,10 @@ fn first_unused_approval(
             continue;
         }
         let Some(approver) = approver.as_ref() else {
-            return Err(
-                "an approval is signed but approver-public-key.hex is missing; run `praetore-mcp init` to add the approver key"
-                    .into(),
-            );
+            return Err(format!(
+                "an approval is signed but approver-public-key.hex is missing; run `{}` to add the approver key",
+                crate::commands::command("init", &home.root)
+            ));
         };
         check_signature(&entry.record, DECISION_DOMAIN, approver)?;
         if required_str(&entry.record, "approver_key_id")? != hex::encode(approver.as_bytes()) {
@@ -683,38 +1171,54 @@ fn first_unused_approval(
     Ok(None)
 }
 
+/// The open pending call for `binding`, or a new one. `entries` is the
+/// approval journal, read under the same lock: a pending file whose id
+/// already has a decision is what a `decide` cut before it removed the file
+/// leaves. That id can never be decided again, so it is not handed out;
+/// its file is removed, the step `decide` did not reach.
 fn reuse_or_create_pending(
     home: &Home,
+    entries: &[JournalEntry],
     binding: &Binding,
-    evidence_id: &str,
+    held: &Evidence,
     now: OffsetDateTime,
     ttl: Duration,
 ) -> Result<PendingInfo, String> {
     for pending in list_pending(home)? {
         let path = pending_path(home, &pending.approval_id);
-        let text = fs::read_to_string(&path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        if !matches!(find_decision(entries, &pending.approval_id), Ok(None)) {
+            fs::remove_file(&path).map_err(|e| {
+                format!(
+                    "approval {} is already decided but its pending file {} cannot be removed: {e}",
+                    pending.approval_id,
+                    path.shown()
+                )
+            })?;
+            continue;
+        }
+        let text =
+            fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.shown()))?;
         let value: Value = serde_json::from_str(&text)
-            .map_err(|e| format!("{} is not JSON: {e}", path.display()))?;
-        let existing = binding_from_pending(&value)?;
-        let expires = parse_time(&pending.expires_at)?;
-        if existing == *binding && now <= expires {
+            .map_err(|e| format!("{} is not JSON: {e}", path.shown()))?;
+        let mut existing = binding_from_pending(&value)?;
+        if let Ok(evidence) = load_signed_receipt(home, &pending.evidence_id) {
+            existing.path_check = path_check_of(&evidence);
+        }
+        if existing == *binding && !pending.expiry.is_expired_at(now) {
             return pending_info(&value);
         }
     }
     let approval_id = random_id();
+    let window = ApprovalWindow::from_retained(held, ttl)?;
     let value = json!({
         "schema": 1,
         "approval_id": approval_id,
         "server": binding.server,
         "tool": binding.tool,
         "arguments": binding.arguments,
-        "evidence_id": evidence_id,
-        "created_at": timestamp(now)?,
-        "expires_at": timestamp(
-            now.checked_add(ttl)
-                .ok_or("approval expiry is outside the representable range")?,
-        )?,
+        "evidence_id": held.evidence_id.to_string(),
+        "created_at": window.created_at(),
+        "expires_at": window.expires_at(),
     });
     let path = pending_path(home, &approval_id);
     if let Some(parent) = path.parent() {
@@ -743,7 +1247,9 @@ fn append_execution(
         "server": binding.server,
         "tool": binding.tool,
         "arguments": binding.arguments,
-        "executed_at": timestamp(now)?,
+        // Full precision. A timestamp truncated to the second can fall
+        // before decided_at when both are in the same second.
+        "executed_at": now.format(&Rfc3339).map_err(|error| error.to_string())?,
         "attester_key_id": public_hex(&attester),
     });
     let signed = sign_record(&record, EXECUTION_DOMAIN, &attester)?;
@@ -826,7 +1332,7 @@ fn public_hex(secret: &[u8; 32]) -> String {
     hex::encode(SigningKey::from_bytes(secret).verifying_key().to_bytes())
 }
 
-fn binding_from_call(server: &str, params: &Value) -> Result<Binding, String> {
+fn binding_from_call(server: &str, params: &Value, evidence: &Evidence) -> Result<Binding, String> {
     let Some(tool) = params.get("name").and_then(Value::as_str) else {
         return Err("tool name is not a string, so the call cannot be bound to an approval".into());
     };
@@ -837,7 +1343,27 @@ fn binding_from_call(server: &str, params: &Value) -> Result<Binding, String> {
         server: server.to_owned(),
         tool: tool.to_owned(),
         arguments: params.get("arguments").cloned().unwrap_or(Value::Null),
+        path_check: path_check_of(evidence),
     })
+}
+
+fn path_check_of(evidence: &Evidence) -> Value {
+    evidence
+        .context
+        .get(crate::gate::PATH_CHECK_CONTEXT_KEY)
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// Every checked path is `same`. No path check counts as same.
+fn path_check_is_same(path_check: &Value) -> bool {
+    match path_check {
+        Value::Null => true,
+        Value::Object(entries) => entries
+            .values()
+            .all(|entry| entry.get("status").and_then(Value::as_str) == Some("same")),
+        _ => false,
+    }
 }
 
 fn binding_from_record(record: &Value) -> Result<Binding, String> {
@@ -848,6 +1374,7 @@ fn binding_from_record(record: &Value) -> Result<Binding, String> {
             .get("arguments")
             .cloned()
             .ok_or("approval record has no arguments")?,
+        path_check: Value::Null,
     })
 }
 
@@ -906,47 +1433,120 @@ fn pending_info(value: &Value) -> Result<PendingInfo, String> {
         server: required_str(value, "server")?.to_owned(),
         tool: required_str(value, "tool")?.to_owned(),
         arguments_preview: crate::proxy::display_safe(&preview),
-        expires_at: required_str(value, "expires_at")?.to_owned(),
+        expiry: Expiry::parse(required_str(value, "expires_at")?),
         evidence_id: required_str(value, "evidence_id")?.to_owned(),
     })
 }
 
+#[expect(clippy::disallowed_methods, reason = "display only")]
 fn hold_message(home: &Home, pending: &PendingInfo) -> String {
-    let dir = shell_quote(&home.root.display().to_string());
+    let commands = DecisionCommands::new(home, &pending.approval_id);
+    let expires = pending
+        .expiry
+        .at()
+        .map_or_else(|| pending.expiry.text().to_owned(), crate::when::expiry_now);
     let mut message = format!(
         "This tool call is waiting for local human approval and was not executed.\n\
          Approval id: {id}\n\
          Server: {server}\n\
          Tool: {tool}\n\
-         Expires (UTC): {expires}\n\
+         Expires (UTC): {expires_utc}\n\
+         Expires: {expires}\n\
          A person at this computer has to approve it in a terminal:\n\
-           praetore-mcp approve {id} --dir {dir}\n\
+           {approve}\n\
          To reject it:\n\
-           praetore-mcp reject {id} --dir {dir}\n\
+           {reject}\n\
          Evidence id: {evidence}\n",
         id = pending.approval_id,
         server = crate::proxy::display_safe(&pending.server),
         tool = crate::proxy::display_safe(&pending.tool),
-        expires = pending.expires_at,
+        expires_utc = pending.expiry.text(),
+        approve = commands.approve,
+        reject = commands.reject,
         evidence = pending.evidence_id,
     );
     if !home.approver_key().is_file() || !home.approver_pin().is_file() {
         message.push_str(&format!(
-            "This home has no approver key yet. Run `praetore-mcp init --dir {dir}` first; it adds that key and leaves existing keys and receipts in place.\n"
+            "This home has no approver key yet. Run `{}` first; it adds that key and leaves existing keys and receipts in place.\n",
+            crate::commands::command("init", &home.root)
         ));
     }
     message
 }
 
-fn shell_quote(value: &str) -> String {
-    if value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || "/._-".contains(c))
-    {
-        value.to_owned()
-    } else {
-        format!("'{}'", value.replace('\'', "'\\''"))
+/// The `approve` and `reject` commands for one pending id, as printed by
+/// `wrap`, `approvals` and the dashboard (see [`crate::commands`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionCommands {
+    pub approve: String,
+    pub reject: String,
+}
+
+impl DecisionCommands {
+    pub fn new(home: &Home, approval_id: &str) -> Self {
+        Self {
+            approve: crate::commands::command(&format!("approve {approval_id}"), &home.root),
+            reject: crate::commands::command(&format!("reject {approval_id}"), &home.root),
+        }
     }
+}
+
+/// What `approvals` prints for an expired pending call, in place of the
+/// commands: `approve` and `reject` of it sign nothing.
+pub const EXPIRED_PENDING: &str = "expired: run the agent again so the call is held again";
+
+/// What `approvals` prints for a pending file whose id is already decided,
+/// in place of the commands, after the outcome.
+pub const DECIDED_PENDING: &str =
+    "a decide was interrupted before it removed this file; holding the call again removes it";
+
+/// What can be done with a pending call at a given time: nothing once the
+/// approval journal has a decision for it (a `decide` that stopped between
+/// appending the decision and removing the pending file), nothing once it
+/// expired (the rule of `decide`, [`Expiry::is_expired_at`]), and decide it
+/// otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingDecision {
+    Open(DecisionCommands),
+    Expired,
+    /// The journal's outcome for this id, `approve` or `reject`.
+    Decided(String),
+}
+
+impl PendingInfo {
+    fn decision(
+        &self,
+        home: &Home,
+        entries: &[JournalEntry],
+        now: OffsetDateTime,
+    ) -> Result<PendingDecision, String> {
+        if let Some(record) = find_decision(entries, &self.approval_id)? {
+            let outcome = record["outcome"].as_str().unwrap_or("?").to_owned();
+            return Ok(PendingDecision::Decided(outcome));
+        }
+        Ok(if self.expiry.is_expired_at(now) {
+            PendingDecision::Expired
+        } else {
+            PendingDecision::Open(DecisionCommands::new(home, &self.approval_id))
+        })
+    }
+}
+
+/// Every pending file with what can be done with it at `now`, read against
+/// the approval journal. An unreadable journal is an error: a pending id is
+/// never offered for a decision without knowing whether it has one.
+pub fn pending_decisions(
+    home: &Home,
+    now: OffsetDateTime,
+) -> Result<Vec<(PendingInfo, PendingDecision)>, String> {
+    let entries = read_journal_unlocked(home)?;
+    list_pending(home)?
+        .into_iter()
+        .map(|item| {
+            let decision = item.decision(home, &entries, now)?;
+            Ok((item, decision))
+        })
+        .collect()
 }
 
 fn exact_keys(record: &Value, expected: &[&str]) -> Result<(), String> {
@@ -1016,18 +1616,36 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-fn ttl(home: &Home) -> Result<Duration, String> {
-    let seconds = if let Some(raw) = std::env::var_os("PRAETORE_MCP_APPROVAL_TTL_SECONDS") {
-        let raw = raw
-            .to_str()
-            .ok_or("PRAETORE_MCP_APPROVAL_TTL_SECONDS is not UTF-8")?;
-        parse_ttl(raw, "PRAETORE_MCP_APPROVAL_TTL_SECONDS")?
-    } else if let Some(raw) = read_ttl_file(home)? {
-        parse_ttl(raw.trim(), "approvals/ttl-seconds")?
-    } else {
-        DEFAULT_TTL_SECONDS
+/// How long a pending approval stays open. Every source that is set is
+/// read and checked first: `PRAETORE_MCP_APPROVAL_TTL_SECONDS`,
+/// `approval_ttl_seconds` in `DIR/config.toml` and the file
+/// `DIR/approvals/ttl-seconds`. A value out of 1..=86400, not a number or
+/// unreadable in any of them is an error that names its source, even when
+/// a source of higher priority is valid. Then the first set source in that
+/// order is used, or 600. `wrap` calls this before it starts, so a bad
+/// value stops it at startup; the config value also reaches `wrap` when
+/// the MCP client passes it a filtered environment.
+pub fn approval_ttl(home: &Home) -> Result<Duration, String> {
+    let env = match std::env::var_os("PRAETORE_MCP_APPROVAL_TTL_SECONDS") {
+        Some(raw) => {
+            let raw = raw
+                .to_str()
+                .ok_or("PRAETORE_MCP_APPROVAL_TTL_SECONDS is not UTF-8")?;
+            Some(parse_ttl(raw, "PRAETORE_MCP_APPROVAL_TTL_SECONDS")?)
+        }
+        None => None,
     };
-    Ok(Duration::seconds(seconds))
+    let config = match crate::config::approval_ttl_seconds(home)? {
+        Some(raw) => Some(parse_ttl(&raw, "config.toml approval_ttl_seconds")?),
+        None => None,
+    };
+    let file = match read_ttl_file(home)? {
+        Some(raw) => Some(parse_ttl(raw.trim(), "approvals/ttl-seconds")?),
+        None => None,
+    };
+    Ok(Duration::seconds(
+        env.or(config).or(file).unwrap_or(DEFAULT_TTL_SECONDS),
+    ))
 }
 
 fn parse_ttl(raw: &str, source: &str) -> Result<i64, String> {
@@ -1047,21 +1665,13 @@ fn read_ttl_file(home: &Home) -> Result<Option<String>, String> {
     match fs::read_to_string(&path) {
         Ok(text) => Ok(Some(text)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("cannot read {}: {error}", path.display())),
+        Err(error) => Err(format!("cannot read {}: {error}", path.shown())),
     }
 }
 
 fn now_utc() -> Result<OffsetDateTime, String> {
     OffsetDateTime::now_utc()
         .replace_nanosecond(0)
-        .map_err(|e| e.to_string())
-}
-
-fn timestamp(value: OffsetDateTime) -> Result<String, String> {
-    value
-        .replace_nanosecond(0)
-        .map_err(|e| e.to_string())?
-        .format(&Rfc3339)
         .map_err(|e| e.to_string())
 }
 
@@ -1097,7 +1707,7 @@ impl ApprovalLock {
         }
         let file = options
             .open(&path)
-            .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+            .map_err(|e| format!("cannot open {}: {e}", path.shown()))?;
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             use std::os::fd::AsRawFd;
@@ -1106,7 +1716,7 @@ impl ApprovalLock {
             if rc != 0 {
                 return Err(format!(
                     "cannot lock {}: {}",
-                    path.display(),
+                    path.shown(),
                     std::io::Error::last_os_error()
                 ));
             }
@@ -1115,20 +1725,19 @@ impl ApprovalLock {
     }
 }
 
-fn read_journal(path: &Path) -> Result<Vec<JournalEntry>, String> {
+fn read_journal(home: &Home, path: &Path) -> Result<Vec<JournalEntry>, String> {
     if !path.exists() {
         return Ok(Vec::new());
     }
     let text =
-        fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.shown()))?;
     let mut entries = Vec::new();
     for (index, line) in text.lines().enumerate() {
         if line.is_empty() {
             continue;
         }
         entries.push(
-            parse_journal_text(line)
-                .map_err(|e| format!("{}:{}: {e}", path.display(), index + 1))?,
+            parse_journal_text(line).map_err(|e| format!("{}:{}: {e}", path.shown(), index + 1))?,
         );
     }
     let mut expected_seq = 0u64;
@@ -1136,9 +1745,10 @@ fn read_journal(path: &Path) -> Result<Vec<JournalEntry>, String> {
     for entry in &entries {
         if entry.seq != expected_seq || entry.prev != expected_prev {
             return Err(format!(
-                "{}: approval journal seq {} does not follow the previous record; run `praetore-mcp verify`",
-                path.display(),
-                entry.seq
+                "{}: approval journal seq {} does not follow the previous record; run `{}`",
+                path.shown(),
+                entry.seq,
+                crate::commands::command("verify", &home.root)
             ));
         }
         expected_prev = hex::encode(link_bytes(entry.seq, &entry.prev, &entry.canonical));
@@ -1153,7 +1763,7 @@ fn read_journal_unlocked(home: &Home) -> Result<Vec<JournalEntry>, String> {
         return Ok(Vec::new());
     }
     let text =
-        fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.shown()))?;
     let mut entries = Vec::new();
     for (index, line) in text.lines().enumerate() {
         if line.is_empty() {
@@ -1162,7 +1772,7 @@ fn read_journal_unlocked(home: &Home) -> Result<Vec<JournalEntry>, String> {
         match parse_journal_text(line) {
             Ok(entry) => entries.push(entry),
             Err(error) => {
-                return Err(format!("{}:{}: {error}", path.display(), index + 1));
+                return Err(format!("{}:{}: {error}", path.shown(), index + 1));
             }
         }
     }
@@ -1215,33 +1825,8 @@ fn link_bytes(seq: u64, prev: &str, canonical: &[u8]) -> [u8; 32] {
 }
 
 fn append_line(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let mut options = fs::OpenOptions::new();
-    options.append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        options.custom_flags(crate::journal::nofollow_flag());
-    }
-    let (mut file, created) = match options.open(path) {
-        Ok(file) => (file, false),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
-            options
-                .create_new(true)
-                .open(path)
-                .map_err(|e| format!("cannot create {}: {e}", path.display()))?,
-            true,
-        ),
-        Err(error) => return Err(format!("cannot open {}: {error}", path.display())),
-    };
-    file.write_all(bytes)
-        .and_then(|()| file.sync_data())
-        .map_err(|e| format!("cannot append to {}: {e}", path.display()))?;
-    if created && let Some(dir) = path.parent() {
-        crate::fsutil::sync_dir(dir).map_err(|e| format!("cannot sync {}: {e}", dir.display()))?;
-    }
-    Ok(())
+    crate::journal_io::append_journal_file(path, bytes)
+        .map_err(|e| format!("cannot append to {}: {e}", path.shown()))
 }
 
 fn write_private(path: &Path, contents: &str) -> Result<(), String> {
@@ -1254,13 +1839,13 @@ fn write_private(path: &Path, contents: &str) -> Result<(), String> {
     }
     let mut file = options
         .open(path)
-        .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+        .map_err(|e| format!("cannot create {}: {e}", path.shown()))?;
     file.write_all(contents.as_bytes())
         .and_then(|()| file.write_all(b"\n"))
         .and_then(|()| file.sync_all())
-        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        .map_err(|e| format!("cannot write {}: {e}", path.shown()))?;
     if let Some(dir) = path.parent() {
-        crate::fsutil::sync_dir(dir).map_err(|e| format!("cannot sync {}: {e}", dir.display()))?;
+        crate::fsutil::sync_dir(dir).map_err(|e| format!("cannot sync {}: {e}", dir.shown()))?;
     }
     Ok(())
 }
@@ -1279,4 +1864,401 @@ fn pending_path(home: &Home, approval_id: &str) -> PathBuf {
 
 fn journal_path(home: &Home) -> PathBuf {
     approvals_dir(home).join("journal.jsonl")
+}
+
+/// One signed decision, so `verify` has a real approval journal to keep.
+#[cfg(test)]
+pub(crate) fn seed_one_decision(home: &Home) -> PathBuf {
+    use crate::gate::{Evaluator, Gate, Mode};
+    use praetore_core::{PolicyCondition, PolicyEffect, PolicyRule};
+
+    let mut policy = store::default_policy();
+    policy.rules.push(
+        PolicyRule::new(
+            "approve-echo",
+            store::ACTION_TYPE,
+            PolicyEffect::RequireApproval,
+        )
+        .with_capability(store::CAPABILITY)
+        .with_parameter_condition(PolicyCondition::exact("tool", json!("echo"))),
+    );
+    fs::write(home.policy(), serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+    let mut gate = Gate::load(home, Mode::Enforce).unwrap();
+    let verdict = Evaluator::evaluate(
+        &mut gate,
+        "fake",
+        &json!({"name": "echo", "arguments": {"n": 1}}),
+    )
+    .unwrap();
+    assert!(
+        verdict.journaled.is_ok(),
+        "receipt was not stored: {:?}",
+        verdict.journaled
+    );
+    assert_eq!(verdict.outcome, DecisionOutcome::RequireApproval);
+    let pending = list_pending(home).unwrap();
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    decide(home, &pending[0].approval_id, HumanOutcome::Approve, None).unwrap();
+    let path = journal_path(home);
+    assert!(fs::metadata(&path).unwrap().len() > 0);
+    path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A writer that stores 180 bytes of a 401-byte line and then stops.
+    /// The approval file stays at its previous length and `verify` still passes.
+    #[test]
+    fn approval_journal_short_write_keeps_previous_length() {
+        fail_approval_append(
+            crate::journal_io::FaultMode::Short,
+            std::io::ErrorKind::StorageFull,
+        );
+    }
+
+    /// Same prefix, then `FileTooLarge` (EFBIG) after the file has grown.
+    #[test]
+    fn approval_journal_file_too_large_keeps_previous_length() {
+        fail_approval_append(
+            crate::journal_io::FaultMode::FileTooLarge,
+            std::io::ErrorKind::FileTooLarge,
+        );
+    }
+
+    fn fail_approval_append(mode: crate::journal_io::FaultMode, kind: std::io::ErrorKind) {
+        let (_temp, home) = crate::journal_io::temp_home();
+        let path = seed_one_decision(&home);
+        let original = fs::read(&path).unwrap();
+        assert!(original.ends_with(b"\n"));
+        let report = crate::receipts::verify_journal(&home, None).unwrap();
+        assert!(
+            report.failures.is_empty(),
+            "seed verify: {:?}",
+            report.failures
+        );
+        let mut writer =
+            crate::journal_io::FaultyFile::open(&path, crate::journal_io::PROBE_ROOM, mode)
+                .unwrap();
+        let error =
+            crate::journal_io::commit_journal_line(&mut writer, &crate::journal_io::line_of_401())
+                .unwrap_err();
+        crate::journal_io::assert_journal_intact(&home, &path, &original, &writer, &error, kind);
+        assert_eq!(report.approval_decisions, 1, "{report:?}");
+    }
+
+    #[test]
+    fn spec_defines_consumed_approval_path_check_equals_held() {
+        let spec = include_str!("../../../docs/formal/ApprovalPath.tla");
+        let cfg = include_str!("../../../docs/formal/ApprovalPath.cfg");
+        assert!(spec.contains("ConsumedApprovalPathCheckEqualsHeld =="));
+        assert!(cfg.contains("ConsumedApprovalPathCheckEqualsHeld"));
+    }
+
+    /// The approval is consumed when the path still resolves to itself.
+    #[cfg(unix)]
+    #[test]
+    fn an_unchanged_path_still_consumes_the_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        fs::create_dir(&work).unwrap();
+        fs::write(work.join("a"), b"x").unwrap();
+        let work = fs::canonicalize(&work).unwrap();
+        let (_temp, home) = approve_path_call(&work);
+        let mut gate = crate::gate::Gate::load(&home, crate::gate::Mode::Enforce).unwrap();
+        let verdict = crate::gate::Evaluator::evaluate(
+            &mut gate,
+            "fake",
+            &json!({"name": "echo", "arguments": {"path": work.join("a").to_str().unwrap()}}),
+        )
+        .unwrap();
+        assert_eq!(verdict.outcome, DecisionOutcome::RequireApproval);
+        assert!(verdict.consumed_approval.is_some(), "{verdict:?}");
+        assert!(verdict.hold_message.is_none());
+        assert_eq!(execution_count(&home), 1);
+    }
+
+    /// Replacing the directory with a symlink must not consume the approval.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_in_place_of_the_held_directory_does_not_consume_the_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        fs::create_dir(&work).unwrap();
+        fs::write(work.join("a"), b"x").unwrap();
+        let work = fs::canonicalize(&work).unwrap();
+        let (_temp, home) = approve_path_call(&work);
+        let moved = work.with_file_name("work.real");
+        fs::rename(&work, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &work).unwrap();
+        let mut gate = crate::gate::Gate::load(&home, crate::gate::Mode::Enforce).unwrap();
+        let verdict = crate::gate::Evaluator::evaluate(
+            &mut gate,
+            "fake",
+            &json!({"name": "echo", "arguments": {"path": work.join("a").to_str().unwrap()}}),
+        )
+        .unwrap();
+        assert_eq!(verdict.outcome, DecisionOutcome::RequireApproval);
+        assert!(
+            verdict.consumed_approval.is_none(),
+            "forwarded: {verdict:?}"
+        );
+        assert!(verdict.hold_message.is_some(), "{verdict:?}");
+        assert_eq!(execution_count(&home), 0);
+    }
+
+    #[cfg(unix)]
+    fn approve_path_call(work: &std::path::Path) -> (tempfile::TempDir, Home) {
+        use crate::gate::{Evaluator, Gate, Mode};
+        use praetore_core::{PolicyCondition, PolicyEffect, PolicyRule};
+        let (temp, home) = crate::journal_io::temp_home();
+        let mut policy = store::default_policy();
+        policy.rules.push(
+            PolicyRule::new(
+                "approve-path",
+                store::ACTION_TYPE,
+                PolicyEffect::RequireApproval,
+            )
+            .with_capability(store::CAPABILITY)
+            .with_parameter_condition(PolicyCondition::exact("tool", json!("echo")))
+            .with_parameter_condition(PolicyCondition::path_prefix(
+                "arguments.path",
+                work.to_str().unwrap(),
+            )),
+        );
+        fs::write(home.policy(), serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+        let mut gate = Gate::load(&home, Mode::Enforce).unwrap();
+        let verdict = Evaluator::evaluate(
+            &mut gate,
+            "fake",
+            &json!({"name": "echo", "arguments": {"path": work.join("a").to_str().unwrap()}}),
+        )
+        .unwrap();
+        assert_eq!(verdict.outcome, DecisionOutcome::RequireApproval);
+        assert!(verdict.hold_message.is_some(), "{verdict:?}");
+        assert!(verdict.consumed_approval.is_none());
+        let pending = list_pending(&home).unwrap();
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        decide(&home, &pending[0].approval_id, HumanOutcome::Approve, None).unwrap();
+        assert_eq!(execution_count(&home), 0);
+        (temp, home)
+    }
+
+    #[cfg(unix)]
+    fn execution_count(home: &Home) -> usize {
+        let path = journal_path(home);
+        if !path.exists() {
+            return 0;
+        }
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("\"kind\":\"execution\""))
+            .count()
+    }
+
+    #[test]
+    fn spec_defines_decision_window_within_signed_hold_plus_ttl() {
+        let spec = include_str!("../../../docs/formal/ApprovalWindow.tla");
+        let cfg = include_str!("../../../docs/formal/ApprovalWindow.cfg");
+        assert!(
+            spec.contains("DecisionWindowWithinSignedHoldPlusTtl =="),
+            "the spec no longer defines DecisionWindowWithinSignedHoldPlusTtl =="
+        );
+        assert!(
+            spec.contains("whole_second(held_timestamp)"),
+            "the spec no longer truncates a 0.3.6 hold to a whole second"
+        );
+        assert!(
+            spec.contains("MaxTtl * Second"),
+            "the spec no longer bounds the window by MaxTtl"
+        );
+        assert!(cfg.contains("DecisionWindowWithinSignedHoldPlusTtl"));
+    }
+
+    /// A pending file edited to 2099 is not signed. `decide` takes the
+    /// window from the retained receipt and the TTL.
+    #[test]
+    fn decide_refuses_a_pending_file_edited_to_2099() {
+        let (_temp, home) = crate::journal_io::temp_home();
+        let id = hold_echo(&home);
+        let path = pending_path(&home, &id);
+        let mut pending: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        pending["created_at"] = json!("2099-01-01T00:00:00Z");
+        pending["expires_at"] = json!("2099-01-02T00:00:00Z");
+        fs::write(&path, serde_json::to_vec_pretty(&pending).unwrap()).unwrap();
+        for outcome in [HumanOutcome::Approve, HumanOutcome::Reject] {
+            let error = decide(&home, &id, outcome, None).unwrap_err();
+            assert!(
+                error.contains("does not match the retained receipt")
+                    && error.contains("nothing was signed"),
+                "{outcome:?}: {error}"
+            );
+        }
+        assert!(!journal_path(&home).exists(), "a decision was signed");
+        assert!(path.is_file(), "the pending file is kept");
+    }
+
+    /// A signed decision whose window is longer than a day fails `verify`
+    /// with exit 1. The fixture is signed here, not by the approve command.
+    #[test]
+    fn verify_rejects_a_signed_window_longer_than_a_day() {
+        let (_temp, home) = crate::journal_io::temp_home();
+        let id = hold_echo(&home);
+        let pending: Value =
+            serde_json::from_str(&fs::read_to_string(pending_path(&home, &id)).unwrap()).unwrap();
+        let evidence = held_receipt(&home);
+        let created = evidence.decided_at.clone().unwrap();
+        let created_at = parse_time(&created).unwrap();
+        let expires = (created_at + Duration::seconds(MAX_TTL_SECONDS + 1))
+            .format(&Rfc3339)
+            .unwrap();
+        let approver = store::approver_secret(&home).unwrap();
+        let record = json!({
+            "schema": 1,
+            "kind": "decision",
+            "approval_id": id,
+            "approver_key_id": public_hex(&approver),
+            "outcome": "approve",
+            "server": pending["server"],
+            "tool": pending["tool"],
+            "arguments": pending["arguments"],
+            "pending_evidence_id": pending["evidence_id"],
+            "created_at": created,
+            "expires_at": expires,
+            "decided_at": created,
+        });
+        let signed = sign_record(&record, DECISION_DOMAIN, &approver).unwrap();
+        with_lock(&home, |journal| append_signed(journal, &[], &signed)).unwrap();
+
+        let (code, stdout, stderr) = run_verify(&home);
+        assert_eq!(code, Some(1), "{stdout}\n{stderr}");
+        assert!(stdout.contains("maximum is 86400"), "{stdout}\n{stderr}");
+    }
+
+    fn sign_decision(home: &Home, id: &str, created: &str, expires: &str) {
+        let pending: Value =
+            serde_json::from_str(&fs::read_to_string(pending_path(home, id)).unwrap()).unwrap();
+        let approver = store::approver_secret(home).unwrap();
+        let record = json!({
+            "schema": 1,
+            "kind": "decision",
+            "approval_id": id,
+            "approver_key_id": public_hex(&approver),
+            "outcome": "approve",
+            "server": pending["server"],
+            "tool": pending["tool"],
+            "arguments": pending["arguments"],
+            "pending_evidence_id": pending["evidence_id"],
+            "created_at": created,
+            "expires_at": expires,
+            "decided_at": created,
+        });
+        let signed = sign_record(&record, DECISION_DOMAIN, &approver).unwrap();
+        with_lock(home, |journal| append_signed(journal, &[], &signed)).unwrap();
+    }
+
+    fn run_verify(home: &Home) -> (Option<i32>, String, String) {
+        use crate::shown::Show;
+        let bin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/debug/praetore-mcp");
+        assert!(
+            bin.is_file(),
+            "build praetore-mcp before this test ({})",
+            bin.shown()
+        );
+        let out = std::process::Command::new(&bin)
+            .args(["verify", "--dir", home.root.to_str().unwrap()])
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    /// A signed `created_at` in 2099 is not the receipt timestamp, even at
+    /// whole-second precision. The span itself is within the TTL cap.
+    /// `verify` exits 1.
+    #[test]
+    fn verify_rejects_a_created_at_in_2099() {
+        let (_temp, home) = crate::journal_io::temp_home();
+        let id = hold_echo(&home);
+        sign_decision(&home, &id, "2099-01-01T00:00:00Z", "2099-01-01T00:10:00Z");
+        let (code, stdout, stderr) = run_verify(&home);
+        assert_eq!(code, Some(1), "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("does not match the signed timestamp"),
+            "{stdout}\n{stderr}"
+        );
+    }
+
+    /// Same UTC second as the receipt, but a different fraction. That is not
+    /// an exact new decision and not the 0.3.6 whole-second form.
+    #[test]
+    fn verify_rejects_a_different_fraction_in_the_receipt_second() {
+        let (_temp, home) = crate::journal_io::temp_home();
+        let id = hold_echo(&home);
+        let receipt = held_receipt(&home).decided_at.unwrap();
+        let created_at = parse_time(&receipt).unwrap();
+        let other = created_at
+            .replace_nanosecond(if created_at.nanosecond() == 500_000_000 {
+                100_000_000
+            } else {
+                500_000_000
+            })
+            .unwrap()
+            .format(&Rfc3339)
+            .unwrap();
+        assert_ne!(other, receipt);
+        let expires = (parse_time(&other).unwrap() + Duration::seconds(600))
+            .format(&Rfc3339)
+            .unwrap();
+        sign_decision(&home, &id, &other, &expires);
+        let (code, stdout, stderr) = run_verify(&home);
+        assert_eq!(code, Some(1), "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("does not match the signed timestamp"),
+            "{stdout}\n{stderr}"
+        );
+        assert!(
+            !stdout.contains("maximum is 86400"),
+            "the TTL cap is not what failed:\n{stdout}"
+        );
+    }
+
+    fn hold_echo(home: &Home) -> String {
+        use crate::gate::{Evaluator, Gate, Mode};
+        use praetore_core::{PolicyCondition, PolicyEffect, PolicyRule};
+        let mut policy = store::default_policy();
+        policy.rules.push(
+            PolicyRule::new(
+                "approve-echo",
+                store::ACTION_TYPE,
+                PolicyEffect::RequireApproval,
+            )
+            .with_capability(store::CAPABILITY)
+            .with_parameter_condition(PolicyCondition::exact("tool", json!("echo"))),
+        );
+        fs::write(home.policy(), serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+        let mut gate = Gate::load(home, Mode::Enforce).unwrap();
+        let verdict = Evaluator::evaluate(
+            &mut gate,
+            "fake",
+            &json!({"name": "echo", "arguments": {"n": 1}}),
+        )
+        .unwrap();
+        assert_eq!(verdict.outcome, DecisionOutcome::RequireApproval);
+        let pending = list_pending(home).unwrap();
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        pending[0].approval_id.clone()
+    }
+
+    fn held_receipt(home: &Home) -> Evidence {
+        let lines = crate::receipts::read_journal(home).unwrap();
+        assert_eq!(lines.len(), 1, "{}", lines.len());
+        crate::journal::parse_line(&lines[0].text).unwrap().evidence
+    }
 }

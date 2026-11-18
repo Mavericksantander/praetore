@@ -90,6 +90,9 @@ pub struct ConsoleState {
     /// One package is built at a time: each holds the shared database
     /// client for the whole export.
     pack_gate: Arc<tokio::sync::Semaphore>,
+    /// The instant a package is built at: the wall clock, except in tests
+    /// that need two downloads built at the same second.
+    pack_clock: Arc<dyn Fn() -> time::OffsetDateTime + Send + Sync>,
     address: SocketAddr,
     /// `Host` values the console answers to (DNS rebinding).
     hosts: Vec<String>,
@@ -208,6 +211,7 @@ impl ConsoleState {
             inbox: None,
             pack: None,
             pack_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            pack_clock: Arc::new(time::OffsetDateTime::now_utc),
             address: DEFAULT_ADDRESS.parse().expect("fixed address"),
             hosts: Vec::new(),
             origins: Vec::new(),
@@ -274,6 +278,13 @@ impl ConsoleState {
 
     pub fn with_compliance_pack(mut self, pack: CompliancePack) -> Self {
         self.pack = Some(Arc::new(pack));
+        self
+    }
+
+    /// Builds every package at `at` instead of the wall clock.
+    #[cfg(test)]
+    pub(crate) fn with_pack_clock(mut self, at: time::OffsetDateTime) -> Self {
+        self.pack_clock = Arc::new(move || at);
         self
     }
 
@@ -553,9 +564,10 @@ async fn download_pack(State(state): State<Arc<ConsoleState>>, headers: HeaderMa
         return api_message(StatusCode::TOO_MANY_REQUESTS, PackError::Busy.api_message());
     };
     let signer = state.inbox.as_ref().map(|inbox| Arc::clone(&inbox.signer));
+    let now = (state.pack_clock)();
     let built = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        paquete::generate(&pack, signer.as_deref(), time::OffsetDateTime::now_utc())
+        paquete::generate(&pack, signer.as_deref(), now)
     })
     .await;
     let bytes = match built {

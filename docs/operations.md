@@ -1341,15 +1341,15 @@ The signature proves that `SHA256SUMS` was produced by this repository's
 (check the signed tag with `git verify-tag`). The macOS binaries are not
 signed or notarized.
 
-The published v0.3.3 release was built from commit
-`0ce6334ff33d7e76a2e2a2bdd3cde69dcd416a0c`. Pass that literal value as
+The published v0.3.6 release was built from commit
+`27ceddbbd295162ca351ea5dfa47fe8bb37315a3`. Pass that literal value as
 `--certificate-github-workflow-sha` when you do not have a clone.
 `git rev-parse` needs one. Installing from that release, as described in
 the repository README and in
-[Install from the v0.3.3 release](install-prebuilt.md), treats this
+[Install from the v0.3.6 release](install-prebuilt.md), treats this
 `cosign` check as optional. Those pages require the SHA256 digest. The
 signature check still needs `cosign` installed. When it succeeds, it proves
-the same thing as the command above for tag `v0.3.3` at that commit. It
+the same thing as the command above for tag `v0.3.6` at that commit. It
 does not prove who pushed the tag.
 
 CI runs the same check with `scripts/verify-release-signature.sh`, with

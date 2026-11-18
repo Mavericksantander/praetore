@@ -1040,6 +1040,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pdf-writer"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5e456864a7a304047bff84977dc6fb162bd956475d40ba50b2dcecaada7f753"
+dependencies = [
+ "bitflags",
+ "itoa",
+ "memchr",
+ "ryu",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1150,7 +1162,7 @@ checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
 name = "praetore-cli"
-version = "0.3.4"
+version = "0.3.6"
 dependencies = [
  "axum",
  "ed25519-dalek",
@@ -1177,7 +1189,7 @@ dependencies = [
 
 [[package]]
 name = "praetore-console"
-version = "0.3.4"
+version = "0.3.6"
 dependencies = [
  "axum",
  "ed25519-dalek",
@@ -1208,7 +1220,7 @@ dependencies = [
 
 [[package]]
 name = "praetore-core"
-version = "0.3.4"
+version = "0.3.6"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -1225,7 +1237,7 @@ dependencies = [
 
 [[package]]
 name = "praetore-gateway"
-version = "0.3.4"
+version = "0.3.6"
 dependencies = [
  "axum",
  "ed25519-dalek",
@@ -1250,7 +1262,7 @@ dependencies = [
 
 [[package]]
 name = "praetore-gateway-service"
-version = "0.3.4"
+version = "0.3.6"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1280,19 +1292,22 @@ dependencies = [
 
 [[package]]
 name = "praetore-mcp"
-version = "0.3.4"
+version = "0.3.6"
 dependencies = [
  "caseless",
  "ed25519-dalek",
  "hex",
  "libc",
+ "pdf-writer",
  "praetore-core",
+ "proptest",
  "rand_core 0.6.4",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "time",
+ "toml_edit",
  "unicode-normalization",
  "uuid",
  "zeroize",
@@ -1300,7 +1315,7 @@ dependencies = [
 
 [[package]]
 name = "praetore-observe"
-version = "0.3.4"
+version = "0.3.6"
 dependencies = [
  "axum",
  "hex",
@@ -1323,7 +1338,7 @@ dependencies = [
 
 [[package]]
 name = "praetore-python"
-version = "0.3.4"
+version = "0.3.6"
 dependencies = [
  "hex",
  "praetore-core",
@@ -1334,7 +1349,7 @@ dependencies = [
 
 [[package]]
 name = "praetore-receipt"
-version = "0.3.4"
+version = "0.3.6"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -1349,7 +1364,7 @@ dependencies = [
 
 [[package]]
 name = "praetore-replay-postgres"
-version = "0.3.4"
+version = "0.3.6"
 dependencies = [
  "axum",
  "ed25519-dalek",
@@ -1370,7 +1385,7 @@ dependencies = [
 
 [[package]]
 name = "praetore-safety-client"
-version = "0.3.4"
+version = "0.3.6"
 dependencies = [
  "praetore-core",
  "rustix",
@@ -1379,7 +1394,7 @@ dependencies = [
 
 [[package]]
 name = "praetore-sandbox-fs"
-version = "0.3.4"
+version = "0.3.6"
 dependencies = [
  "rustix",
  "thiserror",
@@ -1389,7 +1404,7 @@ dependencies = [
 
 [[package]]
 name = "praetore-verify"
-version = "0.3.4"
+version = "0.3.6"
 dependencies = [
  "hex",
  "praetore-core",

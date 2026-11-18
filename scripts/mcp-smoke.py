@@ -2,16 +2,22 @@
 """End-to-end smoke test of a built praetore-mcp binary.
 
 Runs the binary in front of the real @modelcontextprotocol/server-filesystem
-with a fresh LOCAL/DEV home and a deny rule for write_file, sends one
-allowed tools/call (read_text_file) and one denied one (write_file), and
-checks the replies, the file system, the receipts and `verify`. Needs
-Python 3 (standard library only) and Node.
+with a fresh LOCAL/DEV home (default deny), an allow rule for read_text_file
+and a deny rule for write_file, sends one allowed tools/call (read_text_file)
+and one denied one (write_file), and checks the replies, the file system,
+the receipts and `verify`. It also runs `policy coverage` against the same
+server. Needs Python 3 (standard library only) and Node.
 
 The server comes from scripts/mcp-smoke/, installed from its committed
 lockfile; the script does not download anything:
 
     npm ci --ignore-scripts --prefix scripts/mcp-smoke
-    python3 -I scripts/mcp-smoke.py path/to/praetore-mcp
+    python3 -I scripts/mcp-smoke.py path/to/praetore-mcp [--expect-version VERSION]
+
+VERSION is the crate version the binary was built from; without it, the
+version of praetore-mcp in this checkout (cargo metadata). `--version`
+must print that version, or that version with -dev and an optional
++<commit>.
 
 Exit code 0 when every check passes; every check is printed.
 """
@@ -19,6 +25,7 @@ Exit code 0 when every check passes; every check is printed.
 import json
 import os
 import pty
+import re
 import select
 import subprocess
 import sys
@@ -32,6 +39,11 @@ SERVER_BIN = "mcp-server-filesystem"
 NODE_PROJECT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "mcp-smoke")
 TIMEOUT_SECONDS = 180
 
+
+
+def sh_quote(value):
+    """`value` in single quotes for a POSIX shell, as praetore-mcp prints paths."""
+    return "'" + value.replace("'", "'\\''") + "'"
 
 def server_command():
     """`node <entry point>` of the server installed by `npm ci` in NODE_PROJECT.
@@ -160,10 +172,33 @@ def approval_id_from(message):
     return text.split(marker, 1)[1].split()[0]
 
 
+def version_ok(printed, expected):
+    """Whether `printed` (the output of `--version`) is the build version of
+    crate version `expected`: `praetore-mcp <expected>` for a release build,
+    or `praetore-mcp <expected>-dev` with an optional `+<7 to 40 hex>`."""
+    pattern = rf"praetore-mcp {re.escape(expected)}(-dev(\+[0-9a-f]{{7,40}})?)?\n"
+    return re.fullmatch(pattern, printed) is not None
+
+
+def crate_version():
+    """The version of the praetore-mcp crate in this checkout."""
+    manifest = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Cargo.toml")
+    out = subprocess.run(
+        ["cargo", "metadata", "--no-deps", "--format-version", "1", "--manifest-path", manifest],
+        capture_output=True, text=True, timeout=120, check=True,
+    ).stdout
+    return next(p["version"] for p in json.loads(out)["packages"] if p["name"] == "praetore-mcp")
+
+
 def main():
-    if len(sys.argv) != 2:
+    args = sys.argv[1:]
+    if len(args) == 3 and args[1] == "--expect-version":
+        expected = args[2]
+    elif len(args) == 1:
+        expected = crate_version()
+    else:
         sys.exit(__doc__)
-    binary = os.path.realpath(sys.argv[1])
+    binary = os.path.realpath(args[0])
     server = server_command()
     failures = []
 
@@ -180,14 +215,61 @@ def main():
     with open(os.path.join(root, "a.txt"), "w", encoding="utf-8") as handle:
         handle.write("hola\n")
 
-    check("--version", run(binary, "--version").returncode == 0)
+    version = run(binary, "--version")
+    check(
+        f"--version prints the build version of {expected}",
+        version.returncode == 0 and version_ok(version.stdout, expected),
+        version.stdout.strip(),
+    )
     check("init", run(binary, "init", "--dir", home).returncode == 0)
+    with open(os.path.join(home, "policy.json"), encoding="utf-8") as handle:
+        check("init writes no rules (default deny)", json.load(handle).get("rules") == [])
+    check(
+        "policy allow read_text_file",
+        run(binary, "policy", "allow", "--id", "allow-read", "--server", "filesystem",
+            "--tool", "read_text_file", "--dir", home).returncode == 0,
+    )
     check(
         "policy deny write_file",
         run(binary, "policy", "deny", "--id", "deny-write", "--server", "filesystem",
             "--tool", "write_file", "--dir", home).returncode == 0,
     )
     check("policy check", run(binary, "policy", "check", "--dir", home).returncode == 0)
+
+    coverage = run(binary, "policy", "coverage", "--dir", home, "--server", "filesystem",
+                   "--", *server, root)
+    rows = {}
+    for line in coverage.stdout.splitlines():
+        cells = [cell.strip() for cell in line.split("  ") if cell.strip()]
+        if len(cells) >= 4:
+            rows[cells[0]] = cells[1:]
+    check("policy coverage exit 0", coverage.returncode == 0)
+    check("policy coverage lists the 16 tools", "16 tool(s)" in coverage.stdout
+          and len([name for name in rows if name != "TOOL"]) == 16, coverage.stdout)
+    check("coverage: read_text_file ALLOW allow-read",
+          rows.get("read_text_file", [])[:2] == ["ALLOW", "allow-read"])
+    check("coverage: write_file DENY deny-write",
+          rows.get("write_file", [])[:2] == ["DENY", "deny-write"])
+    check("coverage: copy_file and append_file default deny",
+          rows.get("copy_file", [])[:2] == ["DENY", "default deny"]
+          and rows.get("append_file", [])[:2] == ["DENY", "default deny"])
+    check(
+        "policy allow --any-tool (temporary allow-all)",
+        run(binary, "policy", "allow", "--id", "allow-everything", "--any-tool",
+            "--dir", home).returncode == 0,
+    )
+    loose = run(binary, "policy", "coverage", "--dir", home, "--server", "filesystem",
+                "--", *server, root)
+    section = loose.stdout.split("allowed only by an allow-all rule", 1)[-1]
+    listed = {line.split()[0] for line in section.splitlines()[1:] if line.startswith("  ")}
+    check("coverage with allow-all exits 1", loose.returncode == 1)
+    check("coverage lists copy_file and append_file under allow-all",
+          {"copy_file", "append_file"} <= listed and "write_file" not in listed
+          and "read_text_file" not in listed, loose.stdout)
+    check(
+        "policy remove allow-everything",
+        run(binary, "policy", "remove", "--id", "allow-everything", "--dir", home).returncode == 0,
+    )
 
     requests = [
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
@@ -225,7 +307,9 @@ def main():
     check("receipts: one DENY write_file deny-write",
           any("write_file" in l and "DENY" in l and "deny-write" in l for l in lines))
     verify = run(binary, "verify", "--dir", home)
-    check("verify exit 0", verify.returncode == 0)
+    # Without the heads kept elsewhere a clean journal is "not anchored": exit 3.
+    check("verify exits 3 (not anchored)", verify.returncode == 3, verify.stdout)
+    check("verify says UNANCHORED", verify.stdout.startswith("UNANCHORED "), verify.stdout)
     check("verify: 2 verified, 0 failed", "2 receipts: 2 verified, 0 failed" in verify.stdout)
 
     # Local approval, still on the same home: list_directory needs a person
@@ -247,17 +331,30 @@ def main():
     held = wrap_session(binary, home, root, server, hold_requests, {4})
     held_msg = held.get(4, {})
     approval_id = approval_id_from(held_msg)
-    held_text = json.dumps(held_msg.get("result", {}).get("content", []))
+    held_text = "\n".join(
+        item.get("text", "") for item in held_msg.get("result", {}).get("content", [])
+    )
+    # The printed command names the binary and the home by absolute paths,
+    # single-quoted for a POSIX shell, so it runs as printed off PATH.
+    approve_command = (
+        f"{sh_quote(os.path.realpath(binary))} approve {approval_id} "
+        f"--dir {sh_quote(os.path.realpath(home))}"
+    )
     check(
         "list_directory is held for approval",
         held_msg.get("result", {}).get("isError") is True
         and "waiting for local human approval" in held_text
-        and f"praetore-mcp approve {approval_id} --dir {home}" in held_text
+        and f"\n{approve_command}\n" in held_text
         and len(approval_id) == 64,
-        held_text[:400],
+        held_text[:600],
     )
     pending = run(binary, "approvals", "--dir", home)
     check("approvals lists the pending id", approval_id in pending.stdout, pending.stdout)
+    check(
+        "approvals prints the same approve command",
+        f"approve    {approve_command}\n" in pending.stdout,
+        pending.stdout,
+    )
     code, approve_text = approve_on_pty(binary, home, approval_id)
     check("approve on a pty exits 0", code == 0, approve_text)
 
@@ -304,7 +401,7 @@ def main():
         receipts.stdout,
     )
     verify = run(binary, "verify", "--dir", home)
-    check("verify after approval exits 0", verify.returncode == 0, verify.stdout)
+    check("verify after approval exits 3 (not anchored)", verify.returncode == 3, verify.stdout)
     check(
         "verify reports one approval execution",
         "0 failed" in verify.stdout and "1 decision(s), 1 execution(s)" in verify.stdout,
