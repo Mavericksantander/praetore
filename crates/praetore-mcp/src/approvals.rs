@@ -1948,7 +1948,6 @@ mod tests {
         assert_eq!(report.approval_decisions, 1, "{report:?}");
     }
 
-
     #[test]
     fn spec_defines_consumed_approval_path_check_equals_held() {
         let spec = include_str!("../../../docs/formal/ApprovalPath.tla");
