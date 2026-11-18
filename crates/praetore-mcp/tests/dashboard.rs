@@ -146,7 +146,10 @@ fn assert_state_matches_verify(home: &Home) -> Value {
     let (code, report) = verify_cli(home);
     let state = dashboard::state(home, None);
     let v = &state["verify"];
-    assert_eq!(v["status"] == "ok", code == 0, "{report}\n{v}");
+    // `verify` ran without heads: 3 when nothing failed, 1 otherwise.
+    assert_eq!(v["status"] == "ok", code == 3, "{report}\n{v}");
+    assert_eq!(v["assurance"] == "unanchored", code == 3, "{report}\n{v}");
+    assert_eq!(v["assurance"] == "failed", code == 1, "{report}\n{v}");
     let cli_failures: Vec<&str> = report
         .lines()
         .filter(|l| l.starts_with("FAIL") && !l.contains(" receipts: "))
@@ -160,7 +163,7 @@ fn assert_state_matches_verify(home: &Home) -> Value {
     assert_eq!(cli_failures, state_failures);
     let summary = format!(
         "{} {} receipts: {} verified, {} failed",
-        if code == 0 { "OK" } else { "FAIL" },
+        if code == 3 { "UNANCHORED" } else { "FAIL" },
         v["total"],
         v["verified"],
         v["failed"]

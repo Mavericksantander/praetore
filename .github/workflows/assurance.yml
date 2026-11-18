@@ -118,6 +118,12 @@ jobs:
         run: make demo demo-verify
       - name: Receipt verification demo (DEMO/TEST-ONLY keys)
         run: ./demo/verify-receipt.sh
+      - name: verify is OK only against both heads kept elsewhere (output shown)
+        run: |
+          set -euo pipefail
+          output="$(cargo test --locked -p praetore-mcp --test verify_anchor -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok\. 6 passed" <<<"$output" || { echo "::error::expected the 6 tests of tests/verify_anchor.rs to run and pass"; exit 1; }
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       # A new Expiry::at() call without #[expect] must fail clippy in this
       # job's environment. tests/lint_guard.rs reads sources and config

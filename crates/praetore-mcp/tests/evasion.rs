@@ -23,6 +23,13 @@ use std::{
 
 const TTL_ENV: &str = "PRAETORE_MCP_APPROVAL_TTL_SECONDS";
 
+/// Whether a `verify` run without the heads kept elsewhere found nothing
+/// wrong: the summary says UNANCHORED and the exit code is 3, not 0 (a
+/// result without both heads is not a pass).
+fn unanchored(out: &Output) -> bool {
+    out.status.code() == Some(3) && String::from_utf8_lossy(&out.stdout).starts_with("UNANCHORED ")
+}
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_praetore-mcp")
 }
@@ -240,9 +247,9 @@ fn a_server_started_without_wrap_runs_the_call_and_leaves_no_receipt() {
     assert_eq!(fs::read_to_string(&target).unwrap(), "direct");
     assert_eq!(receipts(&home).len(), before, "praetore-mcp saw nothing");
     let out = verify(&home);
-    assert!(out.status.success(), "{out:?}");
+    assert!(unanchored(&out), "{out:?}");
     assert!(
-        stdout(&out).starts_with("OK 1 receipts"),
+        stdout(&out).starts_with("UNANCHORED 1 receipts"),
         "{}",
         stdout(&out)
     );
@@ -271,7 +278,7 @@ fn an_edited_policy_allows_a_denied_call_and_shows_only_as_a_new_policy_digest()
     assert_eq!(executed(&stderr, "delete_file"), 1, "{stderr}");
 
     let out = verify(&home);
-    assert!(out.status.success(), "{out:?}");
+    assert!(unanchored(&out), "{out:?}");
     let digests: Vec<String> = receipts(&home)
         .iter()
         .map(|r| r["evidence"]["policy_digest"].as_str().unwrap().to_owned())
@@ -308,7 +315,7 @@ fn an_edited_config_turns_reports_off_but_not_the_receipts() {
     assert!(out.status.success(), "{out:?}");
     assert!(!home.root.join("reports").exists(), "no report written");
     assert_eq!(receipts(&home).len(), 1);
-    assert!(verify(&home).status.success());
+    assert!(unanchored(&verify(&home)));
 }
 
 // ---------- (c) deleting or truncating a journal ----------
@@ -322,7 +329,7 @@ fn three_receipts() -> (tempfile::TempDir, Home) {
     let (out, stderr) = wrap(&home, &calls);
     assert!(out.status.success(), "{stderr}");
     assert_eq!(receipts(&home).len(), 3);
-    assert!(verify(&home).status.success());
+    assert!(unanchored(&verify(&home)));
     (temp, home)
 }
 
@@ -375,6 +382,19 @@ fn printed_head(out: &Output) -> String {
     head.to_owned()
 }
 
+/// `verify` with both anchors, for a home that has no approval journal.
+fn verify_anchored(home: &Home, head: &str) -> Output {
+    cli(&[
+        "verify",
+        "--dir",
+        home.root.to_str().unwrap(),
+        "--expected-head",
+        head,
+        "--expected-approval-head",
+        "none",
+    ])
+}
+
 fn verify_with_head(home: &Home, head: &str) -> Output {
     cli(&[
         "verify",
@@ -396,17 +416,17 @@ fn dropping_the_last_receipts_or_the_journal_fails_only_verify_with_the_expected
     let (_temp, home) = three_receipts();
     let before = verify(&home);
     let head = printed_head(&before);
-    assert!(
-        verify_with_head(&home, &head).status.success(),
-        "{}",
-        stdout(&before)
-    );
+    let anchored = verify_anchored(&home, &head);
+    assert!(anchored.status.success(), "{}", stdout(&anchored));
+    assert!(stdout(&anchored).starts_with("OK 3 receipts"));
+    // One head alone is not a pass.
+    assert!(unanchored(&verify_with_head(&home, &head)));
 
     rewrite_receipts(&home, |index, line| (index < 2).then(|| line.to_owned()));
     let out = verify(&home);
-    assert!(out.status.success(), "{}", stdout(&out));
+    assert!(unanchored(&out), "{}", stdout(&out));
     assert!(
-        stdout(&out).starts_with("OK 2 receipts"),
+        stdout(&out).starts_with("UNANCHORED 2 receipts"),
         "{}",
         stdout(&out)
     );
@@ -417,9 +437,9 @@ fn dropping_the_last_receipts_or_the_journal_fails_only_verify_with_the_expected
         fs::remove_file(file).unwrap();
     }
     let out = verify(&home);
-    assert!(out.status.success(), "{}", stdout(&out));
+    assert!(unanchored(&out), "{}", stdout(&out));
     assert!(
-        stdout(&out).starts_with("OK 0 receipts"),
+        stdout(&out).starts_with("UNANCHORED 0 receipts"),
         "{}",
         stdout(&out)
     );
@@ -447,7 +467,7 @@ fn truncating_the_approval_journal_holds_a_used_approval_and_fails_verify() {
     hold_and_approve(&home, &arguments);
     let (_, stderr) = wrap(&home, &[call(11, "append", arguments.clone())]);
     assert_eq!(executed(&stderr, "append"), 1, "{stderr}");
-    assert!(verify(&home).status.success());
+    assert!(unanchored(&verify(&home)));
 
     let journal = approval_journal(&home);
     let text = fs::read_to_string(&journal).unwrap();
@@ -506,7 +526,7 @@ fn truncating_both_journals_runs_an_approval_again_and_only_the_saved_heads_find
     assert_eq!(executed(&stderr, "append"), 1, "forwarded again: {stderr}");
     assert_eq!(fs::read_to_string(&target).unwrap(), "aa");
     let out = verify(&home);
-    assert!(out.status.success(), "{}", stdout(&out));
+    assert!(unanchored(&out), "{}", stdout(&out));
     let out = verify_with_head(&home, &receipts_head);
     assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
     let out = verify_with_approval_head(&home, &approval_head);
@@ -675,7 +695,7 @@ fn verify_says_where_to_keep_the_approval_head_and_when_one_use_holds() {
     let (_, stderr) = wrap(&home, &[call(11, "append", arguments)]);
     assert_eq!(executed(&stderr, "append"), 1, "{stderr}");
     let out = verify(&home);
-    assert!(out.status.success(), "{}", stdout(&out));
+    assert!(unanchored(&out), "{}", stdout(&out));
     let text = stdout(&out);
     let head = printed_approval_head(&out);
     assert!(
@@ -721,8 +741,9 @@ fn verify_with_the_expected_approval_head_fails_after_a_cut_or_a_deletion() {
     let (_, stderr) = wrap(&home, &[call(11, "append", arguments.clone())]);
     assert_eq!(executed(&stderr, "append"), 1, "{stderr}");
     let head = printed_approval_head(&verify(&home));
+    // The approval head matches; without the receipts head it is not a pass.
     let out = verify_with_approval_head(&home, &head);
-    assert!(out.status.success(), "{}", stdout(&out));
+    assert!(unanchored(&out), "{}", stdout(&out));
     let both = cli(&[
         "verify",
         "--dir",
@@ -744,7 +765,7 @@ fn verify_with_the_expected_approval_head_fails_after_a_cut_or_a_deletion() {
     assert_eq!(lines.len(), 3, "decision, execution, decision");
     fs::write(&journal, format!("{}\n", lines[..2].join("\n"))).unwrap();
     assert!(
-        verify(&home).status.success(),
+        unanchored(&verify(&home)),
         "plain verify passes after the cut"
     );
     let out = verify_with_approval_head(&home, &head);
@@ -790,7 +811,7 @@ fn readme_approval_head_check(home: &Home, saved: &str) -> (String, String) {
     );
     let script: String = block
         .lines()
-        .filter(|line| !line.starts_with("SAVED="))
+        .filter(|line| !line.starts_with("SAVED=") && !line.starts_with("HEAD="))
         .map(|line| format!("{line}\n"))
         .collect();
     let bin_dir = Path::new(bin()).parent().unwrap();
@@ -804,6 +825,9 @@ fn readme_approval_head_check(home: &Home, saved: &str) -> (String, String) {
         .env("PATH", path)
         .env("DIR", &home.root)
         .env("SAVED", saved)
+        // The receipts head as it is now: this check is about the approval
+        // journal, and `verify` passes only with both heads.
+        .env("HEAD", printed_head(&verify(home)))
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
@@ -891,17 +915,14 @@ fn deleting_the_approval_journal_holds_the_call_and_fails_verify_after_it_ran() 
     let (_, stderr) = wrap(&home, &[call(11, "append", arguments.clone())]);
     assert_eq!(executed(&stderr, "append"), 0, "{stderr}");
     assert!(!target.exists());
-    assert!(
-        verify(&home).status.success(),
-        "nothing ran on the approval"
-    );
+    assert!(unanchored(&verify(&home)), "nothing ran on the approval");
 
     // Approved and executed, then the approval journal deleted.
     let pending = approvals::list_pending(&home).unwrap();
     approvals::decide(&home, &pending[0].approval_id, HumanOutcome::Approve, None).unwrap();
     let (_, stderr) = wrap(&home, &[call(12, "append", arguments.clone())]);
     assert_eq!(executed(&stderr, "append"), 1, "{stderr}");
-    assert!(verify(&home).status.success());
+    assert!(unanchored(&verify(&home)));
     fs::remove_file(approval_journal(&home)).unwrap();
     let out = verify(&home);
     assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
@@ -970,7 +991,7 @@ fn a_receipt_naming_a_rejected_or_malformed_approval_fails_verify() {
     let pending = approvals::list_pending(&home).unwrap();
     let id = pending[0].approval_id.clone();
     approvals::decide(&home, &id, HumanOutcome::Reject, None).unwrap();
-    assert!(verify(&home).status.success());
+    assert!(unanchored(&verify(&home)));
     forge_named_receipt(&home, &arguments, &id);
     let out = verify(&home);
     assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
@@ -1023,7 +1044,7 @@ fn an_approval_is_used_once() {
     let (_, stderr) = wrap(&home, &[call(13, "append", arguments)]);
     assert_eq!(executed(&stderr, "append"), 0, "{stderr}");
     assert_eq!(fs::read_to_string(&target).unwrap(), "a");
-    assert!(verify(&home).status.success());
+    assert!(unanchored(&verify(&home)));
 }
 
 // ---------- (e) other arguments after approval ----------
@@ -1121,7 +1142,7 @@ fn another_allowed_tool_with_the_same_effect_is_forwarded() {
         last["evidence"]["decision"]["decided_by"]["rule_id"],
         "allow-write-text"
     );
-    assert!(verify(&home).status.success());
+    assert!(unanchored(&verify(&home)));
 }
 
 // ---------- (b) the approval window ----------
@@ -1178,7 +1199,7 @@ fn the_ttl_env_var_in_the_client_config_stretches_new_approvals() {
         (86400, 86400)
     );
     let out = verify(&home);
-    assert!(out.status.success(), "{}", stdout(&out));
+    assert!(unanchored(&out), "{}", stdout(&out));
 }
 
 /// (b) Limitación conocida, con rastro. `DIR/approvals/ttl-seconds` is read
@@ -1192,7 +1213,7 @@ fn the_ttl_seconds_file_in_the_home_stretches_new_approvals() {
     fs::write(home.root.join("approvals").join("ttl-seconds"), "86400\n").unwrap();
     assert_eq!(approval_window(&home, &[]), (86400, 86400));
     let out = verify(&home);
-    assert!(out.status.success(), "{}", stdout(&out));
+    assert!(unanchored(&out), "{}", stdout(&out));
 }
 
 /// (b) Limitación conocida, con rastro. `approval_ttl_seconds` in
@@ -1210,7 +1231,7 @@ fn the_ttl_in_config_toml_stretches_new_approvals() {
     .unwrap();
     assert_eq!(approval_window(&home, &[]), (86400, 86400));
     let out = verify(&home);
-    assert!(out.status.success(), "{}", stdout(&out));
+    assert!(unanchored(&out), "{}", stdout(&out));
 }
 
 /// What `config.toml` can and cannot change (the module doc of
