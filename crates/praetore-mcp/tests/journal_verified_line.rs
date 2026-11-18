@@ -4,9 +4,14 @@
 //! (a float printed as text that parses to another float) used to be
 //! appended anyway. The next append then failed on that line: enforce
 //! refused every later call, in new sessions too, and observe ran every
-//! later call with no receipt. Now such a line is never written and its
-//! call is refused in both modes, so every home these tests leave behind
-//! passes `verify`.
+//! later call with no receipt. Now such a line is never written.
+//!
+//! A number not in canonical form is Ambiguous first (#209): enforce
+//! refuses the call, and observe forwards the client's bytes, warns, and
+//! records a receipt of the value the gate reads. The Unverifiable
+//! refusal (#214) remains for a residual receipt that cannot be read back
+//! and is not a non-canonical number; that call is refused in both modes.
+//! Every home these tests leave behind passes `verify`.
 
 use praetore_core::{PolicyCondition, PolicyEffect, PolicyRule};
 use praetore_mcp::store::{self, ACTION_TYPE, CAPABILITY, Home};
@@ -147,10 +152,21 @@ fn assert_verifies(root: &Path, context: &str) {
 /// it as an f64 that prints as text which parses to another f64.
 const POISON: &str = "99.9999999999999929";
 
-/// Whether `literal` is one of those numbers in this build, read from the
-/// refusal on stderr. With a correctly rounding parser none is.
-fn was_refused_as_unverifiable(session: &Session) -> bool {
-    session.stderr.contains("was not written")
+/// Concatenated receipt files of the home. The poison literal must not
+/// appear as text: the gate records the value it reads, not the client's
+/// non-canonical digits.
+fn journal_text(root: &Path) -> String {
+    let Ok(entries) = fs::read_dir(root.join("receipts")) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for entry in entries {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|ext| ext == "jsonl") {
+            out.push_str(&fs::read_to_string(path).unwrap());
+        }
+    }
+    out
 }
 
 #[test]
@@ -163,19 +179,26 @@ fn the_poison_literal_never_reaches_the_journal_in_enforce() {
         "enforce",
         &[call(1, "echo", POISON), call(2, "echo", "1")],
     );
-    // The control call always runs and is journaled.
-    if was_refused_as_unverifiable(&session) {
-        assert_eq!(session.executed, 1, "{}", session.stderr);
-        assert_eq!(receipts(&root), 1, "{}", session.stderr);
-        assert!(
-            session.stderr.contains("call REFUSED (enforce)"),
-            "{}",
-            session.stderr
-        );
-    } else {
-        assert_eq!(session.executed, 2, "{}", session.stderr);
-        assert_eq!(receipts(&root), 2, "{}", session.stderr);
-    }
+    // #209 classifies this literal as Ambiguous (not canonical). Enforce
+    // refuses it before the journal writer; only the control call runs
+    // and is journaled. The Unverifiable path of #214 does not apply.
+    assert!(
+        session
+            .stderr
+            .contains("REFUSED an ambiguous client line in enforce mode")
+            && session
+                .stderr
+                .contains(&format!("number {POISON} is not written in canonical form")),
+        "{}",
+        session.stderr
+    );
+    assert_eq!(session.executed, 1, "{}", session.stderr);
+    assert_eq!(receipts(&root), 1, "{}", session.stderr);
+    assert!(
+        !journal_text(&root).contains(POISON),
+        "poison literal reached the journal:\n{}",
+        journal_text(&root)
+    );
     assert_verifies(&root, "after the poison literal");
     // A new session on the same home still records.
     let before = receipts(&root);
@@ -220,24 +243,39 @@ fn observe_never_runs_a_call_without_a_receipt_because_of_a_number() {
             call(3, "echo", "2"),
         ],
     );
-    // Observe forwards the denied delete_file and the control echo; each
-    // has a receipt. The poison call runs only if its receipt was written.
-    assert_eq!(session.executed, receipts(&root), "{}", session.stderr);
-    assert!(session.executed >= 2, "{}", session.stderr);
-    if was_refused_as_unverifiable(&session) {
-        assert_eq!(session.executed, 2, "{}", session.stderr);
-        assert!(
-            session
+    // #209: a non-canonical number is Ambiguous. Observe forwards the
+    // client's bytes, warns, and records a receipt of the value the gate
+    // reads (reenvía-y-avisa). The denied delete_file and the control
+    // echo are also forwarded and journaled, so three calls run and three
+    // receipts are written. The Unverifiable refusal of #214 does not
+    // apply to this literal.
+    assert!(
+        session.stderr.contains("WARNING ambiguous client line")
+            && session
                 .stderr
-                .contains("call REFUSED (observe: this call cannot have a receipt)"),
-            "{}",
-            session.stderr
-        );
-    }
+                .contains(&format!("number {POISON} is not written in canonical form"))
+            && session.stderr.contains("forwarded unchanged (observe)"),
+        "{}",
+        session.stderr
+    );
+    assert!(
+        !session
+            .stderr
+            .contains("call REFUSED (observe: this call cannot have a receipt)"),
+        "{}",
+        session.stderr
+    );
     assert!(
         !session.stderr.contains("could NOT be written"),
         "{}",
         session.stderr
+    );
+    assert_eq!(session.executed, 3, "{}", session.stderr);
+    assert_eq!(receipts(&root), 3, "{}", session.stderr);
+    assert!(
+        !journal_text(&root).contains(POISON),
+        "poison literal reached the journal:\n{}",
+        journal_text(&root)
     );
     assert_verifies(&root, "after the poison literal in observe");
 }
