@@ -53,6 +53,14 @@
 
 ### Fixed
 
+- **praetore-mcp: `verify` says whether the run is anchored.** Without
+  `--expected-head` the first line is `OK (UNANCHORED)` or
+  `FAIL (UNANCHORED)`. With it, `OK (ANCHORED)` or `FAIL (ANCHORED)`.
+  Plain `verify` reports an edit that leaves `seq` or `prev`
+  inconsistent. A deletion, duplication or reordering whose links were
+  recomputed passes plain `verify` and fails `--expected-head` and
+  `--expected-approval-head` when those heads were kept off the machine.
+
 - **praetore-mcp: what observe mode refuses, and what a DENY shows.** The
   help, the `init` output, the READMEs and the GUIDE said observe mode
   never blocks (the 0.3.5 entry below says so too). It records a DENY and

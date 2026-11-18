@@ -205,8 +205,11 @@ Checks every receipt in the journal: integrity hash, attester signature,
 agent intent signature, authority signature against the issuer pins at
 decision time, and the praetore.mode binding. Checks the order of the
 journal too: each entry carries a sequence number and the hash link of the
-previous one, so an entry removed, duplicated or reordered before the last
-one is reported. Prints the head (entry count and last link).
+previous one. An edit that leaves those links inconsistent is reported.
+Deleting, duplicating or reordering entries and recomputing the links
+leaves a chain this command accepts. Without --expected-head the first
+line says UNANCHORED. With a head that still matches it says ANCHORED.
+Prints the head (entry count and last link).
 
 Also checks DIR/approvals/journal.jsonl when it exists: the approver
 signature, that the decision is bound to the held receipt, that an
@@ -816,12 +819,13 @@ fn cmd_verify(args: &[String]) -> Result<i32, String> {
         .map(|(k, v)| (k.as_str(), *v))
         .collect();
     println!(
-        "{} {} receipts: {} verified, {} failed | mode: {} | decision: {}",
+        "{} ({}) {} receipts: {} verified, {} failed | mode: {} | decision: {}",
         if report.failures.is_empty() {
             "OK"
         } else {
             "FAIL"
         },
+        report.anchor.label(),
         report.total,
         report.ok,
         report.failures.len(),

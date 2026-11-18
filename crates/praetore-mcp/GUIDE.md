@@ -174,7 +174,7 @@ praetore-mcp receipts --tail 5
 praetore-mcp verify
 ```
 
-`OK 0 receipts` means the journal is empty. It does not mean a server was
+`OK (UNANCHORED) 0 receipts` means the journal is empty. It does not mean a server was
 wrapped.
 
 **From 0.3.5, the policy `init` writes is default deny.** It has no rules
@@ -246,7 +246,7 @@ wrapped.
 
 ```sh
 praetore-mcp receipts --tail 5
-praetore-mcp verify    # OK N receipts: N verified, 0 failed; prints the journal head
+praetore-mcp verify    # OK (UNANCHORED) N receipts: N verified, 0 failed; prints the journal head
 ```
 
 The v0.3.3 `praetore-mcp verify` does not read 0.3.4 receipts. A 0.3.4
@@ -728,12 +728,12 @@ Read these before relying on anything above.
 | The server does not start; `wrap` exits with 127 | The client could not find the server command (for example `npx`) with the PATH apps get from the desktop | Put the absolute path in the config, e.g. `/opt/homebrew/bin/npx` (check with `which npx`), then `install` again. In the macOS check, both apps found Homebrew's `npx` without this. |
 | `install` says the config `is not strict JSON` | The file has comments or trailing commas (JSONC) | Remove them, or wrap the server by hand with `praetore-mcp wrap ... -- <command>`. The file is never rewritten in this case. |
 | `install --mode enforce` says `nothing to change` / `already wrapped` and exits 0 | The entry is already wrapped. `install` does not change `--mode` on a wrapped entry. Exit 0 leaves the mode already in the config | `praetore-mcp uninstall --client <client> --yes`, then `praetore-mcp install --client <client> --mode enforce --yes`, then restart the client. Or edit `--mode` in the config and restart. |
-| `install` or `uninstall` prints `not modifying ... without confirmation; re-run with --yes` and exits 1 | stdin is not a terminal, and `--yes` was not passed. The file was not changed | Read the dry-run, then re-run with `--yes`. A later `verify` that prints `OK 0 receipts` means the journal is empty. |
+| `install` or `uninstall` prints `not modifying ... without confirmation; re-run with --yes` and exits 1 | stdin is not a terminal, and `--yes` was not passed. The file was not changed | Read the dry-run, then re-run with `--yes`. A later `verify` that prints `OK (UNANCHORED) 0 receipts` means the journal is empty. |
 | The same Cursor file is listed twice when running `install` from `~` | A build up to `9735974`: `~/.cursor/mcp.json` and `./.cursor/mcp.json` are the same file | Harmless (the second pass is skipped). Current builds list it once ([#52](https://github.com/Mavericksantander/praetore/pull/52)). |
 | `praetore-mcp wrap --help` fails with `unexpected argument "--help"` | A build up to `9735974`, before per-command help ([#49](https://github.com/Mavericksantander/praetore/pull/49)) | Reinstall (see the README's Install section), or use `praetore-mcp --help`, which lists every option. |
 | `another praetore-mcp policy command is running (lock …)` | A previous `policy` command was interrupted | If no other `policy` command is running, delete `~/.praetore/mcp/policy.json.lock`. |
 | `verify` prints `FAIL` | A journal line was edited, or the trust files do not match the keys that signed it | Do not trust that receipt. Check that `--dir` is the home that wrote it. Re-labeling observe as enforce is detected on purpose. |
-| `verify` prints `FAIL ... journal order` | An entry was removed, duplicated or reordered, or a daily file is missing | Do not trust the journal as complete. Compare with a copy or a head kept elsewhere (`verify --expected-head HEX`). |
+| `verify` prints `FAIL ... journal order` | An edit broke `seq` or `prev` and was not re-linked, or a daily file is missing | Do not trust the journal as complete. A deletion, duplication or reordering whose links were recomputed still prints `OK (UNANCHORED)`. Compare with a head kept elsewhere (`verify --expected-head HEX`). |
 | Tool calls hang with no reply and no stderr message, in both modes | Another process of the same user holds `receipts/.journal.lock`. Each receipt is appended under an exclusive `flock` that waits without a timeout, and the call is decided only after its receipt is written | Nothing is forwarded while it waits (fail closed). Find the holder (`lsof receipts/.journal.lock` or `fuser` on Linux) and stop it; the wrapper continues once the lock is released. Do not delete the lock file while a wrapper may be appending. |
 | Every call is refused in enforce with `does not end with a newline` | The last journal line is incomplete (an interrupted write, a full disk) | Run `praetore-mcp verify`, keep a copy of the journal, and remove the incomplete last line by hand. |
 | About a year after `init`, every call is refused in enforce mode | The authority from `init` is valid for 364 days | Run `init` in a new `--dir` and `install` again. |

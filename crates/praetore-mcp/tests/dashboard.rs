@@ -158,8 +158,13 @@ fn assert_state_matches_verify(home: &Home) -> Value {
         .map(|f| f.as_str().unwrap())
         .collect();
     assert_eq!(cli_failures, state_failures);
+    let anchor = if v["anchor"] == "anchored" {
+        "ANCHORED"
+    } else {
+        "UNANCHORED"
+    };
     let summary = format!(
-        "{} {} receipts: {} verified, {} failed",
+        "{} ({anchor}) {} receipts: {} verified, {} failed",
         if code == 0 { "OK" } else { "FAIL" },
         v["total"],
         v["verified"],

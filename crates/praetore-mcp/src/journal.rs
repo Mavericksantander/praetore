@@ -4,8 +4,10 @@
 //! format of `praetore_core::journal_chain`, linked with the same function
 //! ([`receipt_link`]): `seq` counts from 0 across all daily files, and
 //! `prev` is the link of the previous entry (64 zeros for the first one).
-//! A deleted, duplicated or reordered entry breaks `seq` or `prev`, and
-//! `verify` reports it. Removing entries at the end of the journal is only
+//! An edit that leaves `seq` or `prev` inconsistent is reported by
+//! `verify`. Deleting, duplicating or reordering entries and recomputing
+//! the links leaves a chain plain `verify` accepts. That run is not
+//! anchored. Removing entries at the end, or a recomputed chain, is
 //! detected against a head kept somewhere else (`verify --expected-head`).
 //!
 //! Lines written before the chain existed (a bare evidence document) are

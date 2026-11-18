@@ -159,7 +159,7 @@ Run the dry-run again. A wrapped entry is reported as
 (exit 0). Open the config and check that the entry's `command` is the
 absolute path of `~/.local/bin/praetore-mcp` and that its args start with
 `wrap`. If `command` is still the original server program, the install did
-not apply. `praetore-mcp verify` can then print `OK 0 receipts`, which
+not apply. `praetore-mcp verify` can then print `OK (UNANCHORED) 0 receipts`, which
 means the journal is empty.
 
 Restart the client after `install`. A running client keeps the old config.
@@ -324,7 +324,7 @@ install or upgrade Node.
   can remove the wrapper).
 - `praetore-mcp verify` checks this installation's receipt journal
   (integrity, signatures, mode binding). In observe, a receipt records a
-  decision that was not enforced. `OK 0 receipts` means the journal is empty.
+  decision that was not enforced. `OK (UNANCHORED) 0 receipts` means the journal is empty.
   The v0.3.3 `praetore-mcp verify` does not read 0.3.4 receipts.
 - A `write_file` deny rule blocks that tool only. On
   `@modelcontextprotocol/server-filesystem@2.3.0`, `append_file`,

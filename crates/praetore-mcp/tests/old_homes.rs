@@ -62,7 +62,7 @@ fn a_home_written_by_0_3_6_still_verifies_with_both_heads() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{stdout}");
     assert!(
-        stdout.starts_with("OK 4 receipts: 4 verified, 0 failed"),
+        stdout.starts_with("OK (ANCHORED) 4 receipts: 4 verified, 0 failed"),
         "{stdout}"
     );
     assert!(

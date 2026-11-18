@@ -147,7 +147,10 @@ const I18N = {
     why_same: "La política actual es la misma con que se decidió. La regla dice:",
     why_changed: "La política cambió después de esta decisión: la regla de hoy puede ser otra.",
     unbound_short: (id) => `${id} (sin aplicar)`,
-    verify_chip_ok: (n) => `verify OK · ${n}`, verify_chip_fail: (f) => `verify: ${f} falla(s)`, verify_chip_err: "verify no corrió",
+    verify_chip_ok: (n) => `verify OK · ${n}`,
+    verify_chip_unanchored: (n) => `verify OK sin ancla · ${n}`,
+    verify_chip_anchored: (n) => `verify OK con ancla · ${n}`,
+    verify_chip_fail: (f) => `verify: ${f} falla(s)`, verify_chip_err: "verify no corrió",
     empty_filter_t: "Sin resultados", empty_filter_d: "Prueba con otro filtro.",
     tab_summary: "Resumen", tab_signatures: "Verificación", tab_paths: "Rutas", tab_json: "Datos técnicos",
     f_decision: "Decisión", f_rule: "Regla", f_mode: "Modo", f_server: "Servidor", f_tool: "Herramienta",
@@ -171,7 +174,10 @@ const I18N = {
     rule_default_t: "Todo lo demás", rule_default_d: "Cualquier llamada que ninguna regla cubra se bloquea (default deny).",
     allow_all_tag: "Permite todo",
     pol_note: "Los procesos wrap leen la política al arrancar: reinicia tu cliente MCP después de cambiarla.",
-    int_ok: "El journal está íntegro.", int_fail: "Se encontraron fallas",
+    int_ok: "Los enlaces cuadran. Esta pasada no tiene ancla.",
+    int_ok_unanchored: "Los enlaces cuadran. Esta pasada no tiene ancla.",
+    int_ok_anchored: "El journal coincide con el head guardado.",
+    int_fail: "Se encontraron fallas",
     verified_n: (ok, total, failed) => `${ok} de ${total} recibos verificados, ${failed} fallas`,
     head: "Journal head",
     head_text: (n, seq, u) => `${n} entradas encadenadas, próximo seq ${seq}, ${u} sin encadenar anteriores`,
@@ -317,7 +323,10 @@ const I18N = {
     why_same: "The current policy is the one it was decided under. The rule says:",
     why_changed: "The policy changed after this decision: today's rule may differ.",
     unbound_short: (id) => `${id} (not applied)`,
-    verify_chip_ok: (n) => `verify OK · ${n}`, verify_chip_fail: (f) => `verify: ${f} failure(s)`, verify_chip_err: "verify did not run",
+    verify_chip_ok: (n) => `verify OK · ${n}`,
+    verify_chip_unanchored: (n) => `verify OK unanchored · ${n}`,
+    verify_chip_anchored: (n) => `verify OK anchored · ${n}`,
+    verify_chip_fail: (f) => `verify: ${f} failure(s)`, verify_chip_err: "verify did not run",
     empty_filter_t: "No results", empty_filter_d: "Try another filter.",
     tab_summary: "Summary", tab_signatures: "Verification", tab_paths: "Paths", tab_json: "Technical data",
     f_decision: "Decision", f_rule: "Rule", f_mode: "Mode", f_server: "Server", f_tool: "Tool",
@@ -341,7 +350,10 @@ const I18N = {
     rule_default_t: "Everything else", rule_default_d: "Any call no rule covers is blocked (default deny).",
     allow_all_tag: "Allows everything",
     pol_note: "wrap processes read the policy when they start: restart your MCP client after changing it.",
-    int_ok: "The journal is intact.", int_fail: "Failures found",
+    int_ok: "Links check out. This run is not anchored.",
+    int_ok_unanchored: "Links check out. This run is not anchored.",
+    int_ok_anchored: "The journal matches the saved head.",
+    int_fail: "Failures found",
     verified_n: (ok, total, failed) => `${ok} of ${total} receipts verified, ${failed} failures`,
     head: "Journal head",
     head_text: (n, seq, u) => `${n} chained entries, next seq ${seq}, ${u} unchained earlier entries`,
@@ -487,7 +499,10 @@ const I18N = {
     why_same: "A política atual é a mesma com que se decidiu. A regra diz:",
     why_changed: "A política mudou depois desta decisão: a regra de hoje pode ser outra.",
     unbound_short: (id) => `${id} (não aplicada)`,
-    verify_chip_ok: (n) => `verify OK · ${n}`, verify_chip_fail: (f) => `verify: ${f} falha(s)`, verify_chip_err: "verify não rodou",
+    verify_chip_ok: (n) => `verify OK · ${n}`,
+    verify_chip_unanchored: (n) => `verify OK sem âncora · ${n}`,
+    verify_chip_anchored: (n) => `verify OK com âncora · ${n}`,
+    verify_chip_fail: (f) => `verify: ${f} falha(s)`, verify_chip_err: "verify não rodou",
     empty_filter_t: "Sem resultados", empty_filter_d: "Tente outro filtro.",
     tab_summary: "Resumo", tab_signatures: "Verificação", tab_paths: "Caminhos", tab_json: "Dados técnicos",
     f_decision: "Decisão", f_rule: "Regra", f_mode: "Modo", f_server: "Servidor", f_tool: "Ferramenta",
@@ -511,7 +526,10 @@ const I18N = {
     rule_default_t: "Todo o resto", rule_default_d: "Qualquer chamada que nenhuma regra cubra é bloqueada (default deny).",
     allow_all_tag: "Permite tudo",
     pol_note: "Os processos wrap leem a política ao iniciar: reinicie seu cliente MCP depois de alterá-la.",
-    int_ok: "O journal está íntegro.", int_fail: "Foram encontradas falhas",
+    int_ok: "Os elos fecham. Esta passagem não tem âncora.",
+    int_ok_unanchored: "Os elos fecham. Esta passagem não tem âncora.",
+    int_ok_anchored: "O journal coincide com o head guardado.",
+    int_fail: "Foram encontradas falhas",
     verified_n: (ok, total, failed) => `${ok} de ${total} recibos verificados, ${failed} falhas`,
     head: "Journal head",
     head_text: (n, seq, u) => `${n} entradas encadeadas, próximo seq ${seq}, ${u} não encadeadas anteriores`,
@@ -844,7 +862,8 @@ function renderShell() {
   const v = state.verify;
   const verifyChip = document.getElementById("verify-chip");
   verifyChip.className = v.status === "ok" ? "chip ok" : "chip bad";
-  verifyChip.textContent = v.status === "ok" ? t("verify_chip_ok", `${v.verified}/${v.total}`)
+  verifyChip.textContent = v.status === "ok"
+    ? t(v.anchor === "anchored" ? "verify_chip_anchored" : "verify_chip_unanchored", `${v.verified}/${v.total}`)
     : v.status === "fail" ? t("verify_chip_fail", v.failed) : t("verify_chip_err");
   verifyChip.setAttribute("href", "#/info/integrity");
 }
@@ -2132,8 +2151,10 @@ function renderIntegrity() {
     root.append(el("p", { class: "alert bad" }, `${t("verify_error")}: ${v.error}`));
     return;
   }
+  const intact = v.status !== "ok" ? t("int_fail")
+    : v.anchor === "anchored" ? t("int_ok_anchored") : t("int_ok_unanchored");
   root.append(heroCard(v.status === "ok" ? "ok" : "bad", v.status === "ok" ? "✓" : "!",
-    v.status === "ok" ? t("int_ok") : t("int_fail"), t("verified_n", v.verified, v.total, v.failed), null));
+    intact, t("verified_n", v.verified, v.total, v.failed), null));
   if (v.failures.length > 0) {
     const ul = el("ul", { class: "mono" });
     for (const f of v.failures) ul.append(el("li", {}, f));

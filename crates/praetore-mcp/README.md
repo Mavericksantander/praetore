@@ -201,7 +201,7 @@ In a terminal, `install` and `uninstall` ask
 terminal they exit 1 and print
 `not modifying <file> without confirmation; re-run with --yes`, and they
 do not change the file. A later `praetore-mcp verify` that prints
-`OK 0 receipts` means the journal is empty.
+`OK (UNANCHORED) 0 receipts` means the journal is empty.
 
 A rule names one tool. `policy deny --tool write_file` on
 `@modelcontextprotocol/server-filesystem@2.3.0` does not make that server
@@ -313,12 +313,16 @@ when a new daily file is created). Each line is
 `praetore_core::journal_chain` (see
 [`docs/proposals/journal-chain-jsonl.md`](../../docs/proposals/journal-chain-jsonl.md)):
 `seq` counts from 0 across all daily files and `prev` is the hash link of the
-previous entry. `praetore-mcp verify` reports an entry that was removed,
-duplicated or reordered before the last one, and prints the head (entry
-count and last link). Entries removed at the end of the journal leave a
-valid shorter chain: they are only detected with `verify --expected-head`
-against a head kept where the wrapped servers cannot write. Without that,
-the journal shows what is in it, not that nothing is missing. Lines written
+previous entry. Without `--expected-head`, `praetore-mcp verify` reports
+an edit that breaks `seq` or `prev` and is not re-linked. Deleting,
+duplicating or reordering entries and recomputing the links leaves a
+chain that plain `verify` accepts. That run prints `OK (UNANCHORED)`.
+With `--expected-head` and a head kept where the wrapped servers cannot
+write, that change fails, and so does a shorter chain from dropping the
+end. A run whose journal still ends at the saved head prints
+`OK (ANCHORED)`. `verify` prints the head (entry count and last link).
+Without a saved head, the journal shows what is in it, not that nothing
+is missing. Lines written
 by earlier versions (a bare evidence document) still verify, are counted as
 unchained, and may only come before the first chained entry. The v0.3.3
 `praetore-mcp verify` does not read 0.3.4 receipts: it reads each line as

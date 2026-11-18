@@ -1181,6 +1181,7 @@ fn pending_view(home: &Home, snapshot: &Snapshot, status: &BTreeMap<String, Stri
 fn verify_view(report: &VerifyReport, home: &Home, expected: ExpectedHeads<'_>) -> Value {
     json!({
         "status": if report.failures.is_empty() { "ok" } else { "fail" },
+        "anchor": report.anchor.as_str(),
         "total": report.total,
         "verified": report.ok,
         "failed": report.failures.len(),

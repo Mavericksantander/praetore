@@ -242,7 +242,7 @@ fn a_server_started_without_wrap_runs_the_call_and_leaves_no_receipt() {
     let out = verify(&home);
     assert!(out.status.success(), "{out:?}");
     assert!(
-        stdout(&out).starts_with("OK 1 receipts"),
+        stdout(&out).starts_with("OK (UNANCHORED) 1 receipts"),
         "{}",
         stdout(&out)
     );
@@ -406,7 +406,7 @@ fn dropping_the_last_receipts_or_the_journal_fails_only_verify_with_the_expected
     let out = verify(&home);
     assert!(out.status.success(), "{}", stdout(&out));
     assert!(
-        stdout(&out).starts_with("OK 2 receipts"),
+        stdout(&out).starts_with("OK (UNANCHORED) 2 receipts"),
         "{}",
         stdout(&out)
     );
@@ -419,7 +419,7 @@ fn dropping_the_last_receipts_or_the_journal_fails_only_verify_with_the_expected
     let out = verify(&home);
     assert!(out.status.success(), "{}", stdout(&out));
     assert!(
-        stdout(&out).starts_with("OK 0 receipts"),
+        stdout(&out).starts_with("OK (UNANCHORED) 0 receipts"),
         "{}",
         stdout(&out)
     );
@@ -706,6 +706,142 @@ fn verify_with_approval_head(home: &Home, head: &str) -> Output {
         "--expected-approval-head",
         head,
     ])
+}
+
+/// The JSON object of `key`, which is the last member of a journal line.
+fn json_member<'a>(line: &'a str, key: &str) -> &'a str {
+    let marker = format!("\"{key}\":");
+    let start = line.find(&marker).unwrap() + marker.len();
+    let body = &line[start..line.len() - 1];
+    assert!(body.starts_with('{') && body.ends_with('}'), "{line}");
+    body
+}
+
+/// Rewrites receipt lines as one chain. SHA-256 over public fields only.
+/// No key file is read.
+fn rechain_receipts(lines: &[&str]) -> String {
+    use sha2::{Digest, Sha256};
+    const DOMAIN: &[u8] = b"PRAETORE_JOURNAL_LINK_V1\0";
+    let mut prev = "0".repeat(64);
+    let mut out = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        let value: Value = serde_json::from_str(line).unwrap();
+        let evidence = json_member(line, "evidence");
+        let context_hash = value["evidence"]["context_hash"].as_str().unwrap();
+        let signature = value["evidence"]["attester_signature"].as_str().unwrap();
+        let seq = index as u64;
+        out.push_str(&format!(
+            "{{\"seq\":{seq},\"prev\":\"{prev}\",\"evidence\":{evidence}}}\n"
+        ));
+        let mut hasher = Sha256::new();
+        hasher.update(DOMAIN);
+        hasher.update(seq.to_be_bytes());
+        hasher.update(prev.as_bytes());
+        hasher.update(context_hash.as_bytes());
+        hasher.update(signature.as_bytes());
+        prev = hex::encode(hasher.finalize());
+    }
+    out
+}
+
+/// Rewrites approval lines as one chain. SHA-256 over the record bytes.
+/// No key file is read.
+fn rechain_approvals(lines: &[&str]) -> String {
+    use sha2::{Digest, Sha256};
+    const DOMAIN: &[u8] = b"PRAETORE_MCP_APPROVAL_JOURNAL_V1\0";
+    let mut prev = "0".repeat(64);
+    let mut out = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        let record = json_member(line, "record");
+        let seq = index as u64;
+        out.push_str(&format!(
+            "{{\"seq\":{seq},\"prev\":\"{prev}\",\"record\":{record}}}\n"
+        ));
+        let mut hasher = Sha256::new();
+        hasher.update(DOMAIN);
+        hasher.update(seq.to_be_bytes());
+        hasher.update(prev.as_bytes());
+        hasher.update(record.as_bytes());
+        prev = hex::encode(hasher.finalize());
+    }
+    out
+}
+
+/// (c) Plain `verify` accepts a journal whose middle line was removed and
+/// whose links were recomputed, and it says UNANCHORED. The same journals
+/// fail `--expected-head` and `--expected-approval-head`. The decisions
+/// below are signed by `approvals::decide` in this process. The relink
+/// uses only SHA-256.
+#[test]
+fn rechained_middle_deletion_is_unanchored_and_fails_the_saved_heads() {
+    let spec = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/formal/JournalVerify.tla"),
+    )
+    .unwrap();
+    for name in [
+        "AnchoredVerifyDetectsAnyNonAppendChange",
+        "UnanchoredNeverClaimsAnchored",
+    ] {
+        assert!(spec.contains(name), "{name} missing from JournalVerify.tla");
+    }
+
+    let (temp, home) = init_home();
+    for (n, text) in ["a", "b", "c"].into_iter().enumerate() {
+        let arguments = json!({
+            "path": temp.path().join(format!("t{n}.txt")).to_str().unwrap(),
+            "text": text,
+        });
+        hold_and_approve(&home, &arguments);
+    }
+    let before = verify(&home);
+    let before_text = stdout(&before);
+    assert!(before.status.success(), "{before_text}");
+    assert!(before_text.contains("(UNANCHORED)"), "{before_text}");
+    assert!(!before_text.contains("(ANCHORED)"), "{before_text}");
+    let receipts_head = printed_head(&before);
+    let approval_head = printed_approval_head(&before);
+
+    let files = receipt_files(&home);
+    assert_eq!(files.len(), 1);
+    let receipt_lines: Vec<String> = fs::read_to_string(&files[0])
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(receipt_lines.len(), 3, "{receipt_lines:?}");
+    fs::write(
+        &files[0],
+        rechain_receipts(&[&receipt_lines[0], &receipt_lines[2]]),
+    )
+    .unwrap();
+
+    let journal = approval_journal(&home);
+    let approval_lines: Vec<String> = fs::read_to_string(&journal)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(approval_lines.len(), 3, "{approval_lines:?}");
+    assert!(
+        approval_lines
+            .iter()
+            .all(|line| line.contains("\"decision\""))
+    );
+    fs::write(
+        &journal,
+        rechain_approvals(&[&approval_lines[0], &approval_lines[2]]),
+    )
+    .unwrap();
+
+    let out = verify(&home);
+    let report = stdout(&out);
+    assert!(out.status.success(), "{report}");
+    assert!(report.starts_with("OK (UNANCHORED)"), "{report}");
+    assert!(!report.contains("(ANCHORED)"), "{report}");
+    let out = verify_with_head(&home, &receipts_head);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let out = verify_with_approval_head(&home, &approval_head);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
 }
 
 /// (c) `verify --expected-approval-head`: the approval journal must end at

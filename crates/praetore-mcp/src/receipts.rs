@@ -148,10 +148,40 @@ pub fn render_table(
     out
 }
 
+/// Whether this run compared the receipts journal with a head kept
+/// outside it. `Unanchored` when `--expected-head` was not passed, even
+/// if `--expected-approval-head` was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Anchor {
+    #[default]
+    Unanchored,
+    Anchored,
+}
+
+impl Anchor {
+    /// `ANCHORED` or `UNANCHORED`, as the first line of `verify` prints it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Anchored => "ANCHORED",
+            Self::Unanchored => "UNANCHORED",
+        }
+    }
+
+    /// `anchored` or `unanchored`, for the dashboard JSON.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Anchored => "anchored",
+            Self::Unanchored => "unanchored",
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct VerifyReport {
     pub total: usize,
     pub ok: usize,
+    /// `Anchored` when `--expected-head` was passed and parsed.
+    pub anchor: Anchor,
     pub failures: Vec<String>,
     /// Entries written before the journal was chained (bare evidence lines).
     pub unchained: u64,
@@ -386,11 +416,13 @@ pub fn verify_journal(home: &Home, expected_head: Option<&str>) -> Result<Verify
     )
 }
 
-/// Verifies every receipt and the order of the journal: no entry removed,
-/// duplicated or reordered between the first and the last chained entry.
-/// Entries removed at the end are only detected with an expected head:
-/// `expected.receipts` for the receipts journal, `expected.approvals` for
-/// the approval journal.
+/// Verifies every receipt and the links of the journal. An edit that
+/// breaks `seq` or `prev` and is not re-linked fails. A deletion,
+/// duplication or reordering whose links were recomputed does not: that
+/// is [`Anchor::Unanchored`] unless `expected.receipts` is set, in which
+/// case the receipts journal must still end at that head.
+/// `expected.approvals` is the same check for the approval journal. It
+/// does not by itself mark the run anchored.
 pub fn verify_journal_with(
     home: &Home,
     expected: ExpectedHeads<'_>,
@@ -468,6 +500,11 @@ pub fn verify_journal_with(
     report.chained = chain.chained;
     report.unchained = chain.unchained;
     report.head = chain.head();
+    report.anchor = if expected_head.is_some() {
+        Anchor::Anchored
+    } else {
+        Anchor::Unanchored
+    };
     if let Some(expected) = expected_head {
         match report.head {
             Some(head) if head.prev == expected => {}
