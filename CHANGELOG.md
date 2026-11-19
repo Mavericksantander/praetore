@@ -119,6 +119,14 @@
 
 ### Fixed
 
+- **A late dispatch's HTTP 410 names the signed close.** `POST
+  /v1/approvals/{tenant}/{agent}/{request}/dispatch` after the approval
+  window closed now answers 410 `approved_claim_expired` and includes the
+  signed `not_dispatched` receipt. The `code` is that receipt's
+  `not_dispatched_reason`. A window that closed with no decision is still
+  410 `approval_expired`. **Visible change: clients that treated a dispatch
+  410's `code` as `approval_expired` must read `approved_claim_expired`.**
+
 - **praetore-mcp: `policy coverage` treats a `tool` Prefix as a selector.**
   The tool name is already known, so the decision matches the engine,
   including case and unsafe values (`..`, `%`, NUL). It used to leave the

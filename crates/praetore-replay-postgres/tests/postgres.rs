@@ -2703,9 +2703,7 @@ fn postgres_apd_expiry_before_claim_closes_as_approved_claim_expired() {
 
     assert!(matches!(
         fixture.gateway.dispatch_approved(key),
-        Err(GatewayError::Approval(
-            praetore_gateway::ApprovalError::Expired
-        ))
+        Err(GatewayError::ApprovedClaimExpired { .. })
     ));
     assert_eq!(fixture.adapter.invocation_count(), 0);
     assert_eq!(database_invocation_count(key), 0);
