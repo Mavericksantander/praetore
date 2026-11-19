@@ -101,6 +101,11 @@
 
 ### Fixed
 
+- **praetore-mcp: `policy coverage` treats a `tool` Prefix as a selector.**
+  The tool name is already known, so the decision matches the engine,
+  including case and unsafe values (`..`, `%`, NUL). It used to leave the
+  rule in the argument column and report default deny.
+
 - **A repeated journal INSERT no longer takes a position (migration 0025).**
   Before 0025, `INSERT ... ON CONFLICT DO NOTHING` or `DO UPDATE` on a
   primary key already in `praetore.execution_journal` discarded the row
