@@ -499,6 +499,17 @@ fn scope(rule: &PolicyRule, server: &str, tool: &str) -> Scope {
                     return Scope::No;
                 }
             }
+            ("tool", MatchOperator::Prefix, expected) => {
+                // The tool name is known here, so this is a selector, the same
+                // one the engine matches on `parameters.tool`. A value the
+                // engine treats as unsafe (`..`, `%`, NUL) matches only a
+                // restrictive rule. A non-string expectation is unknown, which
+                // also matches only a restrictive rule.
+                let deny_like = rule.effect != PolicyEffect::Allow;
+                if !tool_prefix_holds(tool, expected, deny_like) {
+                    return Scope::No;
+                }
+            }
             _ => conditions.push(condition_label("", condition)),
         }
     }
@@ -512,6 +523,21 @@ fn scope(rule: &PolicyRule, server: &str, tool: &str) -> Scope {
     } else {
         Scope::Conditional(conditions)
     }
+}
+
+/// Whether a `tool` Prefix condition holds for `tool`, using the engine's
+/// Prefix result: an unsafe value or a non-string expectation matches only
+/// a restrictive rule, and a string matches when `tool` starts with it.
+fn tool_prefix_holds(tool: &str, expected: &Value, deny_like: bool) -> bool {
+    let Some(prefix) = expected.as_str() else {
+        return deny_like;
+    };
+    let unsafe_value =
+        tool.split(['/', '\\']).any(|segment| segment == "..") || tool.contains(['%', '\0']);
+    if unsafe_value {
+        return deny_like;
+    }
+    tool.starts_with(prefix)
 }
 
 /// What the policy decides for one tool, read from the rules alone.
