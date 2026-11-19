@@ -124,6 +124,51 @@ fn vscode_install_uninstall_round_trip() {
     round_trip("tests/fixtures/vscode_mcp.json", "vscode", "mcp.json", 1);
 }
 
+/// 6a B-WRAP: `install` must not report "already wrapped" for an entry whose
+/// argv is not a `wrap -- <command>`.
+#[test]
+fn install_rewrites_an_incomplete_wrap() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    assert!(
+        run(&["init", "--dir", home.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let config = temp.path().join("mcp.json");
+    let originals = [
+        r#"{"mcpServers":{"git":{"command":"/nonexistent/praetore-mcp","args":["wrap"]}}}"#,
+        r#"{"mcpServers":{"git":{"command":"praetore-mcp","args":["wrap","--"]}}}"#,
+    ];
+    for original in originals {
+        fs::write(&config, original).unwrap();
+        let out = run(&[
+            "install",
+            "--client",
+            "claude-desktop",
+            "--config",
+            config.to_str().unwrap(),
+            "--dir",
+            home.to_str().unwrap(),
+            "--mode",
+            "enforce",
+            "--yes",
+        ]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stdout}{stderr}");
+        assert!(
+            !stdout.contains("already wrapped"),
+            "install skipped a non-wrap entry:\n{stdout}"
+        );
+        let installed = fs::read_to_string(&config).unwrap();
+        assert_ne!(installed, original);
+        let doc = parse(&installed);
+        let args = doc["mcpServers"]["git"]["args"].as_array().unwrap();
+        assert!(args.iter().any(|arg| arg == "--"), "{installed}");
+    }
+}
+
 #[test]
 fn refuses_jsonc_without_modifying() {
     let temp = tempfile::tempdir().unwrap();

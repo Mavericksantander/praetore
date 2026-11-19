@@ -160,14 +160,16 @@ fn is_praetore_command(command: &str) -> bool {
 }
 
 pub fn is_wrapped(entry: &JsonValue) -> bool {
+    // The file name and a leading `wrap` are not enough: `["wrap"]` and
+    // `["wrap", "--"]` do not name a command, so they are not a wrap.
+    let Some(args) = string_args(entry) else {
+        return false;
+    };
     entry
         .get("command")
         .and_then(JsonValue::as_str)
         .is_some_and(is_praetore_command)
-        && string_args(entry)
-            .and_then(|args| args.first().cloned())
-            .as_deref()
-            == Some(WRAP_SUBCOMMAND)
+        && parse_wrapped_args(&args).is_some()
 }
 
 /// Why an entry cannot be wrapped, or `None` if it is a plain stdio entry.
@@ -512,6 +514,32 @@ mod tests {
         assert!(is_wrapped(&entry));
         let entry = JsonValue::parse(r#"{"command":"praetore-mcp","args":["receipts"]}"#).unwrap();
         assert!(!is_wrapped(&entry));
+    }
+
+    /// 6a B-WRAP: a command whose file name is `praetore-mcp` and whose first
+    /// argument is `wrap` is not a wrap unless `parse_wrapped_args` accepts
+    /// it (`--` and a command after it). `install` must rewrite it.
+    #[test]
+    fn incomplete_wrap_is_rewritten() {
+        for text in [
+            r#"{"mcpServers":{"git":{"command":"/nonexistent/praetore-mcp","args":["wrap"]}}}"#,
+            r#"{"mcpServers":{"git":{"command":"praetore-mcp","args":["wrap","--"]}}}"#,
+        ] {
+            let mut doc = JsonValue::parse(text).unwrap();
+            let changes = wrap_config(&mut doc, Client::ClaudeDesktop, &target());
+            assert!(
+                matches!(changes[0].kind, ChangeKind::Wrapped { .. }),
+                "{text} -> {changes:?}"
+            );
+            let entry = doc.get("mcpServers").unwrap().get("git").unwrap();
+            assert!(is_wrapped(entry), "{}", entry.to_compact());
+            let parsed = parse_wrapped_args(&string_args(entry).unwrap()).unwrap();
+            assert!(
+                parsed.command.contains("praetore-mcp"),
+                "{}",
+                entry.to_compact()
+            );
+        }
     }
 
     #[test]
