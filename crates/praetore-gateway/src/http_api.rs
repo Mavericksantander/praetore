@@ -1029,6 +1029,12 @@ fn gateway_error_response(error: GatewayError) -> Response {
         GatewayError::Approval(crate::ApprovalError::SelfApproval) => {
             error_response(StatusCode::FORBIDDEN, "self_approval_forbidden")
         }
+        GatewayError::Approval(crate::ApprovalError::RootMayNotApprove) => {
+            error_response(StatusCode::FORBIDDEN, "root_may_not_approve")
+        }
+        GatewayError::Approval(crate::ApprovalError::Delegation(_)) => {
+            error_response(StatusCode::FORBIDDEN, "invalid_approval_delegation")
+        }
         GatewayError::Approval(crate::ApprovalError::Expired) => {
             error_response(StatusCode::GONE, "approval_expired")
         }

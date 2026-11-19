@@ -662,3 +662,205 @@ fn claude_code_a_file_changed_before_the_write_is_not_overwritten() {
     assert_eq!(fs::read_to_string(&config).unwrap(), rewritten);
     assert!(backups(temp.path()).is_empty());
 }
+
+/// Contrato p8: exit 1 y "NOT governed by this home", con --dry-run y con --yes,
+/// sin tocar el archivo. Mata el mutante que quita `code = 1` en cmd_install.
+#[test]
+fn six_a_entries_exit_1_in_dry_run_and_yes() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let home_str = home.to_str().unwrap();
+    assert!(run(&["init", "--dir", home_str]).status.success());
+    let config = temp.path().join("mcp.json");
+    let exe = fs::canonicalize(env!("CARGO_BIN_EXE_praetore-mcp"))
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let entry = |command: &str, dir: &str, mode: &str| {
+        format!(
+            r#"{{"mcpServers":{{"s":{{"command":"{command}","args":["wrap","--dir","{dir}","--name","s","--mode","{mode}","--","npx","-y","srv"]}}}}}}"#
+        )
+    };
+    let install = |last: &str| {
+        run(&[
+            "install",
+            "--client",
+            "cursor",
+            "--config",
+            config.to_str().unwrap(),
+            "--dir",
+            home_str,
+            "--mode",
+            "enforce",
+            last,
+        ])
+    };
+    let cases = [
+        entry("/tmp/evil/praetore-mcp", home_str, "enforce"),
+        entry(&exe, "/tmp/attacker-home", "observe"),
+        entry(&exe, home_str, "observe"),
+        entry("praetore-mcp", home_str, "enforce"),
+    ];
+    for text in cases {
+        for last in ["--dry-run", "--yes"] {
+            fs::write(&config, &text).unwrap();
+            let out = install(last);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert_eq!(out.status.code(), Some(1), "{last} {text}\n{stdout}");
+            assert!(stdout.contains("NOT governed by this home"), "{stdout}");
+            assert!(!stdout.contains("already wrapped"), "{stdout}");
+            assert_eq!(fs::read_to_string(&config).unwrap(), text);
+        }
+    }
+    let same = entry(&exe, home_str, "enforce");
+    for last in ["--dry-run", "--yes"] {
+        fs::write(&config, &same).unwrap();
+        let out = install(last);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(0), "{stdout}");
+        assert!(
+            stdout.contains("already wrapped by praetore-mcp"),
+            "{stdout}"
+        );
+    }
+}
+
+/// Contrato p8 para `--client claude-code`: una entrada de Claude Code que
+/// parsea como `wrap` pero apunta a otro binario, a otro home, a otro modo o
+/// lleva `--dir` repetido sale con exit 1 y "NOT governed by this home", con
+/// --dry-run y con --yes, sin tocar el archivo. Cubre el archivo de usuario
+/// con `--config` y el `.mcp.json` de proyecto por la ruta por defecto (el
+/// caso de un repositorio clonado). Una entrada remota cuyo `command` parsea
+/// como wrap sigue siendo remota: Claude Code no ejecuta su `command`.
+#[test]
+fn claude_code_six_a_entries_exit_1_in_dry_run_and_yes() {
+    let (temp, home) = cc_setup();
+    let exe = fs::canonicalize(env!("CARGO_BIN_EXE_praetore-mcp"))
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let wrap_args = |dir: &str, mode: &str| {
+        format!(r#"["wrap","--dir","{dir}","--name","s","--mode","{mode}","--","npx","-y","srv"]"#)
+    };
+    let user_doc = |servers: &str| {
+        format!(
+            "{{\n  \"numStartups\": 3,\n  \"projects\": {{}},\n  \"mcpServers\": {servers}\n}}\n"
+        )
+    };
+    let server =
+        |command: &str, args: &str| format!(r#"{{"s":{{"command":"{command}","args":{args}}}}}"#);
+    let duplicated_dir = format!(
+        r#"["wrap","--dir","{home}","--dir","{home}","--name","s","--mode","enforce","--","npx","-y","srv"]"#
+    );
+    let cases = [
+        server("/tmp/evil/praetore-mcp", &wrap_args(&home, "enforce")),
+        server(&exe, &wrap_args("/tmp/attacker-home", "enforce")),
+        server(&exe, &wrap_args(&home, "observe")),
+        server(&exe, &duplicated_dir),
+        server("praetore-mcp", &wrap_args(&home, "enforce")),
+    ];
+    let config = temp.path().join(".claude.json");
+    let config_str = config.to_str().unwrap().to_owned();
+    let cwd = temp.path().join("repo");
+    fs::create_dir(&cwd).unwrap();
+    for servers in &cases {
+        for last in ["--dry-run", "--yes"] {
+            // ~/.claude.json, named with --config.
+            let doc = user_doc(servers);
+            fs::write(&config, &doc).unwrap();
+            let out = run_in(
+                &[
+                    "install",
+                    "--client",
+                    "claude-code",
+                    "--config",
+                    &config_str,
+                    "--dir",
+                    &home,
+                    "--mode",
+                    "enforce",
+                    last,
+                ],
+                temp.path(),
+                &cwd,
+            );
+            let stdout = text(&out.stdout);
+            assert_eq!(out.status.code(), Some(1), "{last} {servers}\n{stdout}");
+            assert!(stdout.contains("NOT governed by this home"), "{stdout}");
+            assert!(!stdout.contains("already wrapped"), "{stdout}");
+            assert_eq!(fs::read_to_string(&config).unwrap(), doc);
+
+            // ./.mcp.json of a cloned repository, found by the default
+            // paths; ~/.claude.json holds a wrap of this home.
+            let own = user_doc(&server(&exe, &wrap_args(&home, "enforce")));
+            fs::write(&config, &own).unwrap();
+            let project = format!("{{\n  \"mcpServers\": {servers}\n}}\n");
+            fs::write(cwd.join(".mcp.json"), &project).unwrap();
+            let out = run_in(
+                &[
+                    "install",
+                    "--client",
+                    "claude-code",
+                    "--dir",
+                    &home,
+                    "--mode",
+                    "enforce",
+                    last,
+                ],
+                temp.path(),
+                &cwd,
+            );
+            let stdout = text(&out.stdout);
+            assert_eq!(out.status.code(), Some(1), "{last} {servers}\n{stdout}");
+            assert!(stdout.contains("NOT governed by this home"), "{stdout}");
+            assert!(
+                stdout.contains("already wrapped by praetore-mcp"),
+                "{stdout}"
+            );
+            assert_eq!(fs::read_to_string(cwd.join(".mcp.json")).unwrap(), project);
+            assert_eq!(fs::read_to_string(&config).unwrap(), own);
+            fs::remove_file(cwd.join(".mcp.json")).unwrap();
+        }
+    }
+    assert!(backups(temp.path()).is_empty());
+    assert!(backups(&cwd).is_empty());
+
+    // Same binary, home and mode: already wrapped, exit 0.
+    let same = user_doc(&server(&exe, &wrap_args(&home, "enforce")));
+    // A remote entry whose command parses as a wrap stays remote, exit 0.
+    let remote = user_doc(&format!(
+        r#"{{"s":{{"type":"http","url":"https://example.invalid/mcp","command":"/tmp/evil/praetore-mcp","args":{}}}}}"#,
+        wrap_args("/tmp/attacker-home", "observe")
+    ));
+    for (doc, expected) in [
+        (&same, "already wrapped by praetore-mcp"),
+        (&remote, "not wrapped (remote server)"),
+    ] {
+        for last in ["--dry-run", "--yes"] {
+            fs::write(&config, doc).unwrap();
+            let out = run_in(
+                &[
+                    "install",
+                    "--client",
+                    "claude-code",
+                    "--config",
+                    &config_str,
+                    "--dir",
+                    &home,
+                    "--mode",
+                    "enforce",
+                    last,
+                ],
+                temp.path(),
+                &cwd,
+            );
+            let stdout = text(&out.stdout);
+            assert_eq!(out.status.code(), Some(0), "{last}\n{stdout}");
+            assert!(stdout.contains(expected), "{stdout}");
+            assert!(!stdout.contains("NOT governed"), "{stdout}");
+            assert_eq!(&fs::read_to_string(&config).unwrap(), doc);
+        }
+    }
+}

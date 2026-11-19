@@ -190,10 +190,10 @@ praetore-mcp approve <id>          # your terminal; an assistant must not run th
 # praetore-mcp reject <id>         # instead of approve: the call is not forwarded
 ```
 
-`install --mode enforce` on an entry that is already wrapped prints
-`nothing to change` and exits 0. The mode already in the config stays.
+`install --mode enforce` on an entry that is already wrapped reports
+`NOT governed by this home` and exits 1. The mode already in the config stays.
 Switch by uninstalling and installing again, as above, then restart the
-client. You can also edit `--mode` in the client config and restart.
+client. Do not edit `--mode` in the client config.
 `install` does not rewrite `--mode` on a wrapped entry.
 
 In a terminal, `install` and `uninstall` ask
@@ -241,9 +241,9 @@ any other fields stay as they are, and so does the key order.
 `praetore-mcp uninstall [--client ...] [--yes]` restores the original
 entries exactly. Pass `--mode enforce` on the first `install` when you
 want to start in enforce mode. Observe is the default. To change the mode
-later, edit `--mode` in the client config, or uninstall and install again.
-`install` on an already wrapped entry prints `nothing to change` and
-exits 0.
+later, uninstall and install again. Do not edit `--mode` in the client config.
+`install` on an already wrapped entry with a different `--mode` reports
+`NOT governed by this home` and exits 1.
 
 You can also wrap a server by hand:
 
@@ -356,14 +356,18 @@ are open in this version. In each of them, what runs after `install` can
 differ from what `install` reported: a server that is not wrapped, a
 server wrapped for another home or mode, or a server wrapped under a name
 that your policy gives to another one.
+The first case below is reported with exit 1; the others are not.
 
-- **An entry that looks wrapped is skipped.** `install` treats an entry as
-  already wrapped when the file name of `command` is `praetore-mcp` and the
-  first argument is `wrap`. It does not compare `command` with the binary
-  that is running, `--dir` with your home, or `--mode` with the mode you
-  asked for. A config file from someone else (for example the `.mcp.json`
-  of a cloned repository) can carry such an entry, and it is listed as
-  `skipped: already wrapped by praetore-mcp`. This applies to every client.
+- **An entry wrapped for another binary, home or mode.** A config file
+  from someone else (for example the `.mcp.json` of a cloned repository)
+  can carry an entry whose `command` is named `praetore-mcp` and whose
+  first argument is `wrap`. `install` counts it as already wrapped only
+  when `command` is the binary that is running and `--dir` and `--mode`
+  appear once and equal your home and mode. Any other such entry is
+  listed as `NOT governed by this home; run uninstall, then install`, the
+  file is not changed, and `install` exits 1, also with `--dry-run`. This
+  applies to every client, Claude Code included. `install` reports this
+  case; it does not fix it.
 - **Plugin servers.** `install` does not read or list the servers that
   Claude Code plugins declare.
 - **Sources `install` does not read.** For Claude Code these include the
@@ -394,7 +398,8 @@ that your policy gives to another one.
   `install --dry-run` again after you restart it: an entry that is still
   wrapped is listed as `skipped: already wrapped by praetore-mcp`.
 
-None of these is closed by a check in this version. To see what a client
+Apart from the exit 1 of the first case, none of these is closed by a
+check in this version. To see what a client
 runs, use the client's own listing (`claude mcp list` for Claude Code) and
 compare each command with the `praetore-mcp wrap --dir <your home>` line
 you expect.

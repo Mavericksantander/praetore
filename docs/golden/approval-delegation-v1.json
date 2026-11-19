@@ -1,0 +1,18 @@
+{
+  "delegator_signed": {
+    "delegation_hash": "54a026832f78628c28721657b0fa7402f56ccb9728a42471d6ff2662834b9156",
+    "delegation_json": "{\"schema_version\":1,\"delegation_id\":\"7e2a4d3b-9c5f-4a8b-8d1e-2f3a4b5c6d7e\",\"tenant_id\":\"00000000-0000-0000-0000-000000000010\",\"issuer_key_id\":\"golden-delegator\",\"parent_delegation_hash\":\"1deb15ea1904f37815a70f5e2f4ba0fc0c4739f9ba1b5902a44441a8af9d2178\",\"subject_key_id\":\"golden-approver\",\"subject_public_key_hex\":\"22fc297792f0b6ffc0bfcfdb7edb0c0aa14e025a365ec0e342e86e3829cb74b6\",\"role\":\"approver\",\"scope\":{\"action_types\":[\"local:set_value\"]},\"not_before\":\"2026-11-15T00:00:00Z\",\"not_after\":\"2026-12-15T00:00:00Z\",\"max_depth\":0,\"signature\":\"11a3d70c897766b51cb85d03dd502515edd0184a551cb8c373b4ce86036ccc6fb947cc93a42efaf710221ee9b272f91d95a72e75f7f1fcc12208716484eba201\"}",
+    "issuer_public_key_hex": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+    "signature_hex": "11a3d70c897766b51cb85d03dd502515edd0184a551cb8c373b4ce86036ccc6fb947cc93a42efaf710221ee9b272f91d95a72e75f7f1fcc12208716484eba201",
+    "signing_payload": "{\"delegation_id\":\"7e2a4d3b-9c5f-4a8b-8d1e-2f3a4b5c6d7e\",\"issuer_key_id\":\"golden-delegator\",\"max_depth\":0,\"not_after\":\"2026-12-15T00:00:00Z\",\"not_before\":\"2026-11-15T00:00:00Z\",\"parent_delegation_hash\":\"1deb15ea1904f37815a70f5e2f4ba0fc0c4739f9ba1b5902a44441a8af9d2178\",\"role\":\"approver\",\"schema_version\":1,\"scope\":{\"action_types\":[\"local:set_value\"]},\"subject_key_id\":\"golden-approver\",\"subject_public_key_hex\":\"22fc297792f0b6ffc0bfcfdb7edb0c0aa14e025a365ec0e342e86e3829cb74b6\",\"tenant_id\":\"00000000-0000-0000-0000-000000000010\"}"
+  },
+  "domain": "PRAETORE_APPROVAL_DELEGATION_V1\\0",
+  "hash_domain": "PRAETORE_APPROVAL_DELEGATION_HASH_V1\\0",
+  "root_signed": {
+    "delegation_hash": "1deb15ea1904f37815a70f5e2f4ba0fc0c4739f9ba1b5902a44441a8af9d2178",
+    "delegation_json": "{\"schema_version\":1,\"delegation_id\":\"6d1f3c2a-8b4e-4f7a-9c0d-1e2f3a4b5c6d\",\"tenant_id\":\"00000000-0000-0000-0000-000000000010\",\"issuer_key_id\":\"golden-root\",\"subject_key_id\":\"golden-delegator\",\"subject_public_key_hex\":\"2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12\",\"role\":\"delegator\",\"scope\":{\"action_types\":[\"local:set_value\",\"local:delete_value\"]},\"not_before\":\"2026-11-01T00:00:00Z\",\"not_after\":\"2026-12-31T00:00:00Z\",\"max_depth\":1,\"signature\":\"2bec18a334ee1621d18d41dcbb8b82fc82dbb2538a401f6110d327b5c86a9798851d10ea3150088787932dad019c91539845f3a4f659ef4572e093bb00591a03\"}",
+    "issuer_public_key_hex": "db995fe25169d141cab9bbba92baa01f9f2e1ece7df4cb2ac05190f37fcc1f9d",
+    "signature_hex": "2bec18a334ee1621d18d41dcbb8b82fc82dbb2538a401f6110d327b5c86a9798851d10ea3150088787932dad019c91539845f3a4f659ef4572e093bb00591a03",
+    "signing_payload": "{\"delegation_id\":\"6d1f3c2a-8b4e-4f7a-9c0d-1e2f3a4b5c6d\",\"issuer_key_id\":\"golden-root\",\"max_depth\":1,\"not_after\":\"2026-12-31T00:00:00Z\",\"not_before\":\"2026-11-01T00:00:00Z\",\"role\":\"delegator\",\"schema_version\":1,\"scope\":{\"action_types\":[\"local:set_value\",\"local:delete_value\"]},\"subject_key_id\":\"golden-delegator\",\"subject_public_key_hex\":\"2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12\",\"tenant_id\":\"00000000-0000-0000-0000-000000000010\"}"
+  }
+}

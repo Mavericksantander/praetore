@@ -1,4 +1,5 @@
 pub mod action;
+pub mod approval_delegation;
 pub mod authority;
 pub mod authorization;
 pub mod canonical;
@@ -37,8 +38,9 @@ pub use freshness::{FreshnessError, FreshnessLease, FreshnessProvider};
 pub use identity::{AgentId, AgentIdentity, AgentKeyFingerprint, AgentKeyPair, VerifiedPublicKey};
 pub use key_rotation::KeyRotationProof;
 pub use policy::{
-    ActionClass, ActionClassError, ActionClassProposal, ControlLoop, MatchOperator, Policy,
-    PolicyCondition, PolicyDocumentError, PolicyEffect, PolicyLimit, PolicyRule, RecordedPolicy,
+    ActionClass, ActionClassError, ActionClassProposal, ApprovalDelegationPolicy, ControlLoop,
+    MatchOperator, Policy, PolicyCondition, PolicyDocumentError, PolicyEffect, PolicyLimit,
+    PolicyRule, RecordedPolicy,
 };
 pub use replay::{
     AtomicAuthorizationCommit, AuthorizationCommitError, CompletedAuthorization, ReplayGuard,

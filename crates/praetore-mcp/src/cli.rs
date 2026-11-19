@@ -796,6 +796,9 @@ fn cmd_install(args: &[String], uninstall: bool) -> Result<i32, String> {
             client.name(),
             install::render_changes(&path, &changes)
         );
+        if install::refuses_success(&changes) {
+            code = 1;
+        }
         if wrap_target.is_some() && client == Client::ClaudeCode {
             let local = install::local_scope_entries(&doc);
             print!("{}", install::render_local_scope(&local));

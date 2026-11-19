@@ -20,6 +20,9 @@ use crate::shown::Show;
 use std::path::{Path, PathBuf};
 
 pub const WRAP_SUBCOMMAND: &str = "wrap";
+/// Install skip when an entry parses as `wrap` but its command, `--dir` or
+/// `--mode` is not this install's canonical binary and home.
+pub const NOT_GOVERNED: &str = "NOT governed by this home; run uninstall, then install";
 /// Marker recorded in the wrapped args when the original entry had no
 /// `args` member, so `uninstall` restores the entry exactly.
 pub const ORIGINAL_ARGS_ABSENT: &str = "--orig-args-absent";
@@ -160,6 +163,14 @@ impl Change {
     }
 }
 
+/// True when install must exit 1, including `--dry-run`: a parsed wrap is
+/// not this home's canonical binary with the same `--dir` and `--mode`.
+pub fn refuses_success(changes: &[Change]) -> bool {
+    changes
+        .iter()
+        .any(|change| matches!(&change.kind, ChangeKind::Skipped(reason) if reason == NOT_GOVERNED))
+}
+
 /// How `wrap` should be invoked from the rewritten entry.
 #[derive(Debug, Clone)]
 pub struct WrapTarget {
@@ -209,15 +220,48 @@ fn is_praetore_command(command: &str) -> bool {
     stem == "praetore-mcp"
 }
 
-pub fn is_wrapped(entry: &JsonValue) -> bool {
-    entry
-        .get("command")
-        .and_then(JsonValue::as_str)
-        .is_some_and(is_praetore_command)
-        && string_args(entry)
-            .and_then(|args| args.first().cloned())
-            .as_deref()
-            == Some(WRAP_SUBCOMMAND)
+/// A `praetore-mcp wrap -- <command>` entry, before checking which binary
+/// and home it points at.
+fn parsed_wrap(entry: &JsonValue) -> Option<WrappedArgs> {
+    let command = entry.get("command").and_then(JsonValue::as_str)?;
+    if !is_praetore_command(command) {
+        return None;
+    }
+    let args = string_args(entry)?;
+    parse_wrapped_args(&args)
+}
+
+/// The single value of `flag` in `options`, or `None` when it is absent or
+/// repeated.
+fn flag_once<'a>(options: &'a [String], flag: &str) -> Option<&'a str> {
+    let mut value = None;
+    let mut index = 0;
+    while index < options.len() {
+        if options[index] == flag {
+            if value.is_some() {
+                return None;
+            }
+            value = Some(options.get(index + 1)?.as_str());
+            index += 2;
+            continue;
+        }
+        index += 1;
+    }
+    value
+}
+
+/// True only when `entry` is a wrap of this install: the command string is
+/// `target.exe` (the canonical binary) and `--dir` / `--mode` equal `target`.
+pub fn is_wrapped(entry: &JsonValue, target: &WrapTarget) -> bool {
+    let Some(command) = entry.get("command").and_then(JsonValue::as_str) else {
+        return false;
+    };
+    let Some(parsed) = parsed_wrap(entry) else {
+        return false;
+    };
+    command == target.exe
+        && flag_once(&parsed.options, "--dir") == Some(target.dir.as_str())
+        && flag_once(&parsed.options, "--mode") == Some(target.mode.as_str())
 }
 
 /// Claude Code reads an entry with no `type` as stdio. Any other `type`
@@ -256,9 +300,6 @@ fn generic_unsupported_reason(entry: &JsonValue) -> Option<String> {
     if string_args(entry).is_none() {
         return Some("\"args\" is not an array of strings".into());
     }
-    if is_wrapped(entry) {
-        return Some("already wrapped by praetore-mcp".into());
-    }
     None
 }
 
@@ -276,6 +317,22 @@ pub fn wrap_config(doc: &mut JsonValue, client: Client, target: &WrapTarget) -> 
     };
     let mut changes = Vec::new();
     for (name, entry) in servers.iter_mut() {
+        // Claude Code connects to a remote entry (`type` other than stdio,
+        // or `url`) and never runs its `command`, so a remote entry is
+        // reported as remote even if its `command` parses as a wrap.
+        let claude_code_remote = client == Client::ClaudeCode && is_claude_code_remote(entry);
+        if !claude_code_remote && parsed_wrap(entry).is_some() {
+            let kind = if is_wrapped(entry, target) {
+                ChangeKind::Skipped("already wrapped by praetore-mcp".into())
+            } else {
+                ChangeKind::Skipped(NOT_GOVERNED.into())
+            };
+            changes.push(Change {
+                server: name.clone(),
+                kind,
+            });
+            continue;
+        }
         let reason = unsupported_reason(entry, client).or_else(|| {
             (!crate::cli::valid_server_name(name)).then(|| {
                 ChangeKind::Skipped(
@@ -382,14 +439,7 @@ pub fn unwrap_config(doc: &mut JsonValue, client: Client) -> Vec<Change> {
     };
     let mut changes = Vec::new();
     for (name, entry) in servers.iter_mut() {
-        if !is_wrapped(entry) {
-            continue;
-        }
-        let Some(parsed) = string_args(entry).and_then(|args| parse_wrapped_args(&args)) else {
-            changes.push(Change {
-                server: name.clone(),
-                kind: ChangeKind::Skipped("wrapped entry has no `-- command`; left as is".into()),
-            });
+        let Some(parsed) = parsed_wrap(entry) else {
             continue;
         };
         let before = command_line(entry);
@@ -495,7 +545,7 @@ pub fn local_scope_entries(doc: &JsonValue) -> Vec<LocalScopeEntry> {
     let wrapped_user: std::collections::HashSet<&str> = match doc.get("mcpServers") {
         Some(JsonValue::Object(entries)) => entries
             .iter()
-            .filter(|(_, entry)| is_wrapped(entry))
+            .filter(|(_, entry)| parsed_wrap(entry).is_some())
             .map(|(name, _)| name.as_str())
             .collect(),
         _ => Default::default(),
@@ -859,20 +909,102 @@ mod tests {
         let entry =
             JsonValue::parse(r#"{"command":"C:\\bin\\praetore-mcp.exe","args":["wrap","--","x"]}"#)
                 .unwrap();
-        assert!(is_wrapped(&entry));
+        assert!(parsed_wrap(&entry).is_some());
+        assert!(!is_wrapped(&entry, &target()));
         let entry = JsonValue::parse(r#"{"command":"praetore-mcp","args":["receipts"]}"#).unwrap();
-        assert!(!is_wrapped(&entry));
+        assert!(parsed_wrap(&entry).is_none());
+        assert!(!is_wrapped(&entry, &target()));
+    }
+
+    fn git_entry(command: &str, args: &str) -> String {
+        format!(r#"{{"mcpServers":{{"git":{{"command":"{command}","args":{args}}}}}}}"#)
+    }
+
+    fn kind_for(text: &str) -> ChangeKind {
+        let mut doc = JsonValue::parse(text).unwrap();
+        let before = doc.to_compact();
+        let changes = wrap_config(&mut doc, Client::ClaudeDesktop, &target());
+        assert_eq!(
+            doc.to_compact(),
+            before,
+            "a classified wrap is not rewritten"
+        );
+        changes.into_iter().next().unwrap().kind
     }
 
     #[test]
     fn already_wrapped_is_skipped_and_uninstall_unwraps_it() {
-        let text = r#"{"mcpServers":{"git":{"command":"/x/praetore-mcp","args":["wrap","--name","git","--","uvx","mcp-server-git"]}}}"#;
-        let mut doc = JsonValue::parse(text).unwrap();
+        let text = git_entry(
+            "/opt/bin/praetore-mcp",
+            r#"["wrap","--dir","/home/u/.praetore/mcp","--name","git","--mode","observe","--","uvx","mcp-server-git"]"#,
+        );
+        let mut doc = JsonValue::parse(&text).unwrap();
         let changes = wrap_config(&mut doc, Client::ClaudeDesktop, &target());
         assert_eq!(
             changes[0].kind,
             ChangeKind::Skipped("already wrapped by praetore-mcp".into())
         );
+        assert!(!refuses_success(&changes));
+        assert_eq!(doc.to_compact(), text);
+        unwrap_config(&mut doc, Client::ClaudeDesktop);
+        assert_eq!(
+            doc.to_compact(),
+            r#"{"mcpServers":{"git":{"command":"uvx","args":["mcp-server-git"]}}}"#
+        );
+    }
+
+    #[test]
+    fn governance_requires_canonical_exe_and_matching_dir_and_mode() {
+        let args = |dir: &str, mode: &str| {
+            format!(
+                r#"["wrap","--dir","{dir}","--name","git","--mode","{mode}","--","uvx","mcp-server-git"]"#
+            )
+        };
+        let same = git_entry(
+            "/opt/bin/praetore-mcp",
+            &args("/home/u/.praetore/mcp", "observe"),
+        );
+        assert_eq!(
+            kind_for(&same),
+            ChangeKind::Skipped("already wrapped by praetore-mcp".into())
+        );
+        assert!(!refuses_success(&[Change {
+            server: "git".into(),
+            kind: kind_for(&same),
+        }]));
+
+        let other_exe = git_entry(
+            "/other/praetore-mcp",
+            &args("/home/u/.praetore/mcp", "observe"),
+        );
+        let other_dir = git_entry("/opt/bin/praetore-mcp", &args("/other/home", "observe"));
+        let other_mode = git_entry(
+            "/opt/bin/praetore-mcp",
+            &args("/home/u/.praetore/mcp", "enforce"),
+        );
+        let repeated_dir = git_entry(
+            "/opt/bin/praetore-mcp",
+            r#"["wrap","--dir","/home/u/.praetore/mcp","--dir","/home/u/.praetore/mcp","--mode","observe","--","uvx","mcp-server-git"]"#,
+        );
+        for text in [other_exe, other_dir, other_mode, repeated_dir] {
+            let kind = kind_for(&text);
+            assert_eq!(kind, ChangeKind::Skipped(NOT_GOVERNED.into()), "{text}");
+            assert!(refuses_success(&[Change {
+                server: "git".into(),
+                kind,
+            }]));
+        }
+    }
+
+    #[test]
+    fn uninstall_restores_a_parsed_wrap_that_this_home_refuses() {
+        let text = git_entry(
+            "/other/praetore-mcp",
+            r#"["wrap","--dir","/other/home","--mode","enforce","--","uvx","mcp-server-git"]"#,
+        );
+        let mut doc = JsonValue::parse(&text).unwrap();
+        let changes = wrap_config(&mut doc, Client::ClaudeDesktop, &target());
+        assert_eq!(changes[0].kind, ChangeKind::Skipped(NOT_GOVERNED.into()));
         assert_eq!(doc.to_compact(), text);
         unwrap_config(&mut doc, Client::ClaudeDesktop);
         assert_eq!(

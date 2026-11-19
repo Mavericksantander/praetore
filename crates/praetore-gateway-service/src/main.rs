@@ -11,6 +11,7 @@ use praetore_gateway_service::{
     api_auth::select_api_auth,
     approver_bindings::{parse_approver_bindings, single_approver},
     chrony_clock::ChronyClock,
+    delegation_config::{OtherRoleKeys, parse_delegation_config},
     exec_mode::{DEV_COOPERATIVE_EXEC_ENV, DEV_COOPERATIVE_EXEC_WARNING, select_http_options},
     file_freshness::{DemoFreshnessProvider, FileFreshnessLimits, FileFreshnessProvider},
 };
@@ -471,6 +472,7 @@ fn build_gateway(
     require_trusted_clock: bool,
     production_adapter: bool,
     approval_verifiers: Vec<HumanApprovalVerifier>,
+    delegation_document: Option<String>,
 ) -> Result<Gateway, Box<dyn std::error::Error>> {
     let policy_path = required_env("PRAETORE_GATEWAY_POLICY_FILE")?;
     let issuer_pin_path = required_env("PRAETORE_GATEWAY_ISSUER_PIN_FILE")?;
@@ -481,6 +483,31 @@ fn build_gateway(
     let policy_digest = policy.digest()?;
     let issuer_pins = load_issuer_pins(&read_limited(&issuer_pin_path, 1_048_576)?)?;
     let evidence_attester = EvidenceAttesterKey::from_secret_bytes(&keys.evidence);
+    let approval_delegation = match delegation_document {
+        None => None,
+        Some(document) => {
+            let issuer_tenants: Option<HashSet<Uuid>> = tenant_issuer_bindings
+                .as_ref()
+                .map(|bindings| bindings.keys().copied().collect());
+            let issuers: Vec<_> = issuer_pins
+                .iter()
+                .map(|pin| pin.public_key().clone())
+                .collect();
+            let attesters = [
+                evidence_attester.public_key()?,
+                praetore_core::AgentKeyPair::from_secret_bytes(&keys.execution).public_key(),
+            ];
+            Some(parse_delegation_config(
+                &document,
+                issuer_tenants.as_ref(),
+                &OtherRoleKeys {
+                    approvers: &approval_verifiers,
+                    issuers: &issuers,
+                    attesters: &attesters,
+                },
+            )?)
+        }
+    };
 
     let mut config =
         HighAssuranceConfig::new(policy_digest.clone(), issuer_pins, evidence_attester)?
@@ -513,6 +540,9 @@ fn build_gateway(
     let mut gateway = Gateway::new(engine, journal, dispatcher, execution_signer)?;
     for verifier in approval_verifiers {
         gateway = gateway.with_human_approval_verifier(verifier);
+    }
+    if let Some(delegation) = approval_delegation {
+        gateway = gateway.with_approval_delegation(delegation);
     }
     Ok(gateway)
 }
@@ -664,6 +694,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("{DEV_COOPERATIVE_EXEC_WARNING}");
     }
     let approval_verifiers = approval_verifiers(adapter_setup.tenant_issuer_bindings.as_ref())?;
+    // Optional: delegated approval. Read once; a new revocation takes effect
+    // on restart.
+    let delegation_document = env::var("PRAETORE_GATEWAY_DELEGATION_FILE")
+        .ok()
+        .map(|path| read_limited(&path, 1_048_576))
+        .transpose()?;
     let migration_url = env::var("PRAETORE_GATEWAY_MIGRATION_DATABASE_URL").ok();
     let database = prepare_database(
         &database_url,
@@ -679,6 +715,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         adapter_setup.require_trusted_clock,
         adapter_setup.production_adapter,
         approval_verifiers,
+        delegation_document,
     )?);
     let address = match env::var("PRAETORE_GATEWAY_LISTEN_ADDR") {
         Ok(address) => address.parse::<std::net::SocketAddr>()?,
