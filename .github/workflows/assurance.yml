@@ -401,8 +401,11 @@ jobs:
           target/release/praetore-verify evidence --evidence examples/verify/evidence.json \
             --attester-pin examples/verify/attester-public-key.hex \
             --issuer-pins examples/verify/issuer-pins.jsonl --require-intent --format json
-      # Exit codes, not a search of the output: a test whose child process
-      # writes to stdout splits the `test ... ok` line. See the script.
+      # The inventory is `cargo test -- --list`, not a search of the run
+      # output. See the script. The self-test rejects a listing the old
+      # `running 1 test` search would have counted as a run.
+      - name: HighAssurance inventory check rejects a grep-shaped miss
+        run: scripts/test-check-hook-high-assurance.sh
       - name: HighAssurance hook tests (output shown)
         run: scripts/check-hook-high-assurance-tests.sh
       # SAF-14: two agents sign with different issued identities, and no
