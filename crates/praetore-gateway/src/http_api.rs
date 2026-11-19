@@ -427,7 +427,9 @@ struct ErrorResponse {
     /// its signed `not_dispatched` / `dispatch_refused` receipt, or its
     /// signed `failed` receipt with the class `no_effect`. Always on
     /// `action_effect_failed`: the signed `failed` receipt with the class
-    /// `effect_failed`.
+    /// `effect_failed`. On 410 `approved_claim_expired`: the signed
+    /// `not_dispatched` receipt whose `not_dispatched_reason` is that same
+    /// code.
     #[serde(skip_serializing_if = "Option::is_none")]
     receipt: Option<Box<crate::GatewayReceipt>>,
 }
@@ -1037,6 +1039,32 @@ fn gateway_error_response(error: GatewayError) -> Response {
         }
         GatewayError::Approval(crate::ApprovalError::Expired) => {
             error_response(StatusCode::GONE, "approval_expired")
+        }
+        // The code is the signed reason. A window that closed with no
+        // decision stays `approval_expired` above; this close is
+        // `approved_claim_expired`.
+        GatewayError::ApprovedClaimExpired { receipt } => {
+            let code = match receipt.execution_attestation.not_dispatched_reason {
+                Some(crate::NotDispatchedReason::ApprovedClaimExpired) => "approved_claim_expired",
+                _ => {
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "gateway_configuration_error",
+                    );
+                }
+            };
+            (
+                StatusCode::GONE,
+                Json(ErrorResponse {
+                    code,
+                    resolution: None,
+                    expiration_receipt_id: None,
+                    execution: None,
+                    reason: None,
+                    receipt: Some(receipt),
+                }),
+            )
+                .into_response()
         }
         GatewayError::Approval(crate::ApprovalError::NotPending) => {
             error_response(StatusCode::CONFLICT, "approval_not_pending")

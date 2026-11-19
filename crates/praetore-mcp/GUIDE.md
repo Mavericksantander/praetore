@@ -7,8 +7,8 @@ full reference is the [README](README.md).
 
 ## What it does
 
-`praetore-mcp` sits between an MCP client (Claude Desktop, Cursor, VS Code)
-and a stdio MCP server. For every `tools/call` that goes **through a wrapped
+`praetore-mcp` sits between an MCP client (Claude Desktop, Cursor, VS Code,
+Claude Code) and a stdio MCP server. For every `tools/call` that goes **through a wrapped
 MCP server**, it evaluates your policy with the PRÆTORE engine and writes an
 Ed25519-signed receipt. In `enforce` mode, DENY and REQUIRE_APPROVAL calls
 are not forwarded. A DENY is an MCP tool error whose text is
@@ -153,7 +153,19 @@ on macOS; on Linux, `$XDG_CONFIG_HOME/Code/User/mcp.json` when
 when stdin is a terminal. Without a terminal they exit 1 and print
 `not modifying <file> without confirmation; re-run with --yes`, and they
 change nothing. Read the dry-run, then apply observe mode. Substitute
-`claude-desktop` or `vscode` for `cursor` if that is your client.
+`claude-desktop`, `vscode` or `claude-code` for `cursor` if that is your
+client.
+
+For Claude Code, add the server at user scope:
+`claude mcp add --scope user filesystem -- /absolute/path/to/npx -y @modelcontextprotocol/server-filesystem@2.3.0 /absolute/path/to/test-dir`.
+Without `--scope`, `claude mcp add` writes to local scope, which `install`
+does not wrap: it lists those servers as
+`not wrapped (local scope, project <path>)` and ends with a WARNING. Quit
+Claude Code before `install`: it rewrites `~/.claude.json` while it runs,
+and if the file changes while `install` works, nothing is written. The
+README section "Claude Code" says what was checked. The README section
+"Known limits of `install`" lists the cases in which what runs after
+`install` can differ from what `install` reported.
 
 ```sh
 praetore-mcp install --client cursor --mode observe --dry-run
@@ -226,8 +238,9 @@ observe the file is still written, and `praetore-mcp receipts --tail 5`
 shows `DENY` and `first-rule`.
 
 To switch that observe install to enforce, uninstall and install again.
-`install --mode enforce` on an entry that is already wrapped prints
-`nothing to change` and exits 0. The mode already in the config stays.
+`install --mode enforce` on an entry that is already wrapped reports
+`NOT governed by this home` and exits 1. The mode already in the config
+stays. Do not edit `--mode` by hand.
 
 ```sh
 praetore-mcp uninstall --client cursor --yes
@@ -240,9 +253,10 @@ Restart the client. In enforce, `list_directory` and `read_text_file` are
 forwarded, every other tool is refused, and `write_file` is refused and the
 file is not written. The client text is `Denied by PRÆTORE. Evidence id: ...`. The rule
 id is in `praetore-mcp receipts`, in the `DENY` / `first-rule` row, with
-mode `enforce`. You can instead edit `--mode` in the client config and
-restart. `install` does not rewrite `--mode` while the entry is already
-wrapped.
+mode `enforce`. Do not edit `--mode` in the client config.
+`install` does not rewrite `--mode` while the entry is already wrapped:
+it reports `NOT governed by this home` and exits 1. Uninstall, then
+install again.
 
 ```sh
 praetore-mcp receipts --tail 5
@@ -732,7 +746,7 @@ Read these before relying on anything above.
 | `init` or `policy check` prints a warning about `allow-all-mcp-tool-calls` | The home was created by `init` in v0.3.4 or earlier | See "A home from v0.3.4". Add the ALLOW rules you need, then `praetore-mcp policy remove --id allow-all-mcp-tool-calls`. |
 | The server does not start; `wrap` exits with 127 | The client could not find the server command (for example `npx`) with the PATH apps get from the desktop | Put the absolute path in the config, e.g. `/opt/homebrew/bin/npx` (check with `which npx`), then `install` again. In the macOS check, both apps found Homebrew's `npx` without this. |
 | `install` says the config `is not strict JSON` | The file has comments or trailing commas (JSONC) | Remove them, or wrap the server by hand with `praetore-mcp wrap ... -- <command>`. The file is never rewritten in this case. |
-| `install --mode enforce` says `nothing to change` / `already wrapped` and exits 0 | The entry is already wrapped. `install` does not change `--mode` on a wrapped entry. Exit 0 leaves the mode already in the config | `praetore-mcp uninstall --client <client> --yes`, then `praetore-mcp install --client <client> --mode enforce --yes`, then restart the client. Or edit `--mode` in the config and restart. |
+| `install --mode enforce` says `NOT governed by this home` and exits 1 | The entry is wrapped for another mode or home. `install` does not change `--mode` on a wrapped entry | `praetore-mcp uninstall --client <client> --yes`, then `praetore-mcp install --client <client> --mode enforce --yes`, then restart the client. Do not edit `--mode` in the config. |
 | `install` or `uninstall` prints `not modifying ... without confirmation; re-run with --yes` and exits 1 | stdin is not a terminal, and `--yes` was not passed. The file was not changed | Read the dry-run, then re-run with `--yes`. A later `verify` that prints `UNANCHORED 0 receipts` means the journal is empty. |
 | The same Cursor file is listed twice when running `install` from `~` | A build up to `9735974`: `~/.cursor/mcp.json` and `./.cursor/mcp.json` are the same file | Harmless (the second pass is skipped). Current builds list it once ([#52](https://github.com/Mavericksantander/praetore/pull/52)). |
 | `praetore-mcp wrap --help` fails with `unexpected argument "--help"` | A build up to `9735974`, before per-command help ([#49](https://github.com/Mavericksantander/praetore/pull/49)) | Reinstall (see the README's Install section), or use `praetore-mcp --help`, which lists every option. |

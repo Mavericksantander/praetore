@@ -608,6 +608,13 @@ pub enum GatewayError {
         reason: &'static str,
         receipt: Box<GatewayReceipt>,
     },
+    /// A human approved, and the dispatch was claimed after the window
+    /// closed. `receipt` is the signed `not_dispatched` close whose
+    /// `not_dispatched_reason` is `approved_claim_expired`. Distinct from
+    /// [`ApprovalError::Expired`], which is a window that closed with no
+    /// decision (`approval_expired`).
+    #[error("approved dispatch was claimed after the approval window closed")]
+    ApprovedClaimExpired { receipt: Box<GatewayReceipt> },
 }
 
 /// Result of a signed human decision. An approval only records intent: the
@@ -1220,11 +1227,14 @@ impl Gateway {
 
     /// Re-verifies the recorded approval, revalidates the evidence with the
     /// engine clock and claims the single dispatch in the journal. On an
-    /// expired window or a terminal revalidation failure the execution is
-    /// closed as `NotDispatched` with a signed reason, and the error is
-    /// returned. Transient failures (trusted clock, freshness source or
-    /// replay storage unavailable) leave it `ApprovedPendingDispatch` so the
-    /// claim can be attempted again. Never retries by itself.
+    /// expired window the execution is closed as `NotDispatched` with the
+    /// signed reason `approved_claim_expired` and
+    /// [`GatewayError::ApprovedClaimExpired`] carries that receipt. A
+    /// terminal revalidation failure that is not expiry closes it with
+    /// `dispatch_failed`. Transient failures (trusted clock, freshness
+    /// source or replay storage unavailable) leave it
+    /// `ApprovedPendingDispatch` so the claim can be attempted again. Never
+    /// retries by itself.
     pub fn claim_dispatch(
         &self,
         pending: ApprovedPendingDispatch,
@@ -1246,10 +1256,17 @@ impl Gateway {
                 }
                 _ => NotDispatchedReason::DispatchFailed,
             };
-            self.close_not_dispatched(record, reason)?;
             return Err(match reason {
-                NotDispatchedReason::ApprovedClaimExpired => ApprovalError::Expired.into(),
-                _ => GatewayError::Authorization(error),
+                NotDispatchedReason::ApprovedClaimExpired => {
+                    let receipt = self.close_not_dispatched(record, reason)?;
+                    GatewayError::ApprovedClaimExpired {
+                        receipt: Box::new(receipt),
+                    }
+                }
+                _ => {
+                    self.close_not_dispatched(record, reason)?;
+                    GatewayError::Authorization(error)
+                }
             });
         }
         // The adapter re-checks admission after the approval was re-verified
@@ -1290,8 +1307,11 @@ impl Gateway {
                 action_digest: record.action_digest,
             }),
             Err(JournalError::ApprovalExpired) => {
-                self.close_not_dispatched(record, NotDispatchedReason::ApprovedClaimExpired)?;
-                Err(ApprovalError::Expired.into())
+                let receipt =
+                    self.close_not_dispatched(record, NotDispatchedReason::ApprovedClaimExpired)?;
+                Err(GatewayError::ApprovedClaimExpired {
+                    receipt: Box::new(receipt),
+                })
             }
             Err(error) => Err(error.into()),
         }
