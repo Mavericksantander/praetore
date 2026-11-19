@@ -332,9 +332,9 @@ Steps
     ~/.local/bin/praetore-mcp if I ask to remove the program.
     ~/.praetore/mcp holds my keys and receipts; delete it only if I ask.
 15. Ask me whether I want to switch from observe to enforce. Do not switch
-    unless I say yes. `install --mode enforce` on an entry that is already
-    wrapped prints `nothing to change` and exits 0. That leaves the mode
-    already in the config. It does not switch to enforce.
+    unless I say yes. `install --mode enforce` on an entry wrapped in
+    observe reports `NOT governed by this home` and exits 1. It does not
+    switch the mode. Uninstall, then install. Do not edit `--mode` by hand.
     Show the dry-run, and only after I say yes run, in this order:
       praetore-mcp uninstall --client <client> --yes
       praetore-mcp install --client <client> --mode enforce --dry-run
@@ -419,10 +419,10 @@ plain language:
   `create_directory`, `move_file` and `copy_file` still write. In observe
   the denied call still runs. Restart the client after the policy change,
   then read `praetore-mcp receipts`. The rule id is in the receipt.
-- **Switching to enforce.** `install --mode enforce` on an entry that is
-  already wrapped prints `nothing to change` and exits 0. The mode already
-  in the config stays. The switch is `uninstall --yes`, then
-  `install --mode enforce --yes`, then a client restart.
+- **Switching to enforce.** `install --mode enforce` on an entry wrapped
+  in observe reports `NOT governed by this home` and exits 1. The switch
+  is `uninstall --yes`, then `install --mode enforce --yes`, then a client
+  restart. Do not edit `--mode` in the client config.
 - **Optional local approval, after enforce.** Only if you ask, and only on
   the test server named `filesystem` in `~/praetore-test`. The rule is
   `praetore-mcp policy require-approval --id approve-mkdir --server filesystem --tool create_directory`.
