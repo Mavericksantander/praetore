@@ -1180,4 +1180,40 @@ mod tests {
         let text = render_coverage(&policy, "my fs", &report, "praetore-mcp", "");
         assert!(!text.contains("no rule names"), "{text}");
     }
+
+    /// The same policy and the same `write` call: a `tool` Prefix selector.
+    /// The engine's decision is the one `coverage` must report.
+    #[test]
+    fn coverage_matches_engine_on_tool_prefix() {
+        use praetore_core::{Action, AgentId, AgentIdentity, Authority, DecisionOutcome};
+
+        let mut policy = default_policy();
+        policy.rules.push(
+            PolicyRule::new("allow-wr", ACTION_TYPE, PolicyEffect::Allow)
+                .with_capability(CAPABILITY)
+                .with_target("fs")
+                .with_parameter_condition(PolicyCondition::prefix("tool", "wr")),
+        );
+        let id = AgentId::new();
+        let agent = AgentIdentity::new(id.clone(), b"test-public-key".to_vec(), "ed25519").unwrap();
+        let authority = Authority::new(id, "praetore-root", vec![CAPABILITY.to_owned()]);
+        let action = Action::new(
+            ACTION_TYPE,
+            Some("fs".into()),
+            json!({"server": "fs", "tool": "write", "arguments": {}}),
+        )
+        .unwrap();
+        let mission = policy.classify(action).unwrap().into_mission().unwrap();
+        let decision = policy.evaluate(&agent, &authority, &mission).unwrap();
+        assert_eq!(decision.outcome, DecisionOutcome::Allow);
+
+        let report = coverage(&policy, "fs", &["write".to_owned()]);
+        assert_eq!(
+            report[0].outcome,
+            Some(Outcome::Allow),
+            "coverage {:?} engine ALLOW; conditional {:?}",
+            report[0].outcome,
+            report[0].conditional
+        );
+    }
 }
