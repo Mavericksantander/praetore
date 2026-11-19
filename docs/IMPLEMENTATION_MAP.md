@@ -13,13 +13,17 @@ Observación del 2026-11-19. Base leída en esta pasada, después de
 `git merge-base --is-ancestor` de ese SHA contra `origin/main` salió 0.
 El mismo SHA es el merge que devolvió `gh pr view 158`.
 
-Este archivo no estaba en el árbol de `230f4d55`. La observación anterior
-está en el PR abierto
-[#194](https://github.com/Mavericksantander/praetore/pull/194), commit
-`df48819e1f2c088c1b819656ff0c4da06a0f51ce`, sobre `main` `27ceddbb`
-(v0.3.6). Ese texto dice que no asigna niveles. La columna «antes» de
-abajo es **sin nivel**: no había un número que copiar, y esta pasada no
-inventa uno retrospectivo.
+Este archivo no está en `230f4d55`. En esta pasada
+`git cat-file -e 230f4d55ad5cc2789a6beb7db53fbc7f31cd1ec1:docs/IMPLEMENTATION_MAP.md`
+salió 128:
+
+`fatal: path 'docs/IMPLEMENTATION_MAP.md' exists on disk, but not in '230f4d55ad5cc2789a6beb7db53fbc7f31cd1ec1'`.
+
+`git log --oneline 230f4d55ad5cc2789a6beb7db53fbc7f31cd1ec1 -- docs/IMPLEMENTATION_MAP.md`
+no imprimió commits (exit 0). `git grep -l IMPLEMENTATION_MAP 230f4d55ad5cc2789a6beb7db53fbc7f31cd1ec1`
+salió 1. La columna «antes» es **sin nivel** porque ese commit no tiene
+un número escrito para estas filas. Los de «ahora» salen de los comandos
+y de los runs citados abajo.
 
 ## Escala
 
