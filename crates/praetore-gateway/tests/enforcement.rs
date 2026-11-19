@@ -1700,11 +1700,11 @@ fn approved_action_is_not_dispatched_if_freshness_expires_during_approval_commit
         gateway.resolve_human_approval(decision.clone()),
         Ok(HumanApprovalResult::ApprovedPendingDispatch { .. })
     ));
-    // The window closes before the claim: never dispatched, closed with a
-    // signed approval_expired reason instead of a failed execution.
+    // The window closes before the claim: never dispatched. The signed
+    // reason is approved_claim_expired, not approval_expired (no decision).
     assert!(matches!(
         gateway.dispatch_approved(key),
-        Err(GatewayError::Approval(ApprovalError::Expired))
+        Err(GatewayError::ApprovedClaimExpired { .. })
     ));
     assert_eq!(tool.value("mode"), None);
     assert_eq!(tool.invocations(), 0);
@@ -3747,7 +3747,7 @@ mod apd {
         *clock.lock().unwrap() += Duration::seconds(21);
         assert!(matches!(
             gateway.dispatch_approved(key),
-            Err(GatewayError::Approval(ApprovalError::Expired))
+            Err(GatewayError::ApprovedClaimExpired { .. })
         ));
         let record = journal.get(key).unwrap().unwrap();
         assert_eq!(record.execution, ExecutionStatus::NotDispatched);
@@ -3769,7 +3769,7 @@ mod apd {
         journal.claim_expired_once.store(true, Ordering::SeqCst);
         assert!(matches!(
             gateway.dispatch_approved(key),
-            Err(GatewayError::Approval(ApprovalError::Expired))
+            Err(GatewayError::ApprovedClaimExpired { .. })
         ));
         assert!(!journal.claim_expired_once.load(Ordering::SeqCst));
         let record = journal.get(key).unwrap().unwrap();
@@ -3787,6 +3787,33 @@ mod apd {
             Some(NotDispatchedReason::ApprovedClaimExpired)
         );
         assert!(receipt.is_final());
+        assert_eq!(tool.invocations(), 0);
+    }
+
+    /// T-016-B8: `POST .../dispatch` after the window closed answers 410,
+    /// and that body's `code` is the signed `not_dispatched_reason` on the
+    /// receipt in the same body. A window that closed with no decision
+    /// stays `approval_expired`; this path signed `approved_claim_expired`.
+    #[tokio::test]
+    async fn http_410_code_is_the_signed_approved_claim_expired_reason() {
+        let (gateway, key, tool, _, approver_key, clock) = clocked_fixture();
+        approve(&gateway, key, &approver_key);
+        *clock.lock().unwrap() += Duration::seconds(21);
+        let app = http_api::router(
+            Arc::new(gateway),
+            http_api::ApiAuth::UnauthenticatedLoopbackDemo,
+        );
+        let path = format!(
+            "/v1/approvals/{}/{}/{}/dispatch",
+            key.tenant_id, key.agent_id, key.request_id
+        );
+        let (status, body) = json_response(&app, "POST", &path, String::new()).await;
+        assert_eq!(status, StatusCode::GONE, "{body}");
+        assert_eq!(body["code"], "approved_claim_expired", "{body}");
+        assert_eq!(
+            body["receipt"]["execution_attestation"]["not_dispatched_reason"], body["code"],
+            "{body}"
+        );
         assert_eq!(tool.invocations(), 0);
     }
 

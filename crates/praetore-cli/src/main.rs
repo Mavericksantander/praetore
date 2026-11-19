@@ -5384,7 +5384,7 @@ mod tests {
     #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
     fn postgres_t013b_t7b_approved_then_expired_before_dispatch_is_approved_claim_expired() {
         use praetore_gateway::{
-            ApprovalError, ApprovalResolution, ExecutionStatus, GatewayError, NotDispatchedReason,
+            ApprovalResolution, ExecutionStatus, GatewayError, NotDispatchedReason,
         };
         let fx = SandboxFixture::new();
         let gateway = fx.gateway();
@@ -5401,7 +5401,7 @@ mod tests {
         std::thread::sleep(StdDuration::from_secs(31));
         assert!(matches!(
             gateway.dispatch_approved(key),
-            Err(GatewayError::Approval(ApprovalError::Expired))
+            Err(GatewayError::ApprovedClaimExpired { .. })
         ));
         assert_eq!(
             fx.journal(key.request_id),

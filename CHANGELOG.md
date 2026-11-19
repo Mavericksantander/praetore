@@ -101,6 +101,14 @@
 
 ### Fixed
 
+- **A late dispatch's HTTP 410 names the signed close.** `POST
+  /v1/approvals/{tenant}/{agent}/{request}/dispatch` after the approval
+  window closed now answers 410 `approved_claim_expired` and includes the
+  signed `not_dispatched` receipt. The `code` is that receipt's
+  `not_dispatched_reason`. A window that closed with no decision is still
+  410 `approval_expired`. **Visible change: clients that treated a dispatch
+  410's `code` as `approval_expired` must read `approved_claim_expired`.**
+
 - **A repeated journal INSERT no longer takes a position (migration 0025).**
   Before 0025, `INSERT ... ON CONFLICT DO NOTHING` or `DO UPDATE` on a
   primary key already in `praetore.execution_journal` discarded the row
