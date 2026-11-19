@@ -2703,9 +2703,7 @@ fn postgres_apd_expiry_before_claim_closes_as_approved_claim_expired() {
 
     assert!(matches!(
         fixture.gateway.dispatch_approved(key),
-        Err(GatewayError::Approval(
-            praetore_gateway::ApprovalError::Expired
-        ))
+        Err(GatewayError::ApprovedClaimExpired { .. })
     ));
     assert_eq!(fixture.adapter.invocation_count(), 0);
     assert_eq!(database_invocation_count(key), 0);
@@ -9535,9 +9533,11 @@ mod g1_safety {
 
     /// M97-1: renewing ends the lock's transaction and takes the lock in a
     /// new one, so its transaction id changes and the old one is gone; the
-    /// idle lock session holds no snapshot older than its own xid. A
-    /// session waiting for the row when the lock is renewed gets it, and
-    /// the renewal then fails with LockBusy.
+    /// idle lock session holds no snapshot older than its own xid. If
+    /// another session holds the row in the gap, the renewal fails with
+    /// LockBusy and does not move `renewed_at`. `COMMIT` only wakes a
+    /// waiter: the row stays free until that session locks it again, so
+    /// the renewal waits for that lock before trying `NOWAIT`.
     #[test]
     #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
     fn postgres_safety_tenant_lock_renewal_releases_its_xid_and_can_lose_the_lock() {
@@ -9597,9 +9597,10 @@ mod g1_safety {
             SafetyStoreError::LockBusy { .. }
         ));
 
-        // The schema owner queues for the row (as any holder that waits
-        // would); the renewal's COMMIT hands it the row and the renewal
-        // finds it taken.
+        // The schema owner blocks on the row. COMMIT wakes it but leaves
+        // the row unlocked until that session runs again, so an immediate
+        // NOWAIT can take the row back. The renewal waits until the owner
+        // has locked the row, then loses it.
         let admin_url = scratch.url();
         let (taken_tx, taken_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
@@ -9616,35 +9617,19 @@ mod g1_safety {
             release_rx.recv().unwrap();
             transaction.commit().unwrap();
         });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let waiting: bool = admin
-                .query_one(
-                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
-                     WHERE wait_event_type = 'Lock' AND datname = current_database())",
-                    &[],
-                )
-                .unwrap()
-                .get(0);
-            if waiting {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the owner never waited"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
         let renewed_before = lock.renewed_at();
-        let error = lock.renew().unwrap_err();
+        let error = lock
+            .renew_after(|| {
+                taken_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("the owner never locked the row");
+            })
+            .unwrap_err();
         assert!(
             matches!(&error, SafetyStoreError::LockBusy { tenant, .. } if *tenant == TENANT_A),
             "{error}"
         );
         assert_eq!(lock.renewed_at(), renewed_before);
-        taken_rx
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .unwrap();
         // The losing session holds nothing: no open transaction.
         let (xid, _, state) = lock_session(&mut admin);
         assert_eq!((xid, state.as_str()), (None, "idle"));

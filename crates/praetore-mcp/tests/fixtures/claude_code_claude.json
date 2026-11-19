@@ -1,0 +1,78 @@
+{
+  "numStartups": 412,
+  "installMethod": "native",
+  "autoUpdates": true,
+  "firstStartTime": "2026-03-02T14:11:09.512Z",
+  "userID": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+  "tipsHistory": {
+    "new-user-warmup": 7,
+    "shift-enter": 3
+  },
+  "cachedGrowthBookFeatures": {
+    "tengu_sampling_rate": 0.0000123,
+    "tengu_big": 1e+21
+  },
+  "projects": {
+    "/Users/me/work/api": {
+      "allowedTools": [],
+      "mcpContextUris": [],
+      "mcpServers": {
+        "local-db": {
+          "type": "stdio",
+          "command": "npx",
+          "args": [
+            "-y",
+            "@bytebase/dbhub",
+            "--dsn",
+            "${DATABASE_URL}"
+          ],
+          "env": {}
+        }
+      },
+      "enabledMcpjsonServers": [],
+      "disabledMcpjsonServers": [],
+      "hasTrustDialogAccepted": true,
+      "lastCost": 0.0000123,
+      "lastTotalInputTokens": 18233
+    },
+    "/Users/me/notes": {
+      "allowedTools": [],
+      "mcpServers": {},
+      "hasTrustDialogAccepted": false
+    }
+  },
+  "mcpServers": {
+    "filesystem": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "${HOME}/projects"
+      ],
+      "env": {
+        "LOG_LEVEL": "${LOG_LEVEL:-info}"
+      }
+    },
+    "no-type": {
+      "command": "/usr/local/bin/my-server"
+    },
+    "sentry": {
+      "type": "http",
+      "url": "https://mcp.sentry.dev/mcp"
+    },
+    "legacy": {
+      "type": "sse",
+      "url": "https://mcp.example.com/sse",
+      "headers": {
+        "X-API-Key": "${EXAMPLE_KEY}"
+      }
+    },
+    "events": {
+      "type": "ws",
+      "url": "wss://mcp.example.com/socket"
+    }
+  },
+  "hasCompletedOnboarding": true,
+  "lastReleaseNotesSeen": "2.1.325"
+}
