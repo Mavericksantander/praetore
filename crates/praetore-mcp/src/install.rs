@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 pub const WRAP_SUBCOMMAND: &str = "wrap";
 /// Install skip when an entry parses as `wrap` but its command, `--dir` or
 /// `--mode` is not this install's canonical binary and home.
-pub const NOT_GOVERNED: &str = "NOT governed by this home";
+pub const NOT_GOVERNED: &str = "NOT governed by this home; run uninstall, then install";
 /// Marker recorded in the wrapped args when the original entry had no
 /// `args` member, so `uninstall` restores the entry exactly.
 pub const ORIGINAL_ARGS_ABSENT: &str = "--orig-args-absent";
