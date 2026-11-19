@@ -24,7 +24,9 @@ use crate::{
     NotDispatchedReason, action_digest,
 };
 use praetore_core::{
-    DecisionOutcome, Evidence, VerifiedPublicKey, journal_chain::MAX_CHAIN_ENTRIES,
+    DecisionOutcome, Evidence, VerifiedPublicKey,
+    approval_delegation::{DelegationConfig, DelegationError, RevocationRule},
+    journal_chain::MAX_CHAIN_ENTRIES,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -203,6 +205,39 @@ pub struct OutcomeKeys<'a> {
     /// only the approvers of the journal's tenant: unlike the gateway, which
     /// scopes each approver to a tenant, a pin here is not tied to one.
     pub approvers: &'a [KeyPin],
+    /// What schema version 2 (delegated) decisions are checked against.
+    /// `None`: every such decision fails with
+    /// [`OutcomeError::DelegationUnverified`].
+    pub delegation: Option<OutcomeDelegation<'a>>,
+}
+
+/// The trust for delegated decisions: pinned roots, the delegation document
+/// the gateway reads, and the policy the decisions were made under.
+#[derive(Debug, Clone, Copy)]
+pub struct OutcomeDelegation<'a> {
+    /// Pinned delegation roots. A tenant's root in the document must be one
+    /// of them, same key id and same key; the document alone is not trusted.
+    pub roots: &'a [KeyPin],
+    pub delegations: &'a DelegationConfig,
+    /// The digest of the policy given to the verifier. Every delegated
+    /// decision's challenge must carry it.
+    pub policy_digest: &'a str,
+    /// That policy's `approval_delegation.root_may_approve`.
+    pub root_may_approve: bool,
+}
+
+/// One delegated decision that verified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegatedDecision {
+    pub agent_id: Uuid,
+    pub request_id: Uuid,
+    pub approval_id: Uuid,
+    pub approver_key_id: String,
+    pub outcome: HumanApprovalOutcome,
+    /// Delegation hashes from the root to the approver; empty when the root
+    /// approved.
+    pub delegation_chain: Vec<String>,
+    pub root_approved: bool,
 }
 
 /// How many records of each kind the file has.
@@ -279,6 +314,8 @@ pub struct OutcomeReport {
     pub unused_execution_pins: Vec<usize>,
     /// Positions of the approver pins that verified no record.
     pub unused_approver_pins: Vec<usize>,
+    /// Every delegated (schema version 2) decision, in file order.
+    pub delegated: Vec<DelegatedDecision>,
 }
 
 /// Why the outcomes file was not accepted. `line` counts from zero.
@@ -322,6 +359,33 @@ pub enum OutcomeError {
     Inconsistent {
         line: usize,
     },
+    /// A delegated decision, and no delegation roots, document or policy to
+    /// check it against.
+    DelegationUnverified {
+        line: usize,
+    },
+    /// The tenant's delegation root in the document is not pinned.
+    DelegationRootUnpinned {
+        line: usize,
+    },
+    /// The decision's challenge names another policy than the one given.
+    DelegationPolicyMismatch {
+        line: usize,
+    },
+    /// The root approved itself and the policy does not allow it.
+    RootMayNotApprove {
+        line: usize,
+    },
+    /// A delegation of the chain was revoked effective at or before the
+    /// challenge's `expires_at`.
+    DelegationRevoked {
+        line: usize,
+    },
+    /// The delegation chain does not verify.
+    Delegation {
+        line: usize,
+        error: DelegationError,
+    },
 }
 
 impl OutcomeError {
@@ -339,6 +403,12 @@ impl OutcomeError {
             Self::SelfApproval { .. } => "OUTCOME_SELF_APPROVAL",
             Self::Duplicate { .. } => "OUTCOME_DUPLICATE",
             Self::Inconsistent { .. } => "OUTCOME_INCONSISTENT",
+            Self::DelegationUnverified { .. } => "DELEGATION_UNVERIFIED",
+            Self::DelegationRootUnpinned { .. } => "DELEGATION_ROOT_UNPINNED",
+            Self::DelegationPolicyMismatch { .. } => "DELEGATION_POLICY_MISMATCH",
+            Self::RootMayNotApprove { .. } => "DELEGATION_ROOT_MAY_NOT_APPROVE",
+            Self::DelegationRevoked { .. } => "DELEGATION_REVOKED",
+            Self::Delegation { error, .. } => error.code(),
         }
     }
 }
@@ -357,6 +427,20 @@ impl std::fmt::Display for OutcomeError {
             Self::SelfApproval { .. } => "the approver is the requesting agent",
             Self::Duplicate { .. } => "duplicate record",
             Self::Inconsistent { .. } => "records of one request contradict each other",
+            Self::DelegationUnverified { .. } => {
+                "delegated decision, and no delegation root pin, delegation file or policy to check it"
+            }
+            Self::DelegationRootUnpinned { .. } => "the tenant's delegation root is not pinned",
+            Self::DelegationPolicyMismatch { .. } => {
+                "the decision was made under another policy than the one given"
+            }
+            Self::RootMayNotApprove { .. } => {
+                "the delegation root approved and the policy does not allow it"
+            }
+            Self::DelegationRevoked { .. } => {
+                "a delegation of the chain was revoked by the end of the approval window"
+            }
+            Self::Delegation { error, .. } => return write_delegation(f, self, error),
         };
         let (Self::Malformed { line }
         | Self::UnknownRequest { line }
@@ -365,12 +449,28 @@ impl std::fmt::Display for OutcomeError {
         | Self::InvalidSignature { line }
         | Self::SelfApproval { line }
         | Self::Duplicate { line }
-        | Self::Inconsistent { line }) = self
+        | Self::Inconsistent { line }
+        | Self::DelegationUnverified { line }
+        | Self::DelegationRootUnpinned { line }
+        | Self::DelegationPolicyMismatch { line }
+        | Self::RootMayNotApprove { line }
+        | Self::DelegationRevoked { line }) = self
         else {
             unreachable!()
         };
         write!(f, "line {line}: {what}")
     }
+}
+
+fn write_delegation(
+    f: &mut std::fmt::Formatter<'_>,
+    error: &OutcomeError,
+    cause: &DelegationError,
+) -> std::fmt::Result {
+    let OutcomeError::Delegation { line, .. } = error else {
+        unreachable!()
+    };
+    write!(f, "line {line}: {cause}")
 }
 
 impl std::error::Error for OutcomeError {}
@@ -394,7 +494,10 @@ pub fn verify_outcomes(
     if text.len() > MAX_OUTCOMES_BYTES {
         return Err(OutcomeError::TooLarge);
     }
-    for pins in [keys.execution, keys.approvers] {
+    let delegation_roots = keys
+        .delegation
+        .map_or(&[][..], |delegation| delegation.roots);
+    for pins in [keys.execution, keys.approvers, delegation_roots] {
         if pins.len() > MAX_OUTCOME_PINS {
             return Err(OutcomeError::InvalidPin);
         }
@@ -417,6 +520,7 @@ pub fn verify_outcomes(
     let mut approver_used = vec![false; keys.approvers.len()];
     let mut records: HashMap<(Uuid, Uuid), RequestRecords> = HashMap::new();
     let mut counts = OutcomeCounts::default();
+    let mut delegated = Vec::new();
     let mut rest = text;
     let mut line = 0;
     while !rest.is_empty() {
@@ -448,16 +552,29 @@ pub fn verify_outcomes(
                 {
                     return Err(OutcomeError::EvidenceMismatch { line });
                 }
-                let index = find_pin(keys.approvers, &decision.approver_key_id)
-                    .ok_or(OutcomeError::UnknownKey { line })?;
-                let pin = &keys.approvers[index].public_key;
-                decision
-                    .verify_signature(&decision.approver_key_id, pin)
-                    .map_err(|_| OutcomeError::InvalidSignature { line })?;
-                if decision.is_self_approval(pin, evidence) {
-                    return Err(OutcomeError::SelfApproval { line });
+                if decision.is_delegated() {
+                    let verified = verify_delegated_outcome(decision, evidence, keys, line)?;
+                    delegated.push(DelegatedDecision {
+                        agent_id: decision.challenge.agent_id,
+                        request_id: decision.challenge.request_id,
+                        approval_id: decision.approval_id,
+                        approver_key_id: decision.approver_key_id.clone(),
+                        outcome: decision.outcome,
+                        delegation_chain: verified.hashes,
+                        root_approved: verified.root_approved,
+                    });
+                } else {
+                    let index = find_pin(keys.approvers, &decision.approver_key_id)
+                        .ok_or(OutcomeError::UnknownKey { line })?;
+                    let pin = &keys.approvers[index].public_key;
+                    decision
+                        .verify_signature(&decision.approver_key_id, pin)
+                        .map_err(|_| OutcomeError::InvalidSignature { line })?;
+                    if decision.is_self_approval(pin, evidence) {
+                        return Err(OutcomeError::SelfApproval { line });
+                    }
+                    approver_used[index] = true;
                 }
-                approver_used[index] = true;
                 if entry.resolution.is_some() {
                     return Err(OutcomeError::Duplicate { line });
                 }
@@ -555,7 +672,59 @@ pub fn verify_outcomes(
         held,
         unused_execution_pins: unused(&execution_used),
         unused_approver_pins: unused(&approver_used),
+        delegated,
     })
+}
+
+/// A delegated decision, checked with the gateway's function against the
+/// pinned roots, the delegation document and the policy given. Without a
+/// signed time of the decision, a revocation counts when it is effective at
+/// or before the challenge's `expires_at`.
+fn verify_delegated_outcome(
+    decision: &HumanApprovalDecision,
+    evidence: &Evidence,
+    keys: &OutcomeKeys<'_>,
+    line: usize,
+) -> Result<praetore_core::approval_delegation::VerifiedChain, OutcomeError> {
+    let delegation = keys
+        .delegation
+        .ok_or(OutcomeError::DelegationUnverified { line })?;
+    if decision.challenge.policy_digest != delegation.policy_digest {
+        return Err(OutcomeError::DelegationPolicyMismatch { line });
+    }
+    let root = delegation
+        .delegations
+        .root(decision.challenge.tenant_id)
+        .ok_or(OutcomeError::DelegationRootUnpinned { line })?;
+    if !delegation
+        .roots
+        .iter()
+        .any(|pin| pin.key_id == root.key_id && pin.public_key == root.public_key)
+    {
+        return Err(OutcomeError::DelegationRootUnpinned { line });
+    }
+    let deadline = time::OffsetDateTime::parse(
+        &decision.challenge.expires_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .map_err(|_| OutcomeError::EvidenceMismatch { line })?;
+    decision
+        .verify_delegated(
+            evidence,
+            delegation.delegations,
+            delegation.root_may_approve,
+            RevocationRule::EffectiveBy(deadline),
+        )
+        .map_err(|error| match error {
+            crate::ApprovalError::RootMayNotApprove => OutcomeError::RootMayNotApprove { line },
+            crate::ApprovalError::SelfApproval => OutcomeError::SelfApproval { line },
+            crate::ApprovalError::Delegation(DelegationError::Revoked) => {
+                OutcomeError::DelegationRevoked { line }
+            }
+            crate::ApprovalError::Delegation(error) => OutcomeError::Delegation { line, error },
+            crate::ApprovalError::InvalidChallenge => OutcomeError::EvidenceMismatch { line },
+            _ => OutcomeError::InvalidSignature { line },
+        })
 }
 
 fn find_pin(pins: &[KeyPin], key_id: &str) -> Option<usize> {

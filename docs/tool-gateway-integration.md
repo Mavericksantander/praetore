@@ -756,6 +756,13 @@ error. The matching private keys must remain in the external approver system.
 The listener has no TLS; these endpoints must not be exposed to an untrusted
 network.
 
+A gateway may also accept decisions from delegated approvers: with the
+optional `PRAETORE_GATEWAY_DELEGATION_FILE`, a tenant's delegation root
+authorizes approver keys through signed delegations, and those approvers
+sign schema version 2 decisions that carry the `delegation_chain`. See
+[delegated authority to approve](proposals/approval-delegation.md) and
+[operations](operations.md#delegated-approvers).
+
 There is a deliberate crash-safety tradeoff: after approval is durably
 consumed and the journal reaches `Dispatched`, a process crash before or during
 the adapter call does not trigger automatic redispatch. Reconcile using the
@@ -769,6 +776,10 @@ validity window. The core does not implement parent-child delegation,
 attenuation proofs, or chain validation. Do not treat an agent's signature or
 an authority presentation as permission to mint a narrower-looking child
 authority. Delegation requires a separately designed and reviewed feature.
+
+This section is about agent authority. Delegating the authority to approve
+human decisions is a separate feature, limited to signing decisions:
+[delegated authority to approve](proposals/approval-delegation.md).
 
 ## Deployment acceptance checks
 

@@ -350,6 +350,40 @@ contain the capability required by the action and policy rule. The caller
 must set `Action::with_capability("data:read")` for the read action; an
 action without a capability is denied.
 
+## Delegated approval
+
+Human decisions have two schema versions. Version 1 is signed by an
+approver key pinned for the tenant and is unchanged byte for byte (golden
+vector [`human-approval-decision-v1.json`](golden/human-approval-decision-v1.json)).
+Version 2 adds `delegation_chain` inside the signed payload: the hashes of
+the delegations from the tenant's delegation root to the signer, empty when
+the root signs in its own name. A version 1 decision with the field, or a
+version 2 decision without it, does not verify.
+
+| Record | Ed25519 domain |
+|---|---|
+| Delegation | `PRAETORE_APPROVAL_DELEGATION_V1\0` |
+| Delegation hash (SHA-256) | `PRAETORE_APPROVAL_DELEGATION_HASH_V1\0` over the signed canonical JSON |
+| Revocation | `PRAETORE_APPROVAL_REVOCATION_V1\0` |
+
+`verify_approval_chain` (in `praetore_core::approval_delegation`) is the one
+function the gateway and `praetore-verify outcomes` use. A child must be
+signed by its parent, be for the same tenant, hold a subset of its parent's
+exact action types, lie within its parent's validity, have a lower
+`max_depth` (the root counts as 4, and a chain has at most 4 links), have a
+`delegator` parent, and not grant to its issuer or to an earlier key of the
+chain. The signer must be the last link, an `approver` whose action types
+include the request's; no link may be revoked or name the agent's key; every
+link must be valid from the evidence's `decided_at` to the challenge's
+`expires_at`. Every violation is a typed error; nothing is narrowed. The
+root signs alone only when the policy's
+[`approval_delegation.root_may_approve`](policy-language.md#delegated-approval-option)
+is `true`. Golden vectors:
+[delegation](golden/approval-delegation-v1.json),
+[revocation](golden/approval-revocation-v1.json),
+[decision v2](golden/human-approval-decision-v2.json). Design and limits:
+[delegated authority to approve](proposals/approval-delegation.md).
+
 ## Threat model and guarantees
 
 * **Cooperative agent:** deterministic decisions follow the supplied policy,

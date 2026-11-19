@@ -6,7 +6,14 @@
 #[cfg(feature = "signing")]
 use crate::ExecutionAttestationSigner;
 use crate::{ExecutionAttestationError, action_digest};
-use praetore_core::{Authority, DecisionOutcome, Evidence, canonical::canonicalize_json};
+use praetore_core::{
+    Authority, DecisionOutcome, Evidence,
+    approval_delegation::{
+        ApprovalContext, DelegationConfig, DelegationError, RevocationRule, VerifiedChain,
+        verify_approval_chain,
+    },
+    canonical::canonicalize_json,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -84,6 +91,14 @@ pub enum HumanApprovalOutcome {
     Reject,
 }
 
+/// A signed human decision on one held request.
+///
+/// Schema version 1 is signed by a pinned approver key and has no
+/// `delegation_chain`. Schema version 2 is signed by a delegated approver
+/// (or by the tenant's delegation root, when the policy allows it) and
+/// carries `delegation_chain` inside the signed payload: the delegation
+/// hashes from the root to the approver, empty when the root approves. A
+/// version 1 decision serializes and signs exactly as before.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HumanApprovalDecision {
@@ -92,6 +107,8 @@ pub struct HumanApprovalDecision {
     pub approver_key_id: String,
     pub challenge: ApprovalChallenge,
     pub outcome: HumanApprovalOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_chain: Option<Vec<String>>,
     pub signature: String,
 }
 
@@ -102,7 +119,14 @@ struct HumanApprovalPayload<'a> {
     approver_key_id: &'a str,
     challenge: &'a ApprovalChallenge,
     outcome: HumanApprovalOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delegation_chain: Option<&'a [String]>,
 }
+
+/// The `schema_version` of a decision signed by a pinned approver.
+pub const PINNED_DECISION_SCHEMA_VERSION: u8 = 1;
+/// The `schema_version` of a decision signed through a delegation chain.
+pub const DELEGATED_DECISION_SCHEMA_VERSION: u8 = 2;
 
 impl HumanApprovalDecision {
     pub fn from_json(json: &str) -> Result<Self, ApprovalError> {
@@ -124,23 +148,48 @@ impl HumanApprovalDecision {
             approver_key_id: &self.approver_key_id,
             challenge: &self.challenge,
             outcome: self.outcome,
+            delegation_chain: self.delegation_chain.as_deref(),
         };
         let json = serde_json::to_string(&payload).map_err(|_| ApprovalError::InvalidChallenge)?;
         canonicalize_json(&json).map_err(|_| ApprovalError::InvalidChallenge)
     }
 
-    /// Verifies the approver's signature against a pinned approver key with
-    /// key id `expected_key_id`. It does not check the challenge against a
-    /// request; see [`ApprovalChallenge::from_evidence`].
+    /// Verifies a schema version 1 decision's signature against a pinned
+    /// approver key with key id `expected_key_id`. It does not check the
+    /// challenge against a request; see [`ApprovalChallenge::from_evidence`].
     pub fn verify_signature(
         &self,
         expected_key_id: &str,
         public_key: &praetore_core::VerifiedPublicKey,
     ) -> Result<(), ApprovalError> {
-        if self.schema_version != 1
-            || self.approver_key_id != expected_key_id
-            || self.approval_id.is_nil()
+        if self.schema_version != PINNED_DECISION_SCHEMA_VERSION || self.delegation_chain.is_some()
         {
+            return Err(ApprovalError::InvalidSignature);
+        }
+        self.verify_signature_any_version(expected_key_id, public_key)
+    }
+
+    /// Verifies a schema version 2 decision's signature against the key a
+    /// verified delegation chain ends in.
+    fn verify_delegated_signature(
+        &self,
+        expected_key_id: &str,
+        public_key: &praetore_core::VerifiedPublicKey,
+    ) -> Result<(), ApprovalError> {
+        if self.schema_version != DELEGATED_DECISION_SCHEMA_VERSION
+            || self.delegation_chain.is_none()
+        {
+            return Err(ApprovalError::InvalidSignature);
+        }
+        self.verify_signature_any_version(expected_key_id, public_key)
+    }
+
+    fn verify_signature_any_version(
+        &self,
+        expected_key_id: &str,
+        public_key: &praetore_core::VerifiedPublicKey,
+    ) -> Result<(), ApprovalError> {
+        if self.approver_key_id != expected_key_id || self.approval_id.is_nil() {
             return Err(ApprovalError::InvalidSignature);
         }
         if !is_lower_hex(&self.signature) {
@@ -170,6 +219,68 @@ impl HumanApprovalDecision {
         message.extend_from_slice(HUMAN_APPROVAL_DOMAIN);
         message.extend_from_slice(&payload);
         Ok(message)
+    }
+
+    /// Whether this decision is signed through a delegation chain (schema
+    /// version 2).
+    pub fn is_delegated(&self) -> bool {
+        self.schema_version == DELEGATED_DECISION_SCHEMA_VERSION
+    }
+
+    /// Verifies a schema version 2 decision for `evidence`, the held request
+    /// it decides: the challenge is the one derived from the evidence; the
+    /// delegation chain verifies against the tenant's root in `delegations`
+    /// ([`verify_approval_chain`], over the window from the evidence's
+    /// signed `decided_at` to the challenge's `expires_at`); the decision is
+    /// signed by the key the chain ends in; and the approver is not the
+    /// requesting agent. `root_may_approve` is the policy's option, read from
+    /// the policy whose digest the challenge carries. The gateway and the
+    /// offline verifier both call this function.
+    pub fn verify_delegated(
+        &self,
+        evidence: &Evidence,
+        delegations: &DelegationConfig,
+        root_may_approve: bool,
+        revocations: RevocationRule,
+    ) -> Result<VerifiedChain, ApprovalError> {
+        let chain = self
+            .delegation_chain
+            .as_deref()
+            .filter(|_| self.is_delegated())
+            .ok_or(ApprovalError::InvalidSignature)?;
+        let digest =
+            action_digest(&evidence.action).map_err(|_| ApprovalError::InvalidChallenge)?;
+        let expected = ApprovalChallenge::from_evidence(evidence, &digest)?;
+        if self.challenge != expected {
+            return Err(ApprovalError::InvalidChallenge);
+        }
+        let window_start = evidence
+            .decided_at
+            .as_deref()
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+            .ok_or(ApprovalError::InvalidChallenge)?;
+        let window_end = OffsetDateTime::parse(&self.challenge.expires_at, &Rfc3339)
+            .map_err(|_| ApprovalError::InvalidChallenge)?;
+        let context = ApprovalContext {
+            tenant_id: self.challenge.tenant_id,
+            action_type: &evidence.action.action_type,
+            window_start,
+            window_end,
+            agent_public_key: &evidence.agent.public_key,
+            root_may_approve,
+            revocations,
+        };
+        let verified = verify_approval_chain(delegations, chain, &self.approver_key_id, &context)
+            .map_err(|error| match error {
+            DelegationError::RootMayNotApprove => ApprovalError::RootMayNotApprove,
+            DelegationError::SelfApproval => ApprovalError::SelfApproval,
+            other => ApprovalError::Delegation(other),
+        })?;
+        self.verify_delegated_signature(&verified.approver_key_id, &verified.approver_key)?;
+        if self.is_self_approval(&verified.approver_key, evidence) {
+            return Err(ApprovalError::SelfApproval);
+        }
+        Ok(verified)
     }
 }
 
@@ -383,6 +494,10 @@ pub enum ApprovalError {
     NotPending,
     #[error("the requesting agent cannot approve its own action")]
     SelfApproval,
+    #[error("the policy does not let the delegation root approve")]
+    RootMayNotApprove,
+    #[error("delegated approval refused: {0}")]
+    Delegation(DelegationError),
 }
 
 fn authority_tenant_id(authority: &Authority) -> Option<Uuid> {
