@@ -239,9 +239,9 @@ read-only: `append_file`, `edit_file`, `create_directory`, `move_file` and
 enforce, below. Do not add that rule here.
 
 Observe is the arrival mode. To switch to enforce, do not run
-`install --mode enforce` on the wrapped entry. That prints
-`nothing to change` and exits 0, and the mode already in the config stays.
-Uninstall, install again, and restart the client:
+`install --mode enforce` on the wrapped entry. That reports
+`NOT governed by this home` and exits 1, and the mode already in the
+config stays. Uninstall, install again, and restart the client:
 
 ```sh
 praetore-mcp uninstall --client <client> --dry-run
@@ -253,9 +253,9 @@ praetore-mcp install --client <client> --mode enforce --yes
 Read the enforce dry-run before `--yes`. It must show `wrap` with
 `--mode enforce`. In enforce, the same `write_file` call is refused and
 the file is not written. The receipt shows `DENY` and `first-rule` with
-mode `enforce`. You can instead edit `--mode` in the client config and
-restart the client. `install` does not rewrite `--mode` while the entry is
-already wrapped.
+mode `enforce`. Do not edit `--mode` in the client config. `install` does
+not rewrite `--mode` while the entry is already wrapped: it reports
+`NOT governed by this home` and exits 1. Uninstall, then install again.
 
 Optional, after the install is in enforce, and only for the test server
 named `filesystem` on `~/praetore-test`. In observe a REQUIRE_APPROVAL

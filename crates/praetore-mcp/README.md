@@ -190,10 +190,10 @@ praetore-mcp approve <id>          # your terminal; an assistant must not run th
 # praetore-mcp reject <id>         # instead of approve: the call is not forwarded
 ```
 
-`install --mode enforce` on an entry that is already wrapped prints
-`nothing to change` and exits 0. The mode already in the config stays.
+`install --mode enforce` on an entry that is already wrapped reports
+`NOT governed by this home` and exits 1. The mode already in the config stays.
 Switch by uninstalling and installing again, as above, then restart the
-client. You can also edit `--mode` in the client config and restart.
+client. Do not edit `--mode` in the client config.
 `install` does not rewrite `--mode` on a wrapped entry.
 
 In a terminal, `install` and `uninstall` ask
@@ -241,9 +241,9 @@ any other fields stay as they are, and so does the key order.
 `praetore-mcp uninstall [--client ...] [--yes]` restores the original
 entries exactly. Pass `--mode enforce` on the first `install` when you
 want to start in enforce mode. Observe is the default. To change the mode
-later, edit `--mode` in the client config, or uninstall and install again.
-`install` on an already wrapped entry prints `nothing to change` and
-exits 0.
+later, uninstall and install again. Do not edit `--mode` in the client config.
+`install` on an already wrapped entry with a different `--mode` reports
+`NOT governed by this home` and exits 1.
 
 You can also wrap a server by hand:
 
