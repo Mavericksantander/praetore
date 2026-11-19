@@ -469,8 +469,23 @@ impl TenantLock {
     /// and freezing are held back only that long). Between the two another
     /// session may take it: then [`SafetyStoreError::LockBusy`], and the
     /// holder must stop writing until it takes the lock again.
+    ///
+    /// `COMMIT` wakes a session waiting on the row, but it does not grant
+    /// that session the row. The row is free until the woken session locks
+    /// it again, and this session can take it back first. [`Self::renew`]
+    /// does not wait; [`Self::renew_after`] runs a hook in that gap.
     pub fn renew(&mut self) -> Result<(), SafetyStoreError> {
+        self.renew_after(|| ())
+    }
+
+    /// [`Self::renew`], running `before_relock` after the commit and before
+    /// the lock is taken again. A test waits there until another session
+    /// has locked the row, so the renewal loses it instead of racing the
+    /// woken waiter.
+    #[doc(hidden)]
+    pub fn renew_after(&mut self, before_relock: impl FnOnce()) -> Result<(), SafetyStoreError> {
         self.client.batch_execute("COMMIT")?;
+        before_relock();
         lock_registration(&mut self.client, self.tenant_id, &self.role)?;
         self.renewed_at = std::time::Instant::now();
         Ok(())

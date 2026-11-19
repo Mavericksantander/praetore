@@ -4,6 +4,24 @@
 
 ### Added
 
+- **praetore-mcp: `install --client claude-code`** (alias `cc`). Wraps the
+  stdio servers of `~/.claude.json` (user scope) and `./.mcp.json`
+  (project scope): an entry with no `type` or `"type": "stdio"`, a
+  `command` and no `url`. Remote entries (`http`, `sse`, `ws`,
+  `streamable-http`, `sdk`, an unknown `type`, any `url`) are listed as
+  `not wrapped (remote server)`. Local-scope servers are not wrapped: each
+  is listed, a local entry that overrides a wrapped user entry is named,
+  and `install` ends with a WARNING. Only the `mcpServers` value is
+  rewritten. A file that changes while `install` runs is not written.
+  `install` without `--client` now also processes `~/.claude.json` when it
+  exists.
+  The README section "Known limits of `install`" lists seven cases, for
+  Claude Code and in part for every client, in which what runs after
+  `install` can differ from what `install` reported. The first, an entry
+  wrapped for another binary, home or mode, ends with
+  `NOT governed by this home` and exit 1, for Claude Code too; the other
+  six are not closed in this version.
+
 - **Delegated authority to approve.** A tenant's delegation root, pinned
   in the optional `PRAETORE_GATEWAY_DELEGATION_FILE`, signs delegations to
   delegators and approvers with an exact list of action types, a validity
@@ -108,6 +126,17 @@
   `not_dispatched_reason`. A window that closed with no decision is still
   410 `approval_expired`. **Visible change: clients that treated a dispatch
   410's `code` as `approval_expired` must read `approved_claim_expired`.**
+
+- **praetore-mcp: `policy coverage` treats a `tool` Prefix as a selector.**
+  The tool name is already known, so the decision matches the engine,
+  including case and unsafe values (`..`, `%`, NUL). It used to leave the
+  rule in the argument column and report default deny.
+
+- **praetore-mcp install: a wrapped entry for another binary, home or mode is not "already wrapped".**
+  It prints `NOT governed by this home; run uninstall, then install` and
+  exits 1, including `--dry-run`, and does not change the file. Switching
+  observe to enforce is uninstall, then install. Editing `--mode` in the
+  client config is not the switch: the next install still exits 1.
 
 - **A repeated journal INSERT no longer takes a position (migration 0025).**
   Before 0025, `INSERT ... ON CONFLICT DO NOTHING` or `DO UPDATE` on a
