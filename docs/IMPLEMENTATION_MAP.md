@@ -1,29 +1,32 @@
 # Mapa de implementación
 
-Observación del 2026-11-19. Base leída en esta pasada, después de
-`git fetch origin main`:
+Observación del 2026-11-19, actualizada sobre la base de abajo, después
+de `git fetch origin main`:
 
 | Campo | Valor |
 |---|---|
-| `git rev-parse origin/main` | `230f4d55ad5cc2789a6beb7db53fbc7f31cd1ec1` |
-| `git log -1` | `Merge pull request #158 from Mavericksantander/feat/approval-delegation` |
-| Fecha del merge | 2026-11-18 21:10:24 -0300 |
+| `git rev-parse origin/main` | `5f5667c3bad76b758fae3aa7d315e8882072b37e` |
+| `git log -1` | `Merge pull request #220 from Mavericksantander/cursor/json5-safety-key-detector-36a2` |
+| Fecha del merge | 2026-11-19 15:50:32 -0300 |
 | `workspace.package.version` | `0.3.6` (`Cargo.toml`) |
 
 `git merge-base --is-ancestor` de ese SHA contra `origin/main` salió 0.
-El mismo SHA es el merge que devolvió `gh pr view 158`.
+El mismo SHA es el merge que devolvió `gh pr view 220`.
 
-Este archivo no está en `230f4d55`. En esta pasada
-`git cat-file -e 230f4d55ad5cc2789a6beb7db53fbc7f31cd1ec1:docs/IMPLEMENTATION_MAP.md`
+Este archivo no está en `5f5667c3`. En esta pasada
+`git cat-file -e 5f5667c3bad76b758fae3aa7d315e8882072b37e:docs/IMPLEMENTATION_MAP.md`
 salió 128:
 
-`fatal: path 'docs/IMPLEMENTATION_MAP.md' exists on disk, but not in '230f4d55ad5cc2789a6beb7db53fbc7f31cd1ec1'`.
+`fatal: path 'docs/IMPLEMENTATION_MAP.md' exists on disk, but not in '5f5667c3bad76b758fae3aa7d315e8882072b37e'`.
 
-`git log --oneline 230f4d55ad5cc2789a6beb7db53fbc7f31cd1ec1 -- docs/IMPLEMENTATION_MAP.md`
-no imprimió commits (exit 0). `git grep -l IMPLEMENTATION_MAP 230f4d55ad5cc2789a6beb7db53fbc7f31cd1ec1`
-salió 1. La columna «antes» es **sin nivel** porque ese commit no tiene
-un número escrito para estas filas. Los de «ahora» salen de los comandos
-y de los runs citados abajo.
+`git log --oneline 5f5667c3bad76b758fae3aa7d315e8882072b37e -- docs/IMPLEMENTATION_MAP.md`
+no imprimió commits (exit 0). La columna «antes» es **sin nivel** porque
+ese commit no tiene un número escrito para estas filas. Los de «ahora»
+salen de los comandos y de los runs citados abajo.
+
+Este PR empezó como foto de `230f4d55`. Esta actualización mueve la base
+a `5f5667c3`, añade los ocho merges posteriores y corrige la fila de
+#158 con la conclusión final del run.
 
 ## Escala
 
@@ -50,10 +53,10 @@ tests si el job `Rust tests, lint, and format` salió `success` y lo que
 falló el run fue un job `cancelled` (build o smoke de macOS, al llegar
 el push siguiente). Abajo se cita el job, no solo la conclusión del run.
 
-## PRs mergeados en las 24 h anteriores a esta base
+## PRs mergeados en las 24 h anteriores a `230f4d55`
 
 Estado `MERGED` y merge commit según `gh pr view`. Cada SHA es ancestro
-de `230f4d55` (`git merge-base --is-ancestor`, salida 0).
+de `230f4d55` y de `5f5667c3` (`git merge-base --is-ancestor`, salida 0).
 
 | PR | Merge commit | Merge (UTC) | Run en `main` | Run | Job rust |
 |---|---|---|---|---|---|
@@ -74,11 +77,32 @@ de `230f4d55` (`git merge-base --is-ancestor`, salida 0).
 | [#205](https://github.com/Mavericksantander/praetore/pull/205) | `b9e4568352778d4ad10c4973bb529af53aed8146` | 2026-11-18T18:52:57Z | [44374506090](https://github.com/Mavericksantander/praetore/actions/runs/44374506090) | success | success |
 | [#206](https://github.com/Mavericksantander/praetore/pull/206) | `559915c0f7fad520f7566f1adea66344608aed23` | 2026-11-18T19:16:42Z | [44378801966](https://github.com/Mavericksantander/praetore/actions/runs/44378801966) | failure | success. Cancelado: macOS workspace link. Smoke de la matriz, skipped |
 | [#163](https://github.com/Mavericksantander/praetore/pull/163) migración 0025 | `0b0138692358415721d732f09966937ae15572a3` | 2026-11-18T20:24:30Z | [44390713960](https://github.com/Mavericksantander/praetore/actions/runs/44390713960) | success | success. Job PostgreSQL success |
-| [#158](https://github.com/Mavericksantander/praetore/pull/158) delegación | `230f4d55ad5cc2789a6beb7db53fbc7f31cd1ec1` | 2026-11-19T00:10:24Z | [44426846682](https://github.com/Mavericksantander/praetore/actions/runs/44426846682) | in_progress al cerrar esta nota | success. Job PostgreSQL todavía `in_progress` |
+| [#158](https://github.com/Mavericksantander/praetore/pull/158) delegación | `230f4d55ad5cc2789a6beb7db53fbc7f31cd1ec1` | 2026-11-19T00:10:24Z | [44426846682](https://github.com/Mavericksantander/praetore/actions/runs/44426846682) | success | success. Job PostgreSQL success |
 
 El run de `#158` se volvió a consultar con `gh run view 44426846682`
-después de los tests locales. Seguía `in_progress`, con el job rust ya
-en `success` y PostgreSQL sin conclusión.
+en esta pasada. Ya terminó: conclusión `success`, job rust `success` y
+job PostgreSQL `success`. El nivel de esa fila sigue siendo 3, por la
+consola (abajo).
+
+## PRs mergeados después de `230f4d55`, ya en `5f5667c3`
+
+Estado `MERGED` y merge commit según `gh pr view`. Cada SHA es ancestro
+de `5f5667c3` (`git merge-base --is-ancestor`, salida 0).
+
+| PR | Merge commit | Merge (UTC) | Run en `main` | Run | Job rust |
+|---|---|---|---|---|---|
+| [#222](https://github.com/Mavericksantander/praetore/pull/222) B-WRAP install | `2e4b22681f8761d8e1e4048b03469c33ecc6d760` | 2026-11-19T03:34:41Z | [44452412197](https://github.com/Mavericksantander/praetore/actions/runs/44452412197) | success | success |
+| [#218](https://github.com/Mavericksantander/praetore/pull/218) ADR-007 | `ff35431693ae0860006b17f59b5317943cc80632` | 2026-11-19T03:35:27Z | [44452506061](https://github.com/Mavericksantander/praetore/actions/runs/44452506061) | success | success |
+| [#225](https://github.com/Mavericksantander/praetore/pull/225) `policy coverage` Prefix | `b587249c3fe3c9d1294ae91c911a3874def48d85` | 2026-11-19T04:21:30Z | [44457768592](https://github.com/Mavericksantander/praetore/actions/runs/44457768592) | success | success |
+| [#201](https://github.com/Mavericksantander/praetore/pull/201) `install --client claude-code` | `6fec26a23d6ef58838f09bac20033d4b76ddb97e` | 2026-11-19T04:21:55Z | [44457815646](https://github.com/Mavericksantander/praetore/actions/runs/44457815646) | success | success |
+| [#224](https://github.com/Mavericksantander/praetore/pull/224) renovación del lock | `c12cfececeb76aeafcf50fda860d3fc28b5f9413` | 2026-11-19T06:35:49Z | [44473325464](https://github.com/Mavericksantander/praetore/actions/runs/44473325464) | success | success. Job PostgreSQL success |
+| [#223](https://github.com/Mavericksantander/praetore/pull/223) inventario HighAssurance | `907ca1a213061ab7eb35ba0dee1d183ad6da2205` | 2026-11-19T06:36:10Z | [44473367077](https://github.com/Mavericksantander/praetore/actions/runs/44473367077) | success | success |
+| [#219](https://github.com/Mavericksantander/praetore/pull/219) 410 `approved_claim_expired` | `bc83957b778885173033f16e0f10c293b73f045f` | 2026-11-19T18:14:44Z | [44585742867](https://github.com/Mavericksantander/praetore/actions/runs/44585742867) | failure | success. Job PostgreSQL success. Cancelados: los dos build macOS de praetore-mcp |
+| [#220](https://github.com/Mavericksantander/praetore/pull/220) detector JSON5 `safety*` | `5f5667c3bad76b758fae3aa7d315e8882072b37e` | 2026-11-19T18:50:33Z | [44592054410](https://github.com/Mavericksantander/praetore/actions/runs/44592054410) | in_progress al cerrar esta nota | Job rust todavía `in_progress`. Job PostgreSQL todavía `in_progress` |
+
+El run de `#220` se consultó con `gh run view 44592054410` al cerrar esta
+nota. Todavía no tenía conclusión. El nivel de esa fila, abajo, no se
+apoya en ese run.
 
 ## Niveles
 
@@ -116,10 +140,42 @@ Otros comandos de esta pasada:
 | `bash scripts/test-check-rust-version.sh` | 0 | `check-rust-version: all cases pass` |
 | `bash scripts/check-rust-version.sh` | 0 | `rust-version 1.88 on every package Cargo.toml` |
 
-No se corrió `cargo test --workspace`. No se corrió la batería de
-PostgreSQL (no hay `PRAETORE_TEST_DATABASE_URL` en esta máquina). No se
-corrió `a_symlink_planted_after_the_check_does_not_escape` con
-`--ignored`.
+En la pasada original sobre `230f4d55` no se corrió
+`cargo test --workspace`. No se corrió la batería de PostgreSQL (no hay
+`PRAETORE_TEST_DATABASE_URL` en esta máquina). No se corrió
+`a_symlink_planted_after_the_check_does_not_escape` con `--ignored`.
+
+### Pasada de esta actualización (base `5f5667c3`)
+
+Toolchain local: `rustc 1.100.0 (0ef1bc386 2026-11-09)`.
+`CARGO_TARGET_DIR` apuntó a un `target/` dentro del worktree.
+Antes de los tests se corrió `cargo clean -p praetore-mcp`.
+
+| Comando | Exit | Resultado |
+|---|---|---|
+| `cargo fmt --all -- --check` | 0 | |
+| `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` | 0 | |
+| `cargo clean -p praetore-mcp && cargo test --workspace --locked` | 0 | 1502 passed, 0 failed, 189 ignored |
+| `bash scripts/test-check-hook-high-assurance.sh` | 0 | `high assurance inventory check: grep-shaped miss rejected, exact list accepted` |
+| `bash scripts/check-hook-high-assurance-tests.sh` | 0 | `all 17 named HighAssurance hook tests ran and passed` |
+| `git diff --check` | 0 | |
+
+En esa corrida del workspace salieron ok, entre otros:
+`six_a_entries_exit_1_in_dry_run_and_yes`,
+`claude_code_six_a_entries_exit_1_in_dry_run_and_yes`,
+`claude_code_user_scope_install_uninstall_is_byte_identical`,
+`claude_code_local_scope_servers_are_listed_and_end_with_a_warning`,
+`policy::tests::coverage_matches_engine_on_tool_prefix`,
+`policy::review_pr225::coverage_agrees_with_engine_on_tool_prefix_grid`,
+`apd::http_410_code_is_the_signed_approved_claim_expired_reason`,
+`apd::journal_claim_expiry_closes_as_approved_claim_expired`,
+`proxy::tests::json5_safety_keys_are_refused_in_both_modes` y
+`a_server_started_without_wrap_runs_the_call_and_leaves_no_receipt`.
+
+`postgres_safety_tenant_lock_renewal_releases_its_xid_and_can_lose_the_lock`
+salió `ignored, requires PRAETORE_TEST_DATABASE_URL`.
+`a_symlink_planted_after_the_check_does_not_escape` siguió `ignored`.
+No se ejecutó `approve` ni `reject`.
 
 | Capacidad | Antes | Ahora | Evidencia | Qué no autoriza el número |
 |---|---|---|---|---|
@@ -137,9 +193,15 @@ corrió `a_symlink_planted_after_the_check_does_not_escape` con
 | Condición `arguments.a.b` rechazada (#205) | sin nivel | 2 | Run [44374506090](https://github.com/Mavericksantander/praetore/actions/runs/44374506090), job rust success. Local: `dotted_argument_field_is_only_a_dot_inside_the_field` ok | No es 1. El test local es el del helper, no un `wrap` de punta a punta. El job rust sí corrió `cargo test --workspace --locked` |
 | Línea de cliente de más de 32 MiB responde JSON-RPC (#206) | sin nivel | 2 | Run [44378801966](https://github.com/Mavericksantander/praetore/actions/runs/44378801966), job rust success. Local: los dos `oversized_line_uses_32600` / `32700` ok | No es 1 |
 | Migración 0025: `ON CONFLICT` no consume posición (#163) | sin nivel | 2 | Run [44390713960](https://github.com/Mavericksantander/praetore/actions/runs/44390713960), conclusión success, job rust success y job PostgreSQL success. `scripts/postgres-ignored-tests.sh` corre cada test `#[ignore]` de `praetore-replay-postgres --test postgres` que no tenga un paso propio, y el test `postgres_journal_position_on_conflict_does_not_consume_a_position` está `#[ignore]` | No es 1. Esta pasada no lo reejecutó. Los huecos de `chain_seq` que ya existían no se reparan: el changelog de `0b01386` lo dice, y no hay test de esta pasada que los cierre |
-| Delegación para aprobar (#158) | sin nivel | 3 | Run [44426846682](https://github.com/Mavericksantander/praetore/actions/runs/44426846682), job rust success (el run seguía in_progress). Local: `approval_delegation` 6 passed, exit 0. Esos seis tests cargan el documento; no son el gateway | No es 2 ni 1. La consola firma `schema_version: 1` y `delegation_chain: None` (`crates/praetore-console/src/aprobador.rs`, `ApproverSigner::sign`). El test de Postgres `postgres_delegated_approval_is_recorded_dispatched_exported_and_verified` no tiene resultado en esta nota: el job PostgreSQL del run seguía `in_progress` |
-| 6a B-WRAP. El servidor arrancado sin `wrap` corre la llamada y no deja recibo | sin nivel | 5 | Local: `a_server_started_without_wrap_runs_the_call_and_leaves_no_receipt` ok, exit 0. El test pasa porque el hueco sigue. La fila `a` de `docs/security/evasion-matrix.md` lo marca limitación conocida | No se cierra. 5 no es un avance hacia 1 |
+| Delegación para aprobar (#158) | sin nivel | 3 | Run [44426846682](https://github.com/Mavericksantander/praetore/actions/runs/44426846682), conclusión success, job rust success y job PostgreSQL success. Local (pasada original): `approval_delegation` 6 passed, exit 0. Esos seis tests cargan el documento; no son el gateway | No es 2 ni 1. La consola, en `5f5667c3`, sigue firmando `schema_version: 1` y `delegation_chain: None` (`crates/praetore-console/src/aprobador.rs:146,151`, `ApproverSigner::sign`). Esta pasada no reejecutó `postgres_delegated_approval_is_recorded_dispatched_exported_and_verified` (sigue `#[ignore]` sin URL) |
+| 6a B-WRAP. El servidor arrancado sin `wrap` corre la llamada y no deja recibo | sin nivel | 5 | Local, también en esta pasada: `a_server_started_without_wrap_runs_the_call_and_leaves_no_receipt` ok, exit 0. El test pasa porque el hueco sigue. La fila `a` de `docs/security/evasion-matrix.md:17` en `5f5667c3` sigue diciendo `limitación conocida` | No se cierra. #222 no toca este camino: es el cliente que arranca el servidor a pelo, no el clasificador de `install`. 5 no es un avance hacia 1 |
 | Evasión de rutas de #195, salvo el TOCTOU ignorado | sin nivel | 2 | Run [44353295569](https://github.com/Mavericksantander/praetore/actions/runs/44353295569), job rust success. Local: `evasion_paths` 5 passed, exit 0 del comando conjunto | No es 1. El archivo dice que un test que pasa documenta una defensa que ya estaba. El sexto sigue ignorado |
+| Install: un wrap de otro binario, home o modo no es «already wrapped» (#222) | sin nivel | 2 | Run [44452412197](https://github.com/Mavericksantander/praetore/actions/runs/44452412197), conclusión success, job rust success. En `5f5667c3`, `is_wrapped` exige `command == target.exe` y `--dir` / `--mode` una sola vez e iguales (`crates/praetore-mcp/src/install.rs:255-265`); el rechazo usa `NOT_GOVERNED` (`install.rs:25`). Esta pasada: `six_a_entries_exit_1_in_dry_run_and_yes` y `claude_code_six_a_entries_exit_1_in_dry_run_and_yes` ok (`crates/praetore-mcp/tests/install.rs:669,737`) | No es 1. Son tests del propio cambio. No cierra la fila 6a de arriba. `is_wrapped` no lee `env`; eso queda fuera de este 2 (residuales) |
+| `policy coverage` trata un `tool` Prefix como selector (#225) | sin nivel | 2 | Run [44457768592](https://github.com/Mavericksantander/praetore/actions/runs/44457768592), conclusión success, job rust success. Esta pasada: `policy::tests::coverage_matches_engine_on_tool_prefix` y `policy::review_pr225::coverage_agrees_with_engine_on_tool_prefix_grid` ok (`crates/praetore-mcp/src/policy.rs:1213,1283`) | No es 1. Son tests del propio cambio |
+| `install --client claude-code` (#201) | sin nivel | 3 | Run [44457815646](https://github.com/Mavericksantander/praetore/actions/runs/44457815646), conclusión success, job rust success. Esta pasada: `claude_code_user_scope_install_uninstall_is_byte_identical` ok y `claude_code_local_scope_servers_are_listed_and_end_with_a_warning` ok (`crates/praetore-mcp/tests/install.rs:276,336`). El segundo fija el aviso `This version does not wrap local scope` (`tests/install.rs:362`) | No es 2 ni 1. El scope `local` no se envuelve |
+| Gate de CI: inventario HighAssurance desde `cargo test --list` (#223) | sin nivel | 2 | Run [44473367077](https://github.com/Mavericksantander/praetore/actions/runs/44473367077), conclusión success, job rust success. Esta pasada: `scripts/test-check-hook-high-assurance.sh` exit 0 (rechaza un listado que solo parece una corrida) y `scripts/check-hook-high-assurance-tests.sh` exit 0, `all 17 named HighAssurance hook tests ran and passed` | No es 1. Es un chequeo de inventario y de que esos tests corren, no una propiedad nueva del hook |
+| HTTP 410 de un dispatch tardío usa la razón firmada `approved_claim_expired` (#219) | sin nivel | 2 | Run [44585742867](https://github.com/Mavericksantander/praetore/actions/runs/44585742867): job rust success y job PostgreSQL success (el run quedó failure por los dos builds macOS cancelados). En `5f5667c3`: `GatewayError::ApprovedClaimExpired` (`crates/praetore-gateway/src/lib.rs:617`) y el 410 con `code` `approved_claim_expired` (`crates/praetore-gateway/src/http_api.rs:1046-1048`). Esta pasada: `apd::http_410_code_is_the_signed_approved_claim_expired_reason` y `apd::journal_claim_expiry_closes_as_approved_claim_expired` ok (`crates/praetore-gateway/tests/enforcement.rs:3798,3766`) | No es 1. Son tests del propio cambio. El CHANGELOG lo marca como cambio visible de contrato |
+| Detector `safety*`: lee formas JSON5 (#220) | sin nivel | 2 | En `5f5667c3`: `json5_texts` (`crates/praetore-mcp/src/proxy.rs:594`) y `proxy::tests::json5_safety_keys_are_refused_in_both_modes` (`proxy.rs:1575`), ok en esta pasada. El run [44592054410](https://github.com/Mavericksantander/praetore/actions/runs/44592054410) de `main` seguía sin conclusión al cerrar esta nota (job rust `in_progress`) | No es 1. El nivel se sostiene por el test local y porque ese test está en el árbol de `5f5667c3`, no por el run. Es el test del propio cambio |
 
 ## Residuales
 
@@ -153,8 +215,18 @@ En la corrida local salió `ignored` (5 passed, 1 ignored). No se lanzó
 con `--ignored`, así que esta pasada no volvió a ver la escritura fuera
 del root. Queda sin nivel. No es un 2.
 
-**6a B-WRAP.** Sigue abierto. Nivel 5, con el test de arriba. No hay
-cambio que lo cierre en estos merges.
+**6a B-WRAP, servidor sin `wrap`.** Sigue abierto. Nivel 5, con el test
+de arriba, que en esta pasada volvió a salir ok. La fila `a` de
+`docs/security/evasion-matrix.md:17` en `5f5667c3` sigue como
+`limitación conocida`. #222 no cierra este hueco: cambia el clasificador
+de `install` (una entrada que parsea como `wrap` de otro binario, home o
+modo ya no se reporta «already wrapped»), no el caso de un servidor
+arrancado a pelo.
+
+**#222, `env` de la entrada.** `is_wrapped` solo compara `command`,
+`--dir` y `--mode` (`crates/praetore-mcp/src/install.rs:255-265`). No
+lee `env`. Esta pasada no inyectó un cargador; el residual queda
+confirmado por ese código, sin nivel aparte.
 
 **B-KEYS, symlink en un directorio padre.** El rechazo de un padre que
 ya es symlink al momento del `lstat` está dentro del 2
@@ -174,6 +246,8 @@ Queda sin nivel. No entra en el 2 de B-KEYS.
 |---|---|
 | [#193](https://github.com/Mavericksantander/praetore/pull/193), auditoría Ed25519 | Es documentación (`docs/audits/2026-11-16-agilidad-criptografica.md`). El job rust del run [44351325303](https://github.com/Mavericksantander/praetore/actions/runs/44351325303) salió success y no clasifica los sitios de esa auditoría. Sin nivel |
 | [#196](https://github.com/Mavericksantander/praetore/pull/196), fixtures de `verify_view` | El job rust del run [44362750740](https://github.com/Mavericksantander/praetore/actions/runs/44362750740) salió success. Esta pasada no reejecutó esos tests. No se le asigna un nivel distinto del 2 de B-ANCHOR, que es el comportamiento que los fixtures miran |
+| [#218](https://github.com/Mavericksantander/praetore/pull/218), ADR-007 | Solo documentación: `docs/adr/007-unify-mcp-and-gateway.md` y la entrada en `docs/adr/README.md`. El job rust del run [44452506061](https://github.com/Mavericksantander/praetore/actions/runs/44452506061) salió success. No cambia código de runtime. Sin nivel |
+| [#224](https://github.com/Mavericksantander/praetore/pull/224), renovación del tenant lock | El comportamiento de producción no cambia: `TenantLock::renew` llama `renew_after` con un hook vacío (`crates/praetore-replay-postgres/src/safety.rs:477-479`). El test `postgres_safety_tenant_lock_renewal_releases_its_xid_and_can_lose_the_lock` (`tests/postgres.rs:9543`) está `#[ignore]` y en esta pasada salió ignored por falta de `PRAETORE_TEST_DATABASE_URL`. El job PostgreSQL del run [44473325464](https://github.com/Mavericksantander/praetore/actions/runs/44473325464) salió success. Sin número de producto nuevo |
 | Huecos de `chain_seq` ya escritos antes de 0025 | El changelog del merge `0b01386` dice que no se reparan. No se sube esa parte |
 | Carrera B-KEYS del directorio padre | Sin nivel, arriba |
 | TOCTOU `a_symlink_planted_after_the_check_does_not_escape` | Sin nivel, arriba |
@@ -184,4 +258,5 @@ Queda sin nivel. No entra en el 2 de B-KEYS.
 No hay un job de links de Markdown. El job rust corre `git diff --check`
 sobre el árbol y `make demo` (el demo de `docs/DEMO.md`, no este
 archivo). `git diff --check` sobre este árbol, en esta pasada, salió **0**.
-`make demo` no se corrió: no lee este archivo.
+`make demo` no se corrió: no lee este archivo. El run de `#220` en `main`
+aún no había terminado al cerrar esta nota.
