@@ -22,9 +22,10 @@ Usage:
   praetore-mcp init      [--dir DIR]
   praetore-mcp wrap      [--dir DIR] [--name SERVER] [--mode observe|enforce] [--no-report]
                          -- <command> [args...]
-  praetore-mcp install   [--client claude-desktop|cursor|vscode] [--config FILE] [--dir DIR]
-                         [--mode observe|enforce] [--dry-run] [--yes]
-  praetore-mcp uninstall [--client claude-desktop|cursor|vscode] [--config FILE] [--dry-run] [--yes]
+  praetore-mcp install   [--client claude-desktop|cursor|vscode|claude-code] [--config FILE]
+                         [--dir DIR] [--mode observe|enforce] [--dry-run] [--yes]
+  praetore-mcp uninstall [--client claude-desktop|cursor|vscode|claude-code] [--config FILE]
+                         [--dry-run] [--yes]
   praetore-mcp receipts  [--dir DIR] [--tail N]
   praetore-mcp verify    [--dir DIR] [--expected-head HEX] [--expected-approval-head HEX]
   praetore-mcp dashboard [--dir DIR] [--port N] [--expected-head HEX] [--expected-approval-head HEX]
@@ -133,14 +134,24 @@ Exit code: the server's; 127 if it cannot be started, 1 if the server was
 killed by a signal, 2 on a usage error. Ended by SIGINT or SIGTERM, wrap
 terminates by that signal (no exit code).";
 
-const INSTALL_HELP: &str = "Usage: praetore-mcp install [--client claude-desktop|cursor|vscode] [--config FILE] [--dir DIR]
-                            [--mode observe|enforce] [--dry-run] [--yes]
+const INSTALL_HELP: &str = "Usage: praetore-mcp install [--client claude-desktop|cursor|vscode|claude-code] [--config FILE]
+                            [--dir DIR] [--mode observe|enforce] [--dry-run] [--yes]
 
 Rewrites the stdio servers of an MCP client config so they run through
 `praetore-mcp wrap`. A timestamped backup is written next to each file first.
 Without --client, every detected client is processed.
 
-  --client NAME  claude-desktop, cursor or vscode
+claude-code (alias cc) reads ~/.claude.json (user scope) and ./.mcp.json
+(project scope, if present). It wraps an entry with no type or type stdio
+that has a command and no url; every other entry is listed as \"not wrapped
+(remote server)\". Local-scope servers (projects[...].mcpServers in
+~/.claude.json) are NOT wrapped: each one is listed, and install ends with
+a warning. Only the mcpServers value is rewritten; the rest of the file is
+kept byte for byte. If the file changes while install runs (Claude Code
+rewrites it), nothing is written: quit Claude Code and run install again.
+CLAUDE_CONFIG_DIR is ignored.
+
+  --client NAME  claude-desktop, cursor, vscode or claude-code
   --config FILE  config file to edit (needs --client)
   --dir DIR      home passed to `wrap` (must be initialized)
   --mode MODE    mode passed to `wrap` (default observe)
@@ -150,12 +161,14 @@ Without --client, every detected client is processed.
 Exit code: 0 on success or nothing to do, 1 if a config could not be read,
 parsed or written, or was not confirmed, 2 on a usage error.";
 
-const UNINSTALL_HELP: &str = "Usage: praetore-mcp uninstall [--client claude-desktop|cursor|vscode] [--config FILE] [--dry-run] [--yes]
+const UNINSTALL_HELP: &str = "Usage: praetore-mcp uninstall [--client claude-desktop|cursor|vscode|claude-code] [--config FILE]
+                              [--dry-run] [--yes]
 
 Restores the original commands of servers wrapped by `install`. A timestamped
-backup is written next to each file first.
+backup is written next to each file first. For claude-code, only the
+mcpServers value is rewritten.
 
-  --client NAME  claude-desktop, cursor or vscode
+  --client NAME  claude-desktop, cursor, vscode or claude-code
   --config FILE  config file to edit (needs --client)
   --dry-run      show the changes, write nothing
   --yes          do not ask for confirmation
@@ -662,11 +675,17 @@ fn cmd_install(args: &[String], uninstall: bool) -> Result<i32, String> {
     let client = parsed
         .value("--client")
         .map(|c| {
-            Client::parse(c)
-                .ok_or_else(|| format!("unknown client {c:?} (claude-desktop, cursor, vscode)"))
+            Client::parse(c).ok_or_else(|| format!("unknown client {c:?} ({})", Client::NAMES))
         })
         .transpose()?;
 
+    // `install --client claude-code` creates `~/.claude.json` when it is
+    // missing, so the `mcpServers` key exists. Only with that explicit
+    // client, never for a client found by default.
+    let creatable = match (uninstall, client) {
+        (false, Some(client)) => client.creatable_path(),
+        _ => None,
+    };
     let targets: Vec<(Client, PathBuf)> = match (parsed.value("--config"), client) {
         (Some(_), None) => return Err("--config needs --client to know the file format".into()),
         (Some(path), Some(client)) => vec![(client, PathBuf::from(path))],
@@ -675,7 +694,7 @@ fn cmd_install(args: &[String], uninstall: bool) -> Result<i32, String> {
             let mut found = Vec::new();
             for client in clients {
                 for path in client.default_paths() {
-                    if path.is_file() {
+                    if path.is_file() || creatable.as_ref() == Some(&path) {
                         found.push((client, path));
                     } else {
                         println!("  ({}: no config at {})", client.name(), path.shown());
@@ -685,6 +704,13 @@ fn cmd_install(args: &[String], uninstall: bool) -> Result<i32, String> {
             install::dedup_targets(found)
         }
     };
+    if targets.iter().any(|(c, _)| *c == Client::ClaudeCode)
+        && std::env::var_os("CLAUDE_CONFIG_DIR").is_some_and(|v| !v.is_empty())
+    {
+        eprintln!(
+            "praetore-mcp: warning: CLAUDE_CONFIG_DIR is set and is ignored; for claude-code only ~/.claude.json and ./.mcp.json are read (whether Claude Code then keeps its servers elsewhere is not verified)"
+        );
+    }
     if targets.is_empty() {
         println!("praetore-mcp: no MCP client configuration found; nothing to do.");
         return Ok(0);
@@ -727,16 +753,24 @@ fn cmd_install(args: &[String], uninstall: bool) -> Result<i32, String> {
     };
 
     let mut code = 0;
+    let mut not_governed = 0usize;
     for (client, path) in targets {
+        let missing = !path.exists() && creatable.as_ref() == Some(&path);
         let original = match fs::read_to_string(&path) {
             Ok(text) => text,
+            Err(_) if missing => String::new(),
             Err(error) => {
                 eprintln!("praetore-mcp: cannot read {}: {error}", path.shown());
                 code = 1;
                 continue;
             }
         };
-        let mut doc = match JsonValue::parse(&original) {
+        let parsed_doc = if missing {
+            Ok(JsonValue::Object(Vec::new()))
+        } else {
+            JsonValue::parse(&original)
+        };
+        let mut doc = match parsed_doc {
             Ok(doc) => doc,
             Err(error) => {
                 eprintln!(
@@ -747,10 +781,16 @@ fn cmd_install(args: &[String], uninstall: bool) -> Result<i32, String> {
                 continue;
             }
         };
-        let changes = match &wrap_target {
+        let mut changes = match &wrap_target {
             Some(target) => install::wrap_config(&mut doc, client, target),
             None => install::unwrap_config(&mut doc, client),
         };
+        if wrap_target.is_some()
+            && client == Client::ClaudeCode
+            && let Some(created) = install::ensure_servers_key(&mut doc, client)
+        {
+            changes.insert(0, created);
+        }
         print!(
             "[{}] {}",
             client.name(),
@@ -758,6 +798,11 @@ fn cmd_install(args: &[String], uninstall: bool) -> Result<i32, String> {
         );
         if install::refuses_success(&changes) {
             code = 1;
+        }
+        if wrap_target.is_some() && client == Client::ClaudeCode {
+            let local = install::local_scope_entries(&doc);
+            print!("{}", install::render_local_scope(&local));
+            not_governed += local.len();
         }
         if !changes.iter().any(install::Change::is_modification) {
             println!("  nothing to change");
@@ -771,7 +816,28 @@ fn cmd_install(args: &[String], uninstall: bool) -> Result<i32, String> {
             code = 1;
             continue;
         }
-        let updated = install::render_document(&doc, &original);
+        let updated = if client == Client::ClaudeCode {
+            match install::render_member(&original, &doc, client.servers_key()) {
+                Ok(text) => text,
+                Err(error) => {
+                    eprintln!("praetore-mcp: {}: {error}", path.shown());
+                    code = 1;
+                    continue;
+                }
+            }
+        } else {
+            install::render_document(&doc, &original)
+        };
+        if missing {
+            match crate::fsutil::create_private(&path, &updated) {
+                Ok(()) => println!("  created (0600)\n  restart {} to apply", client.name()),
+                Err(error) => {
+                    eprintln!("praetore-mcp: {error}");
+                    code = 1;
+                }
+            }
+            continue;
+        }
         match crate::fsutil::write_with_backup(&path, &original, &updated) {
             Ok((real, backup)) => println!(
                 "  updated{}; backup at {}\n  restart {} to apply",
@@ -783,11 +849,24 @@ fn cmd_install(args: &[String], uninstall: bool) -> Result<i32, String> {
                 backup.shown(),
                 client.name()
             ),
+            Err(error)
+                if client == Client::ClaudeCode && error.contains(crate::fsutil::CHANGED) =>
+            {
+                eprintln!(
+                    "praetore-mcp: {error}. Claude Code rewrites this file while it runs: quit Claude Code and run the command again."
+                );
+                code = 1;
+            }
             Err(error) => {
                 eprintln!("praetore-mcp: {error}");
                 code = 1;
             }
         }
+    }
+    if not_governed > 0 {
+        eprintln!(
+            "praetore-mcp: WARNING: {not_governed} Claude Code local-scope server(s) listed above are NOT wrapped and are NOT governed by praetore-mcp. This version does not wrap local scope. To govern one, remove it (`claude mcp remove NAME --scope local`), add it again with `--scope user` or `--scope project`, and run install again."
+        );
     }
     Ok(code)
 }

@@ -4,6 +4,24 @@
 
 ### Added
 
+- **praetore-mcp: `install --client claude-code`** (alias `cc`). Wraps the
+  stdio servers of `~/.claude.json` (user scope) and `./.mcp.json`
+  (project scope): an entry with no `type` or `"type": "stdio"`, a
+  `command` and no `url`. Remote entries (`http`, `sse`, `ws`,
+  `streamable-http`, `sdk`, an unknown `type`, any `url`) are listed as
+  `not wrapped (remote server)`. Local-scope servers are not wrapped: each
+  is listed, a local entry that overrides a wrapped user entry is named,
+  and `install` ends with a WARNING. Only the `mcpServers` value is
+  rewritten. A file that changes while `install` runs is not written.
+  `install` without `--client` now also processes `~/.claude.json` when it
+  exists.
+  The README section "Known limits of `install`" lists seven cases, for
+  Claude Code and in part for every client, in which what runs after
+  `install` can differ from what `install` reported. The first, an entry
+  wrapped for another binary, home or mode, ends with
+  `NOT governed by this home` and exit 1, for Claude Code too; the other
+  six are not closed in this version.
+
 - **Delegated authority to approve.** A tenant's delegation root, pinned
   in the optional `PRAETORE_GATEWAY_DELEGATION_FILE`, signs delegations to
   delegators and approvers with an exact list of action types, a validity

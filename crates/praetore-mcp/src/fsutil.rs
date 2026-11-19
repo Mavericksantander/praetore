@@ -83,6 +83,20 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// Part of the error `write_with_backup` returns when the file no longer
+/// holds what was read.
+pub const CHANGED: &str = "changed while praetore-mcp was working";
+
+/// Creates `path` with mode 0600 and `contents`; fails if it exists.
+pub fn create_private(path: &Path, contents: &str) -> Result<(), String> {
+    let mut file =
+        create_new(path, 0o600).map_err(|e| format!("cannot create {}: {e}", path.shown()))?;
+    file.write_all(contents.as_bytes())
+        .and_then(|()| file.sync_all())
+        .and_then(|()| sync_dir(parent_of(path)))
+        .map_err(|e| format!("cannot write {}: {e}", path.shown()))
+}
+
 /// Writes a 0600 backup of `contents` next to `real`, never overwriting.
 fn write_backup(real: &Path, contents: &str) -> Result<PathBuf, String> {
     let stamp = timestamp();
@@ -127,10 +141,7 @@ pub fn write_with_backup(
     let current =
         fs::read_to_string(&real).map_err(|e| format!("cannot read {}: {e}", real.shown()))?;
     if current != original {
-        return Err(format!(
-            "{} changed while praetore-mcp was working; nothing was written",
-            real.shown()
-        ));
+        return Err(format!("{} {CHANGED}; nothing was written", real.shown()));
     }
     let permissions = fs::metadata(&real)
         .map_err(|e| format!("cannot stat {}: {e}", real.shown()))?

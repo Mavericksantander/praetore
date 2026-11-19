@@ -7,8 +7,8 @@ full reference is the [README](README.md).
 
 ## What it does
 
-`praetore-mcp` sits between an MCP client (Claude Desktop, Cursor, VS Code)
-and a stdio MCP server. For every `tools/call` that goes **through a wrapped
+`praetore-mcp` sits between an MCP client (Claude Desktop, Cursor, VS Code,
+Claude Code) and a stdio MCP server. For every `tools/call` that goes **through a wrapped
 MCP server**, it evaluates your policy with the PRÆTORE engine and writes an
 Ed25519-signed receipt. In `enforce` mode, DENY and REQUIRE_APPROVAL calls
 are not forwarded. A DENY is an MCP tool error whose text is
@@ -153,7 +153,19 @@ on macOS; on Linux, `$XDG_CONFIG_HOME/Code/User/mcp.json` when
 when stdin is a terminal. Without a terminal they exit 1 and print
 `not modifying <file> without confirmation; re-run with --yes`, and they
 change nothing. Read the dry-run, then apply observe mode. Substitute
-`claude-desktop` or `vscode` for `cursor` if that is your client.
+`claude-desktop`, `vscode` or `claude-code` for `cursor` if that is your
+client.
+
+For Claude Code, add the server at user scope:
+`claude mcp add --scope user filesystem -- /absolute/path/to/npx -y @modelcontextprotocol/server-filesystem@2.3.0 /absolute/path/to/test-dir`.
+Without `--scope`, `claude mcp add` writes to local scope, which `install`
+does not wrap: it lists those servers as
+`not wrapped (local scope, project <path>)` and ends with a WARNING. Quit
+Claude Code before `install`: it rewrites `~/.claude.json` while it runs,
+and if the file changes while `install` works, nothing is written. The
+README section "Claude Code" says what was checked. The README section
+"Known limits of `install`" lists the cases in which what runs after
+`install` can differ from what `install` reported.
 
 ```sh
 praetore-mcp install --client cursor --mode observe --dry-run
