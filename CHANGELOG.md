@@ -101,6 +101,11 @@
 
 ### Fixed
 
+- **praetore-mcp: `policy coverage` treats a `tool` Prefix as a selector.**
+  The tool name is already known, so the decision matches the engine,
+  including case and unsafe values (`..`, `%`, NUL). It used to leave the
+  rule in the argument column and report default deny.
+
 - **praetore-mcp install: a wrapped entry for another binary, home or mode is not "already wrapped".**
   It prints `NOT governed by this home; run uninstall, then install` and
   exits 1, including `--dry-run`, and does not change the file. Switching
