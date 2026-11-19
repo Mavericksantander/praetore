@@ -101,6 +101,12 @@
 
 ### Fixed
 
+- **praetore-mcp install: a wrapped entry for another binary, home or mode is not "already wrapped".**
+  It prints `NOT governed by this home; run uninstall, then install` and
+  exits 1, including `--dry-run`, and does not change the file. Switching
+  observe to enforce is uninstall, then install. Editing `--mode` in the
+  client config is not the switch: the next install still exits 1.
+
 - **A repeated journal INSERT no longer takes a position (migration 0025).**
   Before 0025, `INSERT ... ON CONFLICT DO NOTHING` or `DO UPDATE` on a
   primary key already in `praetore.execution_journal` discarded the row

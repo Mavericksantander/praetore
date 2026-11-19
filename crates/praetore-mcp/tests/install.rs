@@ -150,3 +150,66 @@ fn refuses_jsonc_without_modifying() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("not strict JSON"));
     assert_eq!(fs::read_to_string(&config).unwrap(), text);
 }
+
+/// Contrato p8: exit 1 y "NOT governed by this home", con --dry-run y con --yes,
+/// sin tocar el archivo. Mata el mutante que quita `code = 1` en cmd_install.
+#[test]
+fn six_a_entries_exit_1_in_dry_run_and_yes() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let home_str = home.to_str().unwrap();
+    assert!(run(&["init", "--dir", home_str]).status.success());
+    let config = temp.path().join("mcp.json");
+    let exe = fs::canonicalize(env!("CARGO_BIN_EXE_praetore-mcp"))
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let entry = |command: &str, dir: &str, mode: &str| {
+        format!(
+            r#"{{"mcpServers":{{"s":{{"command":"{command}","args":["wrap","--dir","{dir}","--name","s","--mode","{mode}","--","npx","-y","srv"]}}}}}}"#
+        )
+    };
+    let install = |last: &str| {
+        run(&[
+            "install",
+            "--client",
+            "cursor",
+            "--config",
+            config.to_str().unwrap(),
+            "--dir",
+            home_str,
+            "--mode",
+            "enforce",
+            last,
+        ])
+    };
+    let cases = [
+        entry("/tmp/evil/praetore-mcp", home_str, "enforce"),
+        entry(&exe, "/tmp/attacker-home", "observe"),
+        entry(&exe, home_str, "observe"),
+        entry("praetore-mcp", home_str, "enforce"),
+    ];
+    for text in cases {
+        for last in ["--dry-run", "--yes"] {
+            fs::write(&config, &text).unwrap();
+            let out = install(last);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert_eq!(out.status.code(), Some(1), "{last} {text}\n{stdout}");
+            assert!(stdout.contains("NOT governed by this home"), "{stdout}");
+            assert!(!stdout.contains("already wrapped"), "{stdout}");
+            assert_eq!(fs::read_to_string(&config).unwrap(), text);
+        }
+    }
+    let same = entry(&exe, home_str, "enforce");
+    for last in ["--dry-run", "--yes"] {
+        fs::write(&config, &same).unwrap();
+        let out = install(last);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(0), "{stdout}");
+        assert!(
+            stdout.contains("already wrapped by praetore-mcp"),
+            "{stdout}"
+        );
+    }
+}
