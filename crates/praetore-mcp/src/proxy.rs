@@ -570,13 +570,15 @@ fn fingerprint(raw: &[u8]) -> String {
 }
 
 /// Whether a line this proxy cannot parse might name a `safety*` tool for
-/// a more lenient parser (G7): the text, or any string literal in it read
-/// with JSON escapes decoded (lone surrogates become U+FFFD), contains
-/// `safety` in any ASCII case. Deliberately broad: it only applies to lines
-/// that are already malformed.
+/// a more lenient parser (G7). True when the raw text contains `safety` in
+/// any ASCII case, or when a JSON5 string or unquoted key does after its
+/// escapes are decoded (lone surrogates become U+FFFD). Comments are skipped
+/// while reading those names: an escape inside a comment is not a key.
+/// Deliberately broad for the raw text. It only applies to lines that are
+/// already malformed.
 pub fn may_name_safety_tool(raw: &[u8]) -> bool {
     let text = String::from_utf8_lossy(raw);
-    contains_safety(&text) || string_literals(&text).iter().any(|s| contains_safety(s))
+    contains_safety(&text) || json5_texts(&text).iter().any(|s| contains_safety(s))
 }
 
 fn contains_safety(text: &str) -> bool {
@@ -585,47 +587,230 @@ fn contains_safety(text: &str) -> bool {
         .any(|window| window.eq_ignore_ascii_case(b"safety"))
 }
 
-/// Every `"..."` literal in `text`, decoded leniently: unknown escapes are
-/// kept as the escaped character, an unterminated literal runs to the end.
-fn string_literals(text: &str) -> Vec<String> {
-    let mut literals = Vec::new();
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        if c != '"' {
+/// JSON5 strings (single or double quotes) and unquoted keys in `text`, in
+/// source order, decoded leniently. An unknown escape keeps the escaped
+/// character. An unterminated string runs to the end. A `//` or `/* */`
+/// comment outside a string is not text. A trailing comma is not a token.
+fn json5_texts(text: &str) -> Vec<String> {
+    let mut scan = Json5::new(text);
+    let mut texts = Vec::new();
+    while !scan.done() {
+        if scan.skip_comment() {
             continue;
         }
-        let mut units: Vec<u16> = Vec::new();
-        while let Some(c) = chars.next() {
-            match c {
-                '"' => break,
-                '\\' => match chars.next() {
-                    Some('u') => {
-                        let hex: String = chars.by_ref().take(4).collect();
-                        match u16::from_str_radix(&hex, 16) {
-                            Ok(unit) if hex.len() == 4 => units.push(unit),
-                            _ => units.extend(hex.encode_utf16()),
-                        }
+        match scan.peek() {
+            Some('"' | '\'') => {
+                let quote = scan.bump().expect("peeked quote");
+                texts.push(scan.string(quote));
+            }
+            Some(c) if is_ident_start(c) || scan.rest().starts_with("\\u") => {
+                if let Some(name) = scan.identifier() {
+                    texts.push(name);
+                } else {
+                    scan.bump();
+                }
+            }
+            Some(_) => {
+                scan.bump();
+            }
+            None => break,
+        }
+    }
+    texts
+}
+
+struct Json5<'a> {
+    text: &'a str,
+    at: usize,
+}
+
+impl<'a> Json5<'a> {
+    fn new(text: &'a str) -> Self {
+        Self { text, at: 0 }
+    }
+
+    fn done(&self) -> bool {
+        self.at >= self.text.len()
+    }
+
+    fn rest(&self) -> &'a str {
+        &self.text[self.at..]
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.rest().chars().next()
+    }
+
+    fn bump(&mut self) -> Option<char> {
+        let c = self.peek()?;
+        self.at += c.len_utf8();
+        Some(c)
+    }
+
+    /// A `//` or `/* */` comment at the cursor. An unclosed block comment
+    /// runs to the end of the text.
+    fn skip_comment(&mut self) -> bool {
+        if self.rest().starts_with("//") {
+            self.at += 2;
+            while let Some(c) = self.bump() {
+                if c == '\n' {
+                    break;
+                }
+            }
+            return true;
+        }
+        if self.rest().starts_with("/*") {
+            self.at += 2;
+            loop {
+                if self.rest().starts_with("*/") {
+                    self.at += 2;
+                    break;
+                }
+                if self.bump().is_none() {
+                    break;
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    fn string(&mut self, quote: char) -> String {
+        let mut units = Vec::new();
+        while let Some(c) = self.peek() {
+            if c == quote {
+                self.bump();
+                break;
+            }
+            self.bump();
+            if c != '\\' {
+                push_utf16(&mut units, c);
+                continue;
+            }
+            let Some(esc) = self.bump() else {
+                break;
+            };
+            match esc {
+                'b' => units.push(0x08),
+                'f' => units.push(0x0c),
+                'n' => units.push(u16::from(b'\n')),
+                'r' => units.push(u16::from(b'\r')),
+                't' => units.push(u16::from(b'\t')),
+                'v' => units.push(0x0b),
+                '0' => units.push(0),
+                '\n' | '\u{2028}' | '\u{2029}' => {}
+                '\r' => {
+                    if self.peek() == Some('\n') {
+                        self.bump();
                     }
-                    Some('n') => units.push(u16::from(b'\n')),
-                    Some('t') => units.push(u16::from(b'\t')),
-                    Some('r') => units.push(u16::from(b'\r')),
-                    Some('b') => units.push(0x08),
-                    Some('f') => units.push(0x0c),
-                    Some(other) => {
-                        let mut buffer = [0; 2];
-                        units.extend_from_slice(other.encode_utf16(&mut buffer));
+                }
+                'x' => self.hex_byte(&mut units),
+                'u' => self.hex_unit(&mut units),
+                other => push_utf16(&mut units, other),
+            }
+        }
+        String::from_utf16_lossy(&units)
+    }
+
+    /// `\xHH` as one code unit. Fewer than two hex digits are kept as text.
+    fn hex_byte(&mut self, units: &mut Vec<u16>) {
+        let hex = self.take_hex(2);
+        match u8::from_str_radix(&hex, 16) {
+            Ok(byte) if hex.len() == 2 => units.push(u16::from(byte)),
+            _ => units.extend(hex.encode_utf16()),
+        }
+    }
+
+    /// `\uXXXX` as one UTF-16 code unit, including a lone surrogate. Fewer
+    /// than four hex digits are kept as text.
+    fn hex_unit(&mut self, units: &mut Vec<u16>) {
+        let hex = self.take_hex(4);
+        match u16::from_str_radix(&hex, 16) {
+            Ok(unit) if hex.len() == 4 => units.push(unit),
+            _ => units.extend(hex.encode_utf16()),
+        }
+    }
+
+    /// Up to `n` hex digits. Stops before a non-hex character, so a closing
+    /// quote is left for [`Self::string`].
+    fn take_hex(&mut self, n: usize) -> String {
+        let mut hex = String::new();
+        for _ in 0..n {
+            match self.peek() {
+                Some(c) if c.is_ascii_hexdigit() => {
+                    hex.push(c);
+                    self.bump();
+                }
+                _ => break,
+            }
+        }
+        hex
+    }
+
+    /// An unquoted JSON5 key, including `\u` escapes in the identifier.
+    /// `None` when the cursor is not an identifier (the caller advances).
+    fn identifier(&mut self) -> Option<String> {
+        let start = self.at;
+        let mut units = Vec::new();
+        loop {
+            if self.rest().starts_with("\\u") {
+                let saved = self.at;
+                self.at += 2;
+                let hex = self.take_hex(4);
+                match u16::from_str_radix(&hex, 16) {
+                    Ok(unit) if hex.len() == 4 && ident_unit(unit, units.is_empty()) => {
+                        units.push(unit);
                     }
-                    None => break,
-                },
-                other => {
-                    let mut buffer = [0; 2];
-                    units.extend_from_slice(other.encode_utf16(&mut buffer));
+                    _ => {
+                        self.at = saved;
+                        break;
+                    }
+                }
+            } else {
+                match self.peek() {
+                    Some(c) if units.is_empty() && is_ident_start(c) => {
+                        self.bump();
+                        push_utf16(&mut units, c);
+                    }
+                    Some(c) if !units.is_empty() && is_ident_part(c) => {
+                        self.bump();
+                        push_utf16(&mut units, c);
+                    }
+                    _ => break,
                 }
             }
         }
-        literals.push(String::from_utf16_lossy(&units));
+        if self.at == start {
+            None
+        } else {
+            Some(String::from_utf16_lossy(&units))
+        }
     }
-    literals
+}
+
+fn push_utf16(units: &mut Vec<u16>, c: char) {
+    let mut buffer = [0; 2];
+    units.extend_from_slice(c.encode_utf16(&mut buffer));
+}
+
+fn is_ident_start(c: char) -> bool {
+    c.is_alphabetic() || c == '_' || c == '$'
+}
+
+fn is_ident_part(c: char) -> bool {
+    is_ident_start(c) || c.is_ascii_digit()
+}
+
+/// A UTF-16 code unit from a JSON5 `\u` escape, as an identifier character.
+fn ident_unit(unit: u16, first: bool) -> bool {
+    let Some(c) = char::from_u32(u32::from(unit)) else {
+        return false;
+    };
+    if first {
+        is_ident_start(c)
+    } else {
+        is_ident_part(c)
+    }
 }
 
 /// Refuses a malformed line that may name a `safety*` tool, in both modes
@@ -1371,13 +1556,128 @@ mod tests {
     #[test]
     fn string_literals_decode_escapes_leniently() {
         assert_eq!(
-            string_literals(r#"{"a":"\u0073afety","b":"x\ud800y","c":"unterminated"#),
+            json5_texts(r#"{"a":"\u0073afety","b":"x\ud800y","c":"unterminated"#),
             ["a", "safety", "b", "x\u{fffd}y", "c", "unterminated"]
         );
         assert!(!may_name_safety_tool(
             br#"{"name":"write_file","x":1,"x":2}"#
         ));
         assert!(may_name_safety_tool(br#"{"name":"\u0073\u0061fety:halt"}"#));
+    }
+
+    /// JSON5 can spell `safety` only after decoding: an unquoted key with
+    /// `\u`, a single-quoted string, a `\x` escape, a comment that would
+    /// swallow the next quote, a trailing comma, and a line continuation.
+    /// The raw bytes do not contain the six letters. Those lines are refused
+    /// in both modes, and the warning still names the line by its SHA-256.
+    /// An escape that sits inside a comment is not a name.
+    #[test]
+    fn json5_safety_keys_are_refused_in_both_modes() {
+        assert_eq!(
+            json5_texts(r#"{'a':'\x73afety','b':"\x65",'c':'\u0073till'}"#),
+            ["a", "safety", "b", "e", "c", "still"]
+        );
+        assert_eq!(json5_texts(r"{saf\u0065ty:1,}"), ["safety"]);
+        assert_eq!(json5_texts(r#"{/* "\x73 */ "\x73afety"}"#), ["safety"]);
+        assert_eq!(json5_texts(r#"{/* "\x73afety" */ "write"}"#), ["write"]);
+        assert_eq!(json5_texts("{\"a\":\"saf\\\r\nety\"}"), ["a", "safety"]);
+
+        let encoded: &[(&str, &[u8])] = &[
+            ("unquoted key with unicode escapes", br#"{saf\u0065ty: 1,}"#),
+            (
+                "unquoted key made only of unicode escapes",
+                br#"{\u0073\u0061\u0066\u0065\u0074\u0079: "halt"}"#,
+            ),
+            (
+                "single-quoted unicode escape and a trailing comma",
+                br#"{'name': '\u0073afety:halt',}"#,
+            ),
+            (
+                "single-quoted hex escapes",
+                br#"{'name': '\x73\x61\x66\x65\x74\x79:halt'}"#,
+            ),
+            (
+                "double-quoted hex escape",
+                br#"{"name":"\x73afety:halt","x":1,"x":2}"#,
+            ),
+            (
+                "comment, unquoted key, single quotes, trailing comma",
+                br#"{ /* policy */ name: '\x73afety:halt', }"#,
+            ),
+            (
+                "a comment quote must not hide the next string",
+                br#"{/* "\x73 */ "\x73afety:halt"}"#,
+            ),
+            (
+                "a line comment must not hide the next string",
+                b"{// \"\\x73\n\"\\x73afety:halt\"}",
+            ),
+            ("line continuation", b"{\"name\":\"saf\\\nety:halt\"}"),
+        ];
+        for (label, raw) in encoded {
+            assert!(
+                !raw.windows(6)
+                    .any(|window| window.eq_ignore_ascii_case(b"safety")),
+                "{label} contains the letters before decoding"
+            );
+            assert!(
+                matches!(classify(raw), Classified::Unparseable(_)),
+                "{label} parsed as JSON"
+            );
+            assert!(may_name_safety_tool(raw), "{label}");
+            let mark = fingerprint(raw);
+            for mode in [Mode::Observe, Mode::Enforce] {
+                let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
+                let out = handle_client_line(raw, mode, "fs", &mut eval);
+                assert!(out.to_server.is_none(), "{label} {}", mode.as_str());
+                let reply: Value =
+                    serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
+                assert_eq!(reply["error"]["code"], -32700, "{label}");
+                let warning = &out.warnings[0];
+                assert!(
+                    warning.contains("may name a safety* tool") && warning.contains(&mark),
+                    "{label} {}: {warning}",
+                    mode.as_str()
+                );
+                assert!(eval.calls.is_empty(), "{label}");
+            }
+        }
+
+        // The same JSON5 forms, with an ordinary tool, stay a warning in
+        // observe: comments, single quotes and a trailing comma are not
+        // themselves a safety name.
+        let ordinary = br#"{ /* cfg */ method: 'tools/call', params: {name: 'write_file',}, }"#;
+        assert!(!may_name_safety_tool(ordinary));
+        let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
+        let out = handle_client_line(ordinary, Mode::Observe, "fs", &mut eval);
+        assert_eq!(
+            out.to_server.as_deref(),
+            Some(forward_unchanged(ordinary).as_slice())
+        );
+        assert!(out.to_client.is_none());
+        assert!(
+            out.warnings[0].contains("WARNING unparseable client line")
+                && out.warnings[0].contains(&fingerprint(ordinary)),
+            "{:?}",
+            out.warnings
+        );
+        assert!(eval.calls.is_empty());
+
+        // `\x73afety` inside a comment is comment text, not a key or a string.
+        let commented = br#"{/* "\x73afety:halt" */ "name": "write_file"}"#;
+        assert!(
+            !commented
+                .windows(6)
+                .any(|window| window.eq_ignore_ascii_case(b"safety"))
+        );
+        assert!(!may_name_safety_tool(commented));
+        let line_comment = b"{// \"\\x73afety:halt\"\n\"name\": \"write_file\"}";
+        assert!(
+            !line_comment
+                .windows(6)
+                .any(|window| window.eq_ignore_ascii_case(b"safety"))
+        );
+        assert!(!may_name_safety_tool(line_comment));
     }
 
     #[test]

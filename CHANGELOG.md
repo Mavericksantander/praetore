@@ -119,6 +119,15 @@
 
 ### Fixed
 
+- **praetore-mcp: a JSON5 line can no longer hide a `safety*` name.** An
+  unparseable client line was refused in both modes when the raw text, or a
+  double-quoted JSON string, contained `safety`. A name written as an
+  unquoted key (`saf\u0065ty`), in single quotes, or with a `\x` escape was
+  forwarded in observe, including when a comment or a trailing comma sat
+  beside it. Those forms are decoded and refused in both modes. The warning
+  still carries the line's SHA-256 and length. An escape inside a comment
+  is not a name.
+
 - **A late dispatch's HTTP 410 names the signed close.** `POST
   /v1/approvals/{tenant}/{agent}/{request}/dispatch` after the approval
   window closed now answers 410 `approved_claim_expired` and includes the

@@ -862,11 +862,13 @@ Things to know:
   duplicate key, a lone UTF-16 surrogate escape, nesting deeper than 128)
   are never forwarded silently. Other parsers may accept them, so they are
   handled without a receipt:
-  * a line that may name a `safety*` tool (the text, or any string in it
-    with JSON escapes decoded, contains `safety` in any ASCII case) is
-    **refused in both modes**, even for a declared Safety action, because it
-    cannot be checked against the policy (G7). The client gets JSON-RPC error
-    `-32700`;
+  * a line that may name a `safety*` tool is **refused in both modes**, even
+    for a declared Safety action, because it cannot be checked against the
+    policy (G7). The raw text, a JSON5 string (single or double quotes, `\u`
+    and `\x` escapes, a backslash before a line break) or an unquoted key
+    contains `safety` in any ASCII case. Comments and trailing commas are
+    skipped while reading those names; an escape inside a comment is not a
+    name. The client gets JSON-RPC error `-32700`;
   * any other such line is refused in enforce, and forwarded in observe with
     a stderr warning that gives the parse error, the SHA-256 and the length
     of the line.
