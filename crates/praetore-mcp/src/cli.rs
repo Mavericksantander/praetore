@@ -756,6 +756,9 @@ fn cmd_install(args: &[String], uninstall: bool) -> Result<i32, String> {
             client.name(),
             install::render_changes(&path, &changes)
         );
+        if install::refuses_success(&changes) {
+            code = 1;
+        }
         if !changes.iter().any(install::Change::is_modification) {
             println!("  nothing to change");
             continue;
