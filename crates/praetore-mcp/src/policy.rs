@@ -1243,3 +1243,117 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod review_pr225 {
+    //! Differential check: `coverage` against the engine for a `tool` Prefix
+    //! selector. Edges: equal, longer, case, separators, unsafe values
+    //! (`..`, `%`, NUL), and the empty prefix the engine rejects.
+    use super::*;
+    use crate::store::default_policy;
+    use praetore_core::{Action, AgentId, AgentIdentity, Authority, DecisionOutcome};
+    use serde_json::json;
+
+    fn engine(policy: &Policy, tool: &str) -> Result<Outcome, String> {
+        let id = AgentId::new();
+        let agent = AgentIdentity::new(id.clone(), b"test-public-key".to_vec(), "ed25519").unwrap();
+        let authority = Authority::new(id, "praetore-root", vec![CAPABILITY.to_owned()]);
+        let action = Action::new(
+            ACTION_TYPE,
+            Some("fs".into()),
+            json!({"server": "fs", "tool": tool, "arguments": {}}),
+        )
+        .map_err(|e| format!("action: {e}"))?;
+        let mission = policy
+            .classify(action)
+            .map_err(|e| format!("classify: {e}"))?
+            .into_mission()
+            .map_err(|e| format!("mission: {e:?}"))?;
+        let decision = policy
+            .evaluate(&agent, &authority, &mission)
+            .map_err(|e| format!("evaluate: {e}"))?;
+        Ok(match decision.outcome {
+            DecisionOutcome::Allow => Outcome::Allow,
+            DecisionOutcome::RequireApproval => Outcome::RequireApproval,
+            DecisionOutcome::Deny => Outcome::Deny,
+        })
+    }
+
+    #[test]
+    fn coverage_agrees_with_engine_on_tool_prefix_grid() {
+        let prefixes = [
+            "wr", "write", "writer", "w", "WR", "Wr", "wr/", "wr.", "x", "é", "",
+        ];
+        let tools = [
+            "write",
+            "wr",
+            "w",
+            "WRITE",
+            "Write",
+            "writer",
+            "wr/x",
+            "wr.x",
+            "wr/../x",
+            "wr\\..\\x",
+            "wr%2e",
+            "wr\u{0}x",
+            "..",
+            "éx",
+            "x",
+        ];
+        let effects = [
+            ("allow", PolicyEffect::Allow),
+            ("deny", PolicyEffect::Deny),
+            ("approval", PolicyEffect::RequireApproval),
+        ];
+        let mut mismatches = Vec::new();
+        let mut checked = 0;
+        let mut skipped = Vec::new();
+        for (label, effect) in &effects {
+            for prefix in prefixes {
+                let mut policy = default_policy();
+                if *effect != PolicyEffect::Allow {
+                    policy.rules.push(
+                        PolicyRule::new("allow-fs", ACTION_TYPE, PolicyEffect::Allow)
+                            .with_capability(CAPABILITY)
+                            .with_target("fs"),
+                    );
+                }
+                policy.rules.push(
+                    PolicyRule::new("under-test", ACTION_TYPE, effect.clone())
+                        .with_capability(CAPABILITY)
+                        .with_target("fs")
+                        .with_parameter_condition(PolicyCondition::prefix("tool", prefix)),
+                );
+                for tool in tools {
+                    let engine = engine(&policy, tool);
+                    let report = coverage(&policy, "fs", &[tool.to_owned()]);
+                    let cov = (report[0].outcome, report[0].conditional.len());
+                    match engine {
+                        Err(error) => {
+                            skipped.push(format!("{label} {prefix:?} {tool:?}: {error}"));
+                        }
+                        Ok(engine) => {
+                            checked += 1;
+                            if cov != (Some(engine), 0) {
+                                mismatches.push(format!(
+                                    "{label} prefix {prefix:?} tool {tool:?}: engine {engine:?} coverage {cov:?}"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        println!("checked={checked} skipped={}", skipped.len());
+        for line in &skipped {
+            println!("skipped: {line}");
+        }
+        assert!(
+            mismatches.is_empty(),
+            "{} mismatches:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+    }
+}
