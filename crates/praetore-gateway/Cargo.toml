@@ -32,7 +32,7 @@ praetore-sandbox-fs = { path = "../praetore-sandbox-fs" }
 # G7 runtime tests count engine calls with the test-only probe.
 praetore-core = { path = "../praetore-core", features = ["test-probe"] }
 proptest = "1"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "3", features = ["rand_core"] }
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 

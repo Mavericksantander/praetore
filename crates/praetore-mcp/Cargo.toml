@@ -19,7 +19,7 @@ path = "src/lib.rs"
 
 [dependencies]
 caseless = "0.2.2"
-ed25519-dalek = "2.2.0"
+ed25519-dalek = "3.0.0"
 hex = "0.4.3"
 pdf-writer = "0.15"
 praetore-core = { path = "../praetore-core" }

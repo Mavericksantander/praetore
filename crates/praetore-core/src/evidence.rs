@@ -1,5 +1,5 @@
 use ed25519_dalek::{Signature, Signer, SigningKey};
-use rand_core::OsRng;
+use getrandom::{SysRng, rand_core::UnwrapErr};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -88,7 +88,7 @@ impl Clone for EvidenceAttesterKey {
 impl EvidenceAttesterKey {
     pub fn generate() -> Self {
         Self {
-            signing_key: SigningKey::generate(&mut OsRng),
+            signing_key: SigningKey::generate(&mut UnwrapErr(SysRng)),
         }
     }
 

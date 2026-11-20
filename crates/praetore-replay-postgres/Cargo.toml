@@ -27,6 +27,6 @@ uuid = { version = "1.18", features = ["v4"] }
 # G7: the HTTP entry point test drives the gateway router and counts engine
 # calls with the test-only probe.
 axum = { version = "0.8", default-features = false }
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "3", features = ["rand_core"] }
 praetore-core = { path = "../praetore-core", features = ["test-probe"] }
 tower = { version = "0.5", features = ["util"] }
