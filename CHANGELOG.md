@@ -112,6 +112,17 @@
 
 ### Changed
 
+- **praetore-mcp: a session report whose receipts journal is empty says so
+  plainly.** When `verify` fails because the journal has no entries and
+  every receipt the session named is gone, the PDF headline, the JSON
+  header (`verify.summary`) and the `report` / `wrap` summary say that the
+  journal is empty or was deleted or truncated after those receipts were
+  written, and that every receipt this session named is gone. `VERIFY
+  FAILED` is unchanged. A journal that still has entries, with some
+  session receipts missing, keeps the previous wording. The GUIDE says to
+  close the client and `wrap` before deleting the journals for a clean
+  demo or test.
+
 - **Observability: praetore-mcp observe warnings for ambiguous client lines
   include the SHA-256 and length of the raw line.** The warning names the
   line the same way the warning for an unparseable line does, so the

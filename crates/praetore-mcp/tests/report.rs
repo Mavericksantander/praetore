@@ -5,7 +5,10 @@
 use praetore_mcp::{
     approvals::{self, HumanOutcome},
     receipts,
-    report::STATEMENT,
+    report::{
+        EMPTY_JOURNAL_SUMMARY, EMPTY_JOURNAL_SUMMARY_JOURNAL, EMPTY_JOURNAL_SUMMARY_RECEIPTS,
+        STATEMENT,
+    },
     store::Home,
 };
 use serde_json::{Value, json};
@@ -532,10 +535,76 @@ fn a_removed_receipt_is_reported_as_missing() {
             .len(),
         1
     );
+    assert_eq!(document["header"]["verify"]["journal_receipts"], 1);
+    let summary = document["header"]["verify"]["summary"].as_str().unwrap();
+    assert!(summary.contains("problem(s) found"), "{summary}");
+    assert!(!summary.contains("The journal is empty"), "{summary}");
+    let pdf = fs::read(json_path.with_extension("pdf")).unwrap();
+    assert!(has(&pdf, "VERIFY FAILED"));
+    assert!(has(&pdf, "problem(s) found"));
     assert!(has(
-        &fs::read(json_path.with_extension("pdf")).unwrap(),
-        "VERIFY FAILED"
+        &pdf,
+        "1 receipt(s) of this session are no longer in the journal"
     ));
+    assert!(!has(&pdf, EMPTY_JOURNAL_SUMMARY_JOURNAL));
+    assert!(has(
+        &pdf,
+        "Do not rely on these records until the journal is checked against an external copy of the heads."
+    ));
+}
+
+#[test]
+fn an_empty_journal_is_said_plainly_in_the_report() {
+    let (_temp, home) = init_home();
+    let out = wrap(
+        &home,
+        &[],
+        &[
+            call(20, "echo", json!({"text": "one"})),
+            call(21, "echo", json!({"text": "two"})),
+        ],
+    );
+    assert!(out.status.success(), "{out:?}");
+    for path in praetore_mcp::journal::journal_files(&home.receipts_dir()).unwrap() {
+        fs::write(&path, "").unwrap();
+    }
+
+    let out = run(&["report", "--dir", dir(&home), "--last"], "");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(stdout.contains("verify FAILED"), "{stdout}");
+    assert!(
+        err.contains(EMPTY_JOURNAL_SUMMARY),
+        "stderr should carry the summary: {err}"
+    );
+
+    let json_path = regen_reports(&home).remove(0);
+    let document = document(&json_path);
+    assert_eq!(document["header"]["verify"]["result"], "failed");
+    assert_eq!(document["header"]["verify"]["journal_receipts"], 0);
+    assert_eq!(document["header"]["verify"]["failures_total"], 0);
+    assert_eq!(document["header"]["verify"]["session_receipts"], 0);
+    assert_eq!(
+        document["header"]["verify"]["missing_evidence_ids"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        document["header"]["verify"]["summary"],
+        EMPTY_JOURNAL_SUMMARY
+    );
+    let pdf = fs::read(json_path.with_extension("pdf")).unwrap();
+    assert!(has(&pdf, "VERIFY FAILED"));
+    assert!(has(&pdf, EMPTY_JOURNAL_SUMMARY_JOURNAL));
+    assert!(has(&pdf, EMPTY_JOURNAL_SUMMARY_RECEIPTS));
+    assert!(has(
+        &pdf,
+        "Do not rely on these records until the journal is checked against an external copy of the heads."
+    ));
+    assert!(!has(&pdf, "problem(s) found"));
 }
 
 #[test]

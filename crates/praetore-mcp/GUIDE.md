@@ -509,7 +509,16 @@ summary (ALLOW, DENY, held, approved, expired), the calls, the approvals
 with the approver key id and time, the result of `verify`, both heads and
 the SHA-256 of the JSON file. Times are local with UTC next to them. If
 `verify` fails, the first page says `VERIFY FAILED` and both files are
-still written.
+still written. When the receipts journal has no entries and every receipt
+the session named is gone, the headline, the JSON header (`verify.summary`)
+and the CLI summary say that the journal is empty or was deleted or
+truncated after those receipts were written, and that every receipt this
+session named is gone. The result is still `VERIFY FAILED`: an emptied
+journal and a manipulated one look the same.
+
+To start a clean demo or test, close the MCP client and every `wrap`
+process before deleting the journals. A report of a session whose journal
+was emptied while that session was still open fails `verify` by design.
 
 The JSON header and the PDF name the build that wrote them: the version
 for a release build (`0.3.6`), or the version with `-dev+<short commit>`
