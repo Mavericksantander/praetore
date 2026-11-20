@@ -560,8 +560,11 @@ close is never replaced. The new files are
 `session-<start UTC>-<id>.regen-<now UTC>.json` and `.pdf`, and the new
 header names the close report in `regenerated_from`. They read the journal
 as it is now and run `verify` again, so after a change to the journal the
-close report and the new one can disagree, and both stay. `--last` and
-`--session` only look at reports written at close.
+close report and the new one can disagree, and both stay. Evidence ids
+recorded at close, including those already missing from the journal, are
+kept, so a receipt that was missing then is still missing in the new
+report and `verify` fails. `--last` and `--session` only look at reports
+written at close.
 
 SIGINT and SIGTERM on macOS and Linux: with reports on, `wrap` waits up to
 300 ms for the server to end, forwards the signal to it, waits up to 2 s
