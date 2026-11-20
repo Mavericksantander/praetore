@@ -71,11 +71,12 @@ Commands that praetore-mcp prints for you to copy (`approve` and `reject`
 for a held call, in the tool error, in `approvals` and in the dashboard;
 `init` and the `policy` suggestions) start with the real absolute path of
 the running binary (symlinks resolved, so `<dir>/praetore-mcp` with the
-link above) and pass `--dir` as an absolute path, both in single quotes
-for a POSIX shell. They run as printed even when the binary is not on your
-`PATH`. If the binary's path cannot be read, they start with
-`praetore-mcp`, which needs it on `PATH`. On Windows they are written as
-before.
+link above) and pass `--dir` as an absolute path. Each path is printed
+bare when a POSIX shell will not interpret it, and in single quotes only
+when it is empty or holds whitespace or a shell-special character. They
+run as printed even when the binary is not on your `PATH`. If the binary's
+path cannot be read, they start with `praetore-mcp`, which needs it on
+`PATH`. On Windows they are written as before.
 
 A path or a name that holds a control character (an escape sequence,
 `\r`, `\n`) or a zero-width or bidi character is never printed as is. In
@@ -533,13 +534,13 @@ When the report is written, `wrap` prints where to see it, after its path:
 
 ```
 praetore-mcp: session report: /home/user/.praetore/mcp/reports/session-20261116T030240Z-560f69f7.pdf
-praetore-mcp: to see and download it, run '<dir>/praetore-mcp' dashboard --dir '/home/user/.praetore/mcp' --port 8787 and open http://127.0.0.1:8787/#/sessions/560f69f7 (a dashboard on another port: #/sessions/560f69f7 there)
+praetore-mcp: to see and download it, run <dir>/praetore-mcp dashboard --dir /home/user/.praetore/mcp --port 8787 and open http://127.0.0.1:8787/#/sessions/560f69f7 (a dashboard on another port: #/sessions/560f69f7 there)
 ```
 
 The dashboard writes nothing under the home, so `wrap` cannot tell whether
 one is running, or on which port, without connecting to a local port. It
 does not try: it prints the command (absolute binary path and `--dir`,
-quoted for a POSIX shell) with `--port 8787`, the default port, and the
+as POSIX shell words) with `--port 8787`, the default port, and the
 link to the page of the session on that port. If a dashboard on that port
 is already open, the link works as it is; for a dashboard on another port,
 open `#/sessions/<id>` on that one.
@@ -654,7 +655,7 @@ Read these before relying on anything above.
    receipts.
 3. **Local approval is cooperative.** In enforce mode a REQUIRE_APPROVAL
    call is not forwarded. The tool error names an approval id and the
-   command to run, for example `'<dir>/praetore-mcp' approve <id> --dir '/home/user/.praetore/mcp'`
+   command to run, for example `<dir>/praetore-mcp approve <id> --dir /home/user/.praetore/mcp`
    (the real paths of the running binary, `<dir>` being the directory the
    archive was extracted to, and of the home).
    `praetore-mcp approvals` lists pending calls (server, tool, a short form

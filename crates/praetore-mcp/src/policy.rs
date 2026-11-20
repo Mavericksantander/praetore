@@ -627,17 +627,11 @@ fn plain_tool_name(name: &str) -> bool {
 }
 
 /// `value` as one POSIX shell word: unchanged when it only has characters
-/// a shell does not interpret, otherwise in single quotes.
+/// a shell does not interpret, otherwise in single quotes. Invisible
+/// characters are not rewritten here; Unix printed paths go through
+/// [`crate::commands::quote`] instead.
 pub(crate) fn shell_word(value: &str) -> String {
-    if !value.is_empty()
-        && value.bytes().all(|b| {
-            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b':' | b'=')
-        })
-    {
-        value.to_owned()
-    } else {
-        format!("'{}'", value.replace('\'', r"'\''"))
-    }
+    crate::commands::quote_if_needed(value)
 }
 
 /// The part of a rule id taken from a name: MCP tool name characters, at

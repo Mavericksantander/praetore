@@ -119,6 +119,17 @@
 
 ### Fixed
 
+- **praetore-mcp: printed commands quote a path only when a shell would
+  interpret it.** `approve`, `reject`, `policy allow` suggestions from
+  `policy coverage`, and the other commands built by `commands::quote`
+  (the running binary and `--dir`) are printed bare for a typical path
+  such as `/Users/me/.local/bin/praetore-mcp`. An empty argument, or one
+  with whitespace or a shell-special character, is still written in
+  single quotes (`'` as `'\''`). Control, zero-width and bidi characters
+  still use `$'...'`. Copying a command and losing a quote around a
+  typical path no longer makes zsh treat the whole line as one path.
+  Windows is unchanged.
+
 - **praetore-mcp: a JSON5 line can no longer hide a `safety*` name.** An
   unparseable client line was refused in both modes when the raw text, or a
   double-quoted JSON string, contained `safety`. A name written as an
