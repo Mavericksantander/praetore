@@ -1272,3 +1272,169 @@ fn an_unreadable_expiry_is_expired_in_the_report_and_the_dashboard() {
         .unwrap();
     assert_eq!(held["approval"], "expired");
 }
+
+fn journal_len(home: &Home) -> usize {
+    receipts::read_journal(home).map_or(0, |lines| lines.len())
+}
+
+fn empty_receipts_journal(home: &Home) {
+    let files = praetore_mcp::journal::journal_files(&home.receipts_dir()).unwrap();
+    assert!(!files.is_empty(), "no receipts journal files to empty");
+    for path in &files {
+        fs::write(path, "").unwrap();
+    }
+    assert!(
+        journal_lines(home).is_empty(),
+        "journal was not empty after wipe"
+    );
+}
+
+fn missing_ids(document: &Value) -> Vec<String> {
+    document["header"]["verify"]["missing_evidence_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// Sends one `echo` call on an already initialized wrap stdin and waits
+/// until the receipts journal has `expect` lines.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn send_echo(
+    home: &Home,
+    stdin: &mut std::process::ChildStdin,
+    id: i64,
+    text: &str,
+    expect: usize,
+) {
+    stdin
+        .write_all(format!("{}\n", call(id, "echo", json!({"text": text}))).as_bytes())
+        .unwrap();
+    stdin.flush().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while journal_len(home) != expect {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "journal length {}, expected {expect} after echo id={id}",
+            journal_len(home)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Closes the client stdin so wrap ends itself and writes the session
+/// report. Returns stderr.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn close_wrap(
+    mut child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    err: std::thread::JoinHandle<String>,
+    what: &str,
+) -> String {
+    drop(stdin);
+    let status = wait_within(&mut child, std::time::Duration::from_secs(20), what);
+    let err = err.join().unwrap();
+    assert!(
+        status.success(),
+        "{what}: wrap exit {status:?}, stderr={err}"
+    );
+    assert!(
+        err.contains("session report:"),
+        "{what}: no close report in stderr: {err}"
+    );
+    err
+}
+
+/// If the receipts journal is emptied while wrap is still open, the close
+/// report records the session's evidence ids as missing (they lived only
+/// in memory). `praetore-mcp report` must keep those ids when it
+/// regenerates, so verify stays failed and the command exits 1. Taking
+/// ids only from the close report's `receipts` array would drop them and
+/// report a pass.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regenerating_after_a_mid_session_journal_wipe_still_reports_the_missing_receipts() {
+    let (_temp, home) = init_home();
+    let (child, mut stdin, err, _server) = wrap_in_session(&home, &[]);
+    send_echo(&home, &mut stdin, 21, "two", 2);
+    assert_eq!(journal_len(&home), 2);
+
+    empty_receipts_journal(&home);
+    close_wrap(child, stdin, err, "mid-session wipe close");
+
+    let close_path = json_reports(&home);
+    assert_eq!(close_path.len(), 1, "{close_path:?}");
+    let close = document(&close_path[0]);
+    assert_eq!(close["header"]["verify"]["result"], "failed");
+    let missing = missing_ids(&close);
+    assert_eq!(missing.len(), 2, "{missing:?}");
+    assert_eq!(close["receipts"].as_array().unwrap().len(), 0);
+    assert_eq!(close["header"]["verify"]["journal_receipts"], 0);
+    assert!(close["header"]["receipt_journal_head"].is_null());
+
+    let out = run(&["report", "--dir", dir(&home), "--last"], "");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "report must exit 1 on verify failed; stdout={stdout}; stderr={stderr}"
+    );
+    assert!(stdout.contains("verify FAILED"), "stdout={stdout}");
+
+    let regen = regen_reports(&home);
+    assert_eq!(regen.len(), 1, "{regen:?}");
+    let regen_doc = document(&regen[0]);
+    assert_eq!(regen_doc["header"]["verify"]["result"], "failed");
+    assert_eq!(regen_doc["header"]["verify"]["journal_receipts"], 0);
+    assert_eq!(missing_ids(&regen_doc), missing);
+    assert_eq!(regen_doc["receipts"].as_array().unwrap().len(), 0);
+}
+
+/// Same wipe, then one more receipt before close: the new receipt is in
+/// the close report, the earlier ones are only in `missing_evidence_ids`.
+/// Regenerating must still fail verify for those earlier ids and exit 1.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regenerating_after_a_mid_session_wipe_and_a_later_receipt_keeps_the_earlier_missing_ids() {
+    let (_temp, home) = init_home();
+    let (child, mut stdin, err, _server) = wrap_in_session(&home, &[]);
+    send_echo(&home, &mut stdin, 21, "two", 2);
+    assert_eq!(journal_len(&home), 2);
+
+    empty_receipts_journal(&home);
+    send_echo(&home, &mut stdin, 30, "after-wipe", 1);
+    assert_eq!(journal_len(&home), 1);
+
+    close_wrap(child, stdin, err, "mid-session wipe then later receipt");
+
+    let close_path = json_reports(&home);
+    assert_eq!(close_path.len(), 1, "{close_path:?}");
+    let close = document(&close_path[0]);
+    assert_eq!(close["header"]["verify"]["result"], "failed");
+    let missing = missing_ids(&close);
+    assert_eq!(missing.len(), 2, "{missing:?}");
+    assert_eq!(close["receipts"].as_array().unwrap().len(), 1);
+    assert_eq!(close["header"]["verify"]["journal_receipts"], 1);
+    assert_eq!(close["header"]["verify"]["session_receipts"], 1);
+
+    let out = run(&["report", "--dir", dir(&home), "--last"], "");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "report must exit 1 on verify failed; stdout={stdout}; stderr={stderr}"
+    );
+    assert!(stdout.contains("verify FAILED"), "stdout={stdout}");
+
+    let regen = regen_reports(&home);
+    assert_eq!(regen.len(), 1, "{regen:?}");
+    let regen_doc = document(&regen[0]);
+    assert_eq!(regen_doc["header"]["verify"]["result"], "failed");
+    assert_eq!(regen_doc["header"]["verify"]["journal_receipts"], 1);
+    assert_eq!(regen_doc["header"]["verify"]["session_receipts"], 1);
+    assert_eq!(missing_ids(&regen_doc), missing);
+    assert_eq!(regen_doc["receipts"].as_array().unwrap().len(), 1);
+}

@@ -119,6 +119,17 @@
 
 ### Fixed
 
+- **praetore-mcp: `report` keeps evidence ids already missing at close.**
+  Regenerating a session took ids only from the close report's `receipts`
+  array. If the journal was emptied while `wrap` was still open, that
+  array was empty (or held only a receipt written after the wipe), so
+  `praetore-mcp report` printed `verify passed` and exited 0 even though
+  the close report had named the missing ids and failed `verify`. The
+  regenerated report now includes `header.verify.missing_evidence_ids` as
+  well, so those receipts stay missing, `verify` fails, and `report`
+  exits 1, as it does for any other failed verify. The wording of the
+  summary is unchanged.
+
 - **praetore-mcp: a JSON5 line can no longer hide a `safety*` name.** An
   unparseable client line was refused in both modes when the raw text, or a
   double-quoted JSON string, contained `safety`. A name written as an
