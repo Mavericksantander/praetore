@@ -6,7 +6,7 @@ use crate::{
     error::{PraetoreError, Result},
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use rand_core::OsRng;
+use getrandom::{SysRng, rand_core::UnwrapErr};
 use sha2::{Digest, Sha256};
 
 const AGENT_KEY_FINGERPRINT_DOMAIN: &[u8] = b"PRAETORE_AGENT_KEY_V1\0ed25519\0";
@@ -154,7 +154,7 @@ impl std::fmt::Debug for AgentKeyPair {
 impl AgentKeyPair {
     pub fn generate() -> Self {
         Self {
-            signing_key: SigningKey::generate(&mut OsRng),
+            signing_key: SigningKey::generate(&mut UnwrapErr(SysRng)),
         }
     }
 
