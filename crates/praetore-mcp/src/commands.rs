@@ -11,6 +11,7 @@
 //! quote on a typical path then still pastes as the same command. When the
 //! binary's path cannot be read (or is not UTF-8) the command starts with
 //! `praetore-mcp`, which needs the binary on `PATH`.
+//! Control and invisible characters are the exception and use `$'...'` (bash, zsh and ksh, not POSIX `sh`).
 //!
 //! On other platforms (Windows) nothing changes: commands start with
 //! `praetore-mcp` and `--dir` is written as before, because POSIX quoting
@@ -371,34 +372,37 @@ mod tests {
         std::fs::remove_dir_all(&temp).unwrap();
     }
 
-    /// POSIX `sh` recovers one argument from the printed word.
+    /// `shell` recovers one argument from the printed word.
     ///
-    /// `sh -c 'printf %s "$1"' _ <word>` compares exact bytes. A `\n` in
-    /// dash's printf format is the letter n, so the delimiter is not `%s\n`.
+    /// `{shell} -c 'printf %s "$1"' _ <word>` compares exact bytes. The
+    /// outer shell is `shell`, so `$'...'` is parsed only when that shell
+    /// understands it. A `\n` in dash's printf format is the letter n, so
+    /// the delimiter is not `%s\n`.
     #[cfg(unix)]
-    fn posix_word(word: &str, dir: &Path) -> Result<Vec<u8>, String> {
-        let script = format!("sh -c 'printf %s \"$1\"' _ {word}");
-        let out = Command::new("sh")
+    fn shell_word(shell: &str, word: &str, dir: &Path) -> Result<Vec<u8>, String> {
+        let script = format!("{shell} -c 'printf %s \"$1\"' _ {word}");
+        let out = Command::new(shell)
             .arg("-c")
             .arg(&script)
             .current_dir(dir)
             .env("HOME", "/tmp/audit-quote-home")
             .env("IFS", " \t\n")
             .output()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| format!("{shell}: {error}"))?;
         if out.status.success() {
             Ok(out.stdout)
         } else {
             Err(format!(
-                "exit {:?}: {}",
+                "{shell} exit {:?}: {}",
                 out.status.code(),
                 String::from_utf8_lossy(&out.stderr)
             ))
         }
     }
 
-    /// The printed word, re-parsed by POSIX `sh`, is the original argument.
-    /// A value `sh` would expand, split or comment out is not left bare.
+    /// Portable words round-trip through POSIX `sh`. Control and invisible
+    /// characters round-trip through bash, and through zsh when it is
+    /// installed. A missing zsh is reported and skipped; it is not a pass.
     #[cfg(unix)]
     #[test]
     fn quote_posix_sh_round_trips_shell_edge_cases() {
@@ -408,7 +412,7 @@ mod tests {
             std::fs::write(dir.join(name), b"").unwrap();
         }
 
-        let cases: &[(&str, &str)] = &[
+        let portable: &[(&str, &str)] = &[
             ("space", "a b"),
             ("spaces", "  x  "),
             ("single quote", "it's"),
@@ -420,9 +424,6 @@ mod tests {
             ("backtick", "`echo AUDIT_EXPANDED`"),
             ("backslash", "a\\b"),
             ("only backslash", "\\"),
-            ("newline", "a\nb"),
-            ("only newline", "\n"),
-            ("tab", "a\tb"),
             ("empty", ""),
             ("leading dash", "-n"),
             ("only dash", "-"),
@@ -439,6 +440,11 @@ mod tests {
             ("unicode n", "cañón"),
             ("emoji", "ok😀"),
             ("rtl letters", "مرحبا"),
+        ];
+        let invisible: &[(&str, &str)] = &[
+            ("newline", "a\nb"),
+            ("only newline", "\n"),
+            ("tab", "a\tb"),
             ("nbsp", "a\u{00a0}b"),
             ("zero width", "a\u{200b}b"),
             ("rtl mark", "a\u{200f}b"),
@@ -446,23 +452,92 @@ mod tests {
         ];
 
         let mut failures = Vec::new();
-        for (label, value) in cases {
+        let mut sh_ok = 0usize;
+        for (label, value) in portable {
             let quoted = quote(value);
-            let bare = posix_word(value, &dir);
+            let bare = shell_word("sh", value, &dir);
             let bare_preserved = bare.as_deref() == Ok(value.as_bytes());
             if !bare_preserved && quoted == *value {
                 failures.push(format!(
                     "{label}: left unquoted but sh does not preserve it ({bare:?})"
                 ));
+                continue;
             }
-            match posix_word(&quoted, &dir) {
-                Ok(got) if got == value.as_bytes() => {}
+            match shell_word("sh", &quoted, &dir) {
+                Ok(got) if got == value.as_bytes() => sh_ok += 1,
                 other => failures.push(format!(
                     "{label}: quote={quoted:?} sh={other:?} want={value:?}"
                 )),
             }
         }
+
+        // Absent zsh is skipped on purpose. A zsh that exists and does not
+        // answer the probe is a failure, not a skip and not a pass.
+        let zsh_ready = match Command::new("zsh").arg("-c").arg("printf zsh").output() {
+            Ok(out) if out.status.success() && out.stdout == b"zsh" => true,
+            Ok(out) => {
+                failures.push(format!(
+                    "zsh: installed but probe failed: exit {:?} stdout {} stderr {}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                ));
+                false
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                failures.push(format!("zsh: {error}"));
+                false
+            }
+        };
+        let zsh_absent = !zsh_ready && !failures.iter().any(|line| line.starts_with("zsh:"));
+        let invisible_labels: Vec<&str> = invisible.iter().map(|(label, _)| *label).collect();
+        let mut bash_ok = 0usize;
+        let mut zsh_ok = 0usize;
+        for (label, value) in invisible {
+            let quoted = quote(value);
+            if !quoted.starts_with("$'") {
+                failures.push(format!(
+                    "{label}: control/invisible word is not $'...': {quoted:?}"
+                ));
+                continue;
+            }
+            match shell_word("bash", &quoted, &dir) {
+                Ok(got) if got == value.as_bytes() => bash_ok += 1,
+                other => failures.push(format!(
+                    "{label}: quote={quoted:?} bash={other:?} want={value:?}"
+                )),
+            }
+            if zsh_ready {
+                match shell_word("zsh", &quoted, &dir) {
+                    Ok(got) if got == value.as_bytes() => zsh_ok += 1,
+                    other => failures.push(format!(
+                        "{label}: quote={quoted:?} zsh={other:?} want={value:?}"
+                    )),
+                }
+            }
+        }
         std::fs::remove_dir_all(&dir).unwrap();
+        eprintln!(
+            "quote-edge: sh passed {sh_ok}/{} portable cases",
+            portable.len()
+        );
+        eprintln!(
+            "quote-edge: bash passed {bash_ok}/{} invisible cases",
+            invisible.len()
+        );
+        if zsh_absent {
+            eprintln!(
+                "quote-edge: zsh not installed; skipped {} invisible cases: {}",
+                invisible.len(),
+                invisible_labels.join(", ")
+            );
+        } else {
+            eprintln!(
+                "quote-edge: zsh passed {zsh_ok}/{} invisible cases",
+                invisible.len()
+            );
+        }
         assert!(
             failures.is_empty(),
             "{} edge case(s) failed:\n{}",
