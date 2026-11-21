@@ -1009,7 +1009,8 @@ fn last_closed(files: &[PathBuf]) -> Option<&PathBuf> {
 }
 
 /// Writes a new report of a session from the JSON file written at close
-/// (which names the session's receipts) and the journal as it is now.
+/// (which names the session's receipts and any evidence ids already
+/// missing at close) and the journal as it is now.
 /// `Last` is the session that closed last. The heads recorded at close are
 /// kept; `verify` runs again. The new pair is written next to the close
 /// report, which is never replaced.
@@ -1057,12 +1058,22 @@ pub fn regenerate(home: &Home, selector: &Selector) -> Result<Generated, String>
         started_at: parse_time(&header["started_at"]).ok_or_else(|| bad("invalid started_at"))?,
         ended_at: parse_time(&header["ended_at"]).ok_or_else(|| bad("invalid ended_at"))?,
     };
-    let evidence_ids = document["receipts"]
+    let mut evidence_ids: Vec<String> = document["receipts"]
         .as_array()
         .ok_or_else(|| bad("no receipts"))?
         .iter()
         .filter_map(|receipt| evidence_id_of(receipt).map(str::to_owned))
         .collect();
+    // Receipts copied at close omit ids already gone from the journal.
+    // Those ids are in the header; keep them so regenerate still fails.
+    let mut seen: BTreeSet<String> = evidence_ids.iter().cloned().collect();
+    if let Some(missing) = header["verify"]["missing_evidence_ids"].as_array() {
+        for id in missing.iter().filter_map(|id| id.as_str()) {
+            if seen.insert(id.to_owned()) {
+                evidence_ids.push(id.to_owned());
+            }
+        }
+    }
     let close_heads = Heads {
         receipt: header["receipt_journal_head"]["next_seq"]
             .as_u64()
