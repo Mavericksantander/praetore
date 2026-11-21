@@ -174,6 +174,23 @@ jobs:
         if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
         run: git diff --check ${{ github.event.pull_request.base.sha || github.event.before }}...HEAD
 
+  # These tests spawn `praetore-mcp approve` or `reject` (a pty for
+  # approve, or the printed reject line). They are #[ignore], so
+  # `cargo test --workspace` does not run them; this job is the only one
+  # that does.
+  mcp-approval-cli:
+    name: praetore-mcp approve/reject tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Ignored approvals that execute approve or reject
+        run: |
+          set -euo pipefail
+          output="$(cargo test --locked -p praetore-mcp --test approvals -- --ignored 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok. 15 passed" <<<"$output" || { echo "::error::expected 15 ignored approve/reject tests"; exit 1; }
+
   hook-evidence:
     name: Claude Code hook evidence (sets 03, 04, 05)
     runs-on: ubuntu-latest
