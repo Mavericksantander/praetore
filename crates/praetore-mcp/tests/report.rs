@@ -1159,8 +1159,8 @@ fn an_unreadable_approval_journal_is_said_in_the_header_and_the_pdf() {
 }
 
 /// After "session report: <pdf>", wrap names the command that starts the
-/// dashboard on this home (absolute, quoted for sh) and the page of the
-/// session there.
+/// dashboard on this home (absolute, as POSIX shell words) and the page of
+/// the session there.
 #[test]
 fn the_close_line_names_the_dashboard_command_and_the_session_link() {
     let (_temp, home) = init_home();
@@ -1174,9 +1174,9 @@ fn the_close_line_names_the_dashboard_command_and_the_session_link() {
     let exe = Path::new(bin()).canonicalize().unwrap();
     let root = home.root.canonicalize().unwrap();
     let expected = format!(
-        "praetore-mcp: to see and download it, run '{}' dashboard --dir '{}' --port 8787 and open http://127.0.0.1:8787/#/sessions/{id} (a dashboard on another port: #/sessions/{id} there)",
-        exe.display(),
-        root.display()
+        "praetore-mcp: to see and download it, run {} dashboard --dir {} --port 8787 and open http://127.0.0.1:8787/#/sessions/{id} (a dashboard on another port: #/sessions/{id} there)",
+        praetore_mcp::commands::quote(exe.to_str().unwrap()),
+        praetore_mcp::commands::quote(root.to_str().unwrap())
     );
     let lines: Vec<&str> = err.lines().collect();
     let report = lines

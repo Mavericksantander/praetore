@@ -1723,7 +1723,7 @@ function approvalCard(p) {
   card.append(el("p", { class: "muted" }, t("exact_args_hint")));
 
   // The commands come from the server (absolute binary path and --dir,
-  // quoted for a POSIX shell): the page shows and copies them unchanged.
+  // as POSIX shell words): the page shows and copies them unchanged.
   const commands = p.commands && typeof p.commands.approve === "string" ? p.commands : null;
   if (!expired && commands) {
     card.append(el("div", { class: "label-sm" }, t("cli_hint")));
