@@ -360,7 +360,8 @@ fn enforce_holds_the_call_and_names_the_exact_command() {
     // (here the test binary); the page shows and copies them unchanged.
     let state = praetore_mcp::dashboard::state(&home, None);
     let served = praetore_mcp::commands::program();
-    assert_eq!(served, program());
+    let test_binary = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+    assert_eq!(served, quote(test_binary.to_str().unwrap()));
     assert_eq!(
         state["pending"][0]["commands"]["approve"],
         format!("{served} approve {id} --dir {}", quoted_dir(&home)).as_str()
