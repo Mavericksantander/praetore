@@ -383,7 +383,10 @@ fn lock_registration(
     tenant_id: Uuid,
     role: &str,
 ) -> Result<(), SafetyStoreError> {
-    client.batch_execute("BEGIN")?;
+    // READ COMMITTED whatever the database or role default: under
+    // REPEATABLE READ or SERIALIZABLE the transaction snapshot outlives
+    // the statement, and `release_lock_snapshot` could not drop it.
+    client.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED")?;
     let locked = client.query(
         "SELECT t.tenant_id FROM praetore.safety_ingest_tenants t \
          WHERE t.tenant_id = $1 \
@@ -428,15 +431,17 @@ fn lock_registration(
 /// Drops the snapshot the locking statement left open.
 ///
 /// `query` uses the extended protocol and leaves its unnamed portal in
-/// place until the transaction ends (a simple-protocol statement drops
-/// that portal; see `CreatePortal` in postgres.c). The portal holds the
+/// place until the transaction ends. A simple Query message destroys
+/// that portal (PostgreSQL 16 protocol §55.2.3). The portal holds the
 /// statement snapshot, whose xmin is the oldest xid in progress when the
 /// statement started, often older than the xid `FOR UPDATE` assigns a
 /// moment later. Kept, that xmin is the horizon this idle session holds
 /// back for the whole renewal interval. The row lock is the
 /// transaction's, not the snapshot's, so a simple-protocol statement
 /// removes the portal and leaves `backend_xmin` null. `backend_xid`
-/// stays, and that is the horizon until the next renewal.
+/// stays, and that is the horizon until the next renewal. That is true
+/// in READ COMMITTED, which is how `lock_registration` opens: under
+/// REPEATABLE READ the transaction snapshot outlives the portal.
 fn release_lock_snapshot(client: &mut Client) -> Result<(), SafetyStoreError> {
     client.batch_execute("SELECT pg_catalog.pg_backend_pid()")?;
     Ok(())

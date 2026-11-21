@@ -9531,6 +9531,59 @@ mod g1_safety {
         assert!(!lock.is_held(), "the terminated lock still reports held");
     }
 
+    /// With the database's default isolation at REPEATABLE READ, the idle
+    /// lock session still holds no snapshot of an older in-progress
+    /// transaction, after taking the lock and after a renewal: the lock's
+    /// transaction is READ COMMITTED whatever the default.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_safety_tenant_lock_holds_no_older_snapshot_under_a_repeatable_read_default() {
+        let (scratch, role_a, _runtime) = scratch_with_roles();
+        scratch
+            .connect()
+            .batch_execute(&format!(
+                "ALTER DATABASE {} SET default_transaction_isolation = 'repeatable read'",
+                scratch.name
+            ))
+            .unwrap();
+        let mut older = scratch.connect();
+        older.batch_execute("BEGIN").unwrap();
+        let older_xid: String = older
+            .query_one("SELECT pg_catalog.pg_current_xact_id()::text", &[])
+            .unwrap()
+            .get(0);
+        let mut client = connect_scratch_as(&scratch, &role_a.name);
+        let isolation: String = client
+            .query_one("SHOW default_transaction_isolation", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(isolation, "repeatable read");
+        let mut lock = TenantLock::acquire(client, TENANT_A).unwrap();
+        let mut admin = scratch.connect();
+        let xmin = |admin: &mut postgres::Client| -> Option<String> {
+            admin
+                .query_one(
+                    "SELECT backend_xmin::text FROM pg_stat_activity \
+                     WHERE usename = $1 AND state = 'idle in transaction'",
+                    &[&role_a.name],
+                )
+                .unwrap()
+                .get(0)
+        };
+        assert_ne!(
+            xmin(&mut admin).as_deref(),
+            Some(older_xid.as_str()),
+            "the lock session kept the snapshot of in-progress transaction {older_xid}"
+        );
+        lock.renew().unwrap();
+        assert_ne!(
+            xmin(&mut admin).as_deref(),
+            Some(older_xid.as_str()),
+            "the renewed lock kept the snapshot of in-progress transaction {older_xid}"
+        );
+        drop(older);
+    }
+
     /// M97-1: renewing ends the lock's transaction and takes the lock in a
     /// new one, so its transaction id changes and the old one is gone; the
     /// idle lock session holds no snapshot older than its own xid. An
