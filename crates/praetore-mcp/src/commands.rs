@@ -370,4 +370,104 @@ mod tests {
         }
         std::fs::remove_dir_all(&temp).unwrap();
     }
+
+    /// POSIX `sh` recovers one argument from the printed word.
+    ///
+    /// `sh -c 'printf %s "$1"' _ <word>` compares exact bytes. A `\n` in
+    /// dash's printf format is the letter n, so the delimiter is not `%s\n`.
+    #[cfg(unix)]
+    fn posix_word(word: &str, dir: &Path) -> Result<Vec<u8>, String> {
+        let script = format!("sh -c 'printf %s \"$1\"' _ {word}");
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .current_dir(dir)
+            .env("HOME", "/tmp/audit-quote-home")
+            .env("IFS", " \t\n")
+            .output()
+            .map_err(|error| error.to_string())?;
+        if out.status.success() {
+            Ok(out.stdout)
+        } else {
+            Err(format!(
+                "exit {:?}: {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            ))
+        }
+    }
+
+    /// The printed word, re-parsed by POSIX `sh`, is the original argument.
+    /// A value `sh` would expand, split or comment out is not left bare.
+    #[cfg(unix)]
+    #[test]
+    fn quote_posix_sh_round_trips_shell_edge_cases() {
+        let dir = std::env::temp_dir().join(format!("praetore-quote-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["zed", "q", "a", "ab"] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+
+        let cases: &[(&str, &str)] = &[
+            ("space", "a b"),
+            ("spaces", "  x  "),
+            ("single quote", "it's"),
+            ("only single quote", "'"),
+            ("double quote", "a\"b"),
+            ("only double quote", "\""),
+            ("dollar", "$HOME"),
+            ("dollar paren", "$(echo AUDIT_EXPANDED)"),
+            ("backtick", "`echo AUDIT_EXPANDED`"),
+            ("backslash", "a\\b"),
+            ("only backslash", "\\"),
+            ("newline", "a\nb"),
+            ("only newline", "\n"),
+            ("tab", "a\tb"),
+            ("empty", ""),
+            ("leading dash", "-n"),
+            ("only dash", "-"),
+            ("double dash", "--dir"),
+            ("equals", "="),
+            ("assignment", "FOO=bar"),
+            ("glob star", "*"),
+            ("glob question", "?"),
+            ("glob class", "a[b]"),
+            ("hash", "#"),
+            ("hash word", "#hash"),
+            ("tilde", "~"),
+            ("tilde path", "~/x"),
+            ("unicode n", "cañón"),
+            ("emoji", "ok😀"),
+            ("rtl letters", "مرحبا"),
+            ("nbsp", "a\u{00a0}b"),
+            ("zero width", "a\u{200b}b"),
+            ("rtl mark", "a\u{200f}b"),
+            ("rtl override", "a\u{202e}b"),
+        ];
+
+        let mut failures = Vec::new();
+        for (label, value) in cases {
+            let quoted = quote(value);
+            let bare = posix_word(value, &dir);
+            let bare_preserved = bare.as_deref() == Ok(value.as_bytes());
+            if !bare_preserved && quoted == *value {
+                failures.push(format!(
+                    "{label}: left unquoted but sh does not preserve it ({bare:?})"
+                ));
+            }
+            match posix_word(&quoted, &dir) {
+                Ok(got) if got == value.as_bytes() => {}
+                other => failures.push(format!(
+                    "{label}: quote={quoted:?} sh={other:?} want={value:?}"
+                )),
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            failures.is_empty(),
+            "{} edge case(s) failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
 }
