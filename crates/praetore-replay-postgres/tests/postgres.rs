@@ -9533,8 +9533,10 @@ mod g1_safety {
 
     /// M97-1: renewing ends the lock's transaction and takes the lock in a
     /// new one, so its transaction id changes and the old one is gone; the
-    /// idle lock session holds no snapshot older than its own xid. If
-    /// another session holds the row in the gap, the renewal fails with
+    /// idle lock session holds no snapshot older than its own xid. An
+    /// older transaction stays in progress for both checks: its xid would
+    /// be `backend_xmin` if the locking statement's snapshot were kept.
+    /// If another session holds the row in the gap, the renewal fails with
     /// LockBusy and does not move `renewed_at`. `COMMIT` only wakes a
     /// waiter: the row stays free until that session locks it again, so
     /// the renewal waits for that lock before trying `NOWAIT`.
@@ -9542,6 +9544,14 @@ mod g1_safety {
     #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
     fn postgres_safety_tenant_lock_renewal_releases_its_xid_and_can_lose_the_lock() {
         let (scratch, role_a, _runtime) = scratch_with_roles();
+        // Cluster-wide: any in-progress xid, in this database or another,
+        // is the horizon of a snapshot taken while it runs.
+        let mut older = scratch.connect();
+        older.batch_execute("BEGIN").unwrap();
+        let older_xid: String = older
+            .query_one("SELECT pg_catalog.pg_current_xact_id()::text", &[])
+            .unwrap()
+            .get(0);
         let mut lock =
             TenantLock::acquire(connect_scratch_as(&scratch, &role_a.name), TENANT_A).unwrap();
         let mut admin = scratch.connect();
@@ -9567,13 +9577,21 @@ mod g1_safety {
         let (xid_1, xmin_1, state) = lock_session(&mut admin);
         let xid_1 = xid_1.expect("the row lock assigns a transaction id");
         assert_eq!(state, "idle in transaction");
-        println!("lock session: backend_xid {xid_1}, backend_xmin {xmin_1:?}");
+        println!(
+            "lock session: backend_xid {xid_1}, backend_xmin {xmin_1:?} (other xid {older_xid})"
+        );
         // Between renewals the session holds its own transaction id and no
         // older snapshot: the horizon it holds back is its own xid, for at
-        // most one renewal interval.
+        // most one renewal interval. `older_xid` is still in progress, so a
+        // retained snapshot would show it here.
         assert!(
             xmin_1.is_none() || xmin_1.as_deref() == Some(xid_1.as_str()),
             "the lock session holds an older snapshot: {xmin_1:?}"
+        );
+        assert_ne!(
+            xmin_1.as_deref(),
+            Some(older_xid.as_str()),
+            "the lock session kept the snapshot of in-progress transaction {older_xid}"
         );
         let before = lock.renewed_at();
         lock.renew().unwrap();
@@ -9581,8 +9599,16 @@ mod g1_safety {
         let (xid_2, xmin_2, _) = lock_session(&mut admin);
         let xid_2 = xid_2.expect("the renewed lock has a transaction id");
         assert_ne!(xid_1, xid_2, "the renewal ends the old transaction");
-        println!("after renew: backend_xid {xid_2}, backend_xmin {xmin_2:?}");
+        println!(
+            "after renew: backend_xid {xid_2}, backend_xmin {xmin_2:?} (other xid {older_xid})"
+        );
         assert!(xmin_2.is_none() || xmin_2.as_deref() == Some(xid_2.as_str()));
+        assert_ne!(
+            xmin_2.as_deref(),
+            Some(older_xid.as_str()),
+            "the renewed lock kept the snapshot of in-progress transaction {older_xid}"
+        );
+        drop(older);
         let old_open: bool = admin
             .query_one(
                 "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE backend_xid::text = $1)",

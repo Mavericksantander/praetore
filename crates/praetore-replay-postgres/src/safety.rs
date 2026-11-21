@@ -408,7 +408,10 @@ fn lock_registration(
         }
     };
     let error = match locked {
-        Ok(rows) if rows.len() == 1 => return Ok(()),
+        Ok(rows) if rows.len() == 1 => match release_lock_snapshot(client) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        },
         Ok(_) => refused(false),
         Err(error) if error.code() == Some(&postgres::error::SqlState::LOCK_NOT_AVAILABLE) => {
             refused(true)
@@ -420,6 +423,23 @@ fn lock_registration(
     };
     let _ = client.batch_execute("ROLLBACK");
     Err(error)
+}
+
+/// Drops the snapshot the locking statement left open.
+///
+/// `query` uses the extended protocol and leaves its unnamed portal in
+/// place until the transaction ends (a simple-protocol statement drops
+/// that portal; see `CreatePortal` in postgres.c). The portal holds the
+/// statement snapshot, whose xmin is the oldest xid in progress when the
+/// statement started, often older than the xid `FOR UPDATE` assigns a
+/// moment later. Kept, that xmin is the horizon this idle session holds
+/// back for the whole renewal interval. The row lock is the
+/// transaction's, not the snapshot's, so a simple-protocol statement
+/// removes the portal and leaves `backend_xmin` null. `backend_xid`
+/// stays, and that is the horizon until the next renewal.
+fn release_lock_snapshot(client: &mut Client) -> Result<(), SafetyStoreError> {
+    client.batch_execute("SELECT pg_catalog.pg_backend_pid()")?;
+    Ok(())
 }
 
 /// How long [`TenantLock::is_held`] waits for the server.
@@ -466,9 +486,11 @@ impl TenantLock {
     /// Ends the transaction that holds the lock and takes it again in a
     /// new one (`COMMIT; BEGIN; SELECT ... FOR UPDATE NOWAIT`), so that no
     /// transaction id stays open longer than the renewal interval (VACUUM
-    /// and freezing are held back only that long). Between the two another
-    /// session may take it: then [`SafetyStoreError::LockBusy`], and the
-    /// holder must stop writing until it takes the lock again.
+    /// and freezing are held back only that long). The locking statement's
+    /// snapshot is released, so the horizon is this xid and not an older
+    /// snapshot xmin. Between the two another session may take it: then
+    /// [`SafetyStoreError::LockBusy`], and the holder must stop writing
+    /// until it takes the lock again.
     ///
     /// `COMMIT` wakes a session waiting on the row, but it does not grant
     /// that session the row. The row is free until the woken session locks
