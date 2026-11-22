@@ -32,17 +32,17 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_praetore-mcp")
 }
 
-/// `value` quoted for a POSIX shell, as praetore-mcp prints paths.
+/// `value` as one POSIX shell word, as praetore-mcp prints paths.
 fn quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', r"'\''"))
+    praetore_mcp::commands::quote(value)
 }
 
-/// How printed commands start: the binary's canonical path, quoted.
+/// How printed commands start: the binary's canonical path, as one shell word.
 fn program() -> String {
     quote(fs::canonicalize(bin()).unwrap().to_str().unwrap())
 }
 
-/// The `--dir` value of printed commands: the canonical home, quoted.
+/// The `--dir` value of printed commands: the canonical home, as one shell word.
 fn quoted_dir(home: &Path) -> String {
     quote(fs::canonicalize(home).unwrap().to_str().unwrap())
 }

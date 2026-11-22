@@ -26,17 +26,17 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_praetore-mcp")
 }
 
-/// `value` quoted for a POSIX shell, as praetore-mcp prints paths.
+/// `value` as one POSIX shell word, as praetore-mcp prints paths.
 fn quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', r"'\''"))
+    praetore_mcp::commands::quote(value)
 }
 
-/// How printed commands start: the binary's canonical path, quoted.
+/// How printed commands start: the binary's canonical path, as one shell word.
 fn program() -> String {
     quote(fs::canonicalize(bin()).unwrap().to_str().unwrap())
 }
 
-/// The `--dir` value of printed commands: the canonical home, quoted.
+/// The `--dir` value of printed commands: the canonical home, as one shell word.
 fn quoted_dir(home: &Home) -> String {
     quote(fs::canonicalize(&home.root).unwrap().to_str().unwrap())
 }
@@ -338,7 +338,7 @@ fn enforce_holds_the_call_and_names_the_exact_command() {
     assert_eq!(by_id(&responses, 7)["result"]["isError"], true);
     let id = approval_id_from(text);
     // The commands name the running binary and the home by absolute paths,
-    // quoted for a POSIX shell, so they run as printed off PATH.
+    // as POSIX shell words, so they run as printed off PATH.
     let approve = format!("{} approve {id} --dir {}", program(), quoted_dir(&home));
     let reject = format!("{} reject {id} --dir {}", program(), quoted_dir(&home));
     assert!(text.contains(&format!("\n{approve}\n")), "{text}");
@@ -360,7 +360,8 @@ fn enforce_holds_the_call_and_names_the_exact_command() {
     // (here the test binary); the page shows and copies them unchanged.
     let state = praetore_mcp::dashboard::state(&home, None);
     let served = praetore_mcp::commands::program();
-    assert!(served.starts_with("'/"), "{served}");
+    let test_binary = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+    assert_eq!(served, quote(test_binary.to_str().unwrap()));
     assert_eq!(
         state["pending"][0]["commands"]["approve"],
         format!("{served} approve {id} --dir {}", quoted_dir(&home)).as_str()

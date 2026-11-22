@@ -42,7 +42,9 @@ TIMEOUT_SECONDS = 180
 
 
 def sh_quote(value):
-    """`value` in single quotes for a POSIX shell, as praetore-mcp prints paths."""
+    """`value` as one POSIX shell word, as praetore-mcp prints paths."""
+    if value and all((c.isascii() and c.isalnum()) or c in "_-./:=" for c in value):
+        return value
     return "'" + value.replace("'", "'\\''") + "'"
 
 def server_command():
@@ -335,7 +337,7 @@ def main():
         item.get("text", "") for item in held_msg.get("result", {}).get("content", [])
     )
     # The printed command names the binary and the home by absolute paths,
-    # single-quoted for a POSIX shell, so it runs as printed off PATH.
+    # as POSIX shell words, so it runs as printed off PATH.
     approve_command = (
         f"{sh_quote(os.path.realpath(binary))} approve {approval_id} "
         f"--dir {sh_quote(os.path.realpath(home))}"

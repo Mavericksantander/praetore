@@ -490,9 +490,10 @@ function nodesWithText(root, text) {
 test("the approval card shows and copies the server's commands unchanged", async () => {
   const state = fixture("pending");
   const { approve, reject } = state.pending[0].commands;
-  // As the server writes them: absolute binary and --dir, quoted for sh.
-  assert.ok(approve.startsWith("'/home/user/.local/bin/praetore-mcp' approve "), approve);
-  assert.ok(approve.endsWith(" --dir '/home/user/.praetore/mcp'"), approve);
+  // As the server writes them: absolute binary and --dir, quoted only
+  // when a POSIX shell would interpret the path.
+  assert.ok(approve.startsWith("/home/user/.local/bin/praetore-mcp approve "), approve);
+  assert.ok(approve.endsWith(" --dir /home/user/.praetore/mcp"), approve);
   const p = page({ now: pendingNow() });
   await p.start(state);
   const root = p.byId.get("live-rest");
