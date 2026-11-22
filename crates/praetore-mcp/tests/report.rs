@@ -1581,3 +1581,55 @@ fn a_malformed_missing_evidence_ids_does_not_regenerate_as_a_pass() {
         assert!(stderr.contains("missing_evidence_ids"), "stderr={stderr}");
     }
 }
+
+/// The receipts array can name one gone id twice. `missing` and
+/// `failure_summary` (`failures_total + missing.len()`) count it once.
+#[test]
+fn duplicate_receipts_of_a_missing_id_count_once() {
+    let (_temp, home) = init_home();
+    let out = wrap(
+        &home,
+        &[],
+        &[
+            call(20, "echo", json!({"text": "one"})),
+            call(21, "echo", json!({"text": "two"})),
+        ],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let close_path = json_reports(&home);
+    assert_eq!(close_path.len(), 1, "{close_path:?}");
+    let close = document(&close_path[0]);
+    let receipts = close["receipts"].as_array().unwrap();
+    assert_eq!(receipts.len(), 2, "{receipts:?}");
+
+    let daily = praetore_mcp::journal::journal_files(&home.receipts_dir()).unwrap()[0].clone();
+    let text = fs::read_to_string(&daily).unwrap();
+    let kept = text.lines().next().unwrap().to_owned();
+    let kept_id = receipt_evidence_id(&serde_json::from_str(&kept).unwrap());
+    let gone = receipts
+        .iter()
+        .find(|receipt| receipt_evidence_id(receipt) != kept_id)
+        .unwrap()
+        .clone();
+    let gone_id = receipt_evidence_id(&gone);
+    fs::write(&daily, format!("{kept}\n")).unwrap();
+
+    let mut edited = close;
+    edited["receipts"] = json!([gone.clone(), gone]);
+    edited["header"]["verify"]["missing_evidence_ids"] = json!([]);
+    write_report(&close_path[0], &edited);
+
+    let out = run(&["report", "--dir", dir(&home), "--last"], "");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout={stdout}; stderr={stderr}"
+    );
+    let regen = document(regen_reports(&home).last().unwrap());
+    assert_eq!(missing_ids(&regen), vec![gone_id]);
+    let summary = regen["header"]["verify"]["summary"].as_str().unwrap();
+    assert!(summary.starts_with("1 problem(s) found"), "{summary}");
+    assert_eq!(regen["header"]["verify"]["journal_receipts"], 1);
+}
