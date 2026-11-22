@@ -509,7 +509,16 @@ summary (ALLOW, DENY, held, approved, expired), the calls, the approvals
 with the approver key id and time, the result of `verify`, both heads and
 the SHA-256 of the JSON file. Times are local with UTC next to them. If
 `verify` fails, the first page says `VERIFY FAILED` and both files are
-still written.
+still written. When the receipts journal has no entries and every receipt
+the session named is gone, the headline, the JSON header (`verify.summary`)
+and the CLI summary say that the journal is empty or was deleted or
+truncated after those receipts were written, and that every receipt this
+session named is gone. The result is still `VERIFY FAILED`: an emptied
+journal and a manipulated one look the same.
+
+To start a clean demo or test, close the MCP client and every `wrap`
+process before deleting the journals. A report of a session whose journal
+was emptied while that session was still open fails `verify` by design.
 
 The JSON header and the PDF name the build that wrote them: the version
 for a release build (`0.3.6`), or the version with `-dev+<short commit>`
@@ -560,8 +569,11 @@ close is never replaced. The new files are
 `session-<start UTC>-<id>.regen-<now UTC>.json` and `.pdf`, and the new
 header names the close report in `regenerated_from`. They read the journal
 as it is now and run `verify` again, so after a change to the journal the
-close report and the new one can disagree, and both stay. `--last` and
-`--session` only look at reports written at close.
+close report and the new one can disagree, and both stay. Evidence ids
+recorded at close, including those already missing from the journal, are
+kept, so a receipt that was missing then is still missing in the new
+report and `verify` fails. `--last` and `--session` only look at reports
+written at close.
 
 SIGINT and SIGTERM on macOS and Linux: with reports on, `wrap` waits up to
 300 ms for the server to end, forwards the signal to it, waits up to 2 s

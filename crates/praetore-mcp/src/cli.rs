@@ -1043,6 +1043,9 @@ fn cmd_report(args: &[String]) -> Result<i32, String> {
         Ok(0)
     } else {
         println!("verify FAILED: the report says so on its first page");
+        if let Some(summary) = &generated.verify_summary {
+            eprintln!("praetore-mcp: {summary}");
+        }
         Ok(1)
     }
 }

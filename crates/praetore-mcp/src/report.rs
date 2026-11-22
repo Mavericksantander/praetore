@@ -42,6 +42,18 @@ pub const STATEMENT: &str =
     "Tamper-evident on this machine; verify against an external copy of the heads.";
 /// Failures copied into the JSON header and the PDF (the count is exact).
 const MAX_LISTED_FAILURES: usize = 50;
+/// First sentence of [`EMPTY_JOURNAL_SUMMARY`], drawn on its own PDF line.
+pub const EMPTY_JOURNAL_SUMMARY_JOURNAL: &str =
+    "The journal is empty or was deleted or truncated after these receipts were written.";
+/// Second sentence of [`EMPTY_JOURNAL_SUMMARY`], drawn on its own PDF line.
+pub const EMPTY_JOURNAL_SUMMARY_RECEIPTS: &str = "Every receipt this session named is gone.";
+/// PDF headline, JSON `verify.summary` and CLI summary when the receipts
+/// journal has no entries and every receipt this session named is gone.
+/// `failures_total` does not include those missing ids (it is the count
+/// from `verify` of the journal itself, which is 0 for an empty journal),
+/// so `failures_total + missing.len()` would read as one problem per
+/// missing receipt.
+pub const EMPTY_JOURNAL_SUMMARY: &str = "The journal is empty or was deleted or truncated after these receipts were written. Every receipt this session named is gone.";
 
 /// The version in the report header: the crate version for a release
 /// build, `<version>-dev+<short commit>` (or `<version>-dev`) for any other
@@ -301,6 +313,40 @@ pub struct VerifyOutcome {
     pub approval_executions: usize,
 }
 
+impl VerifyOutcome {
+    /// The live journal has no receipts and every evidence id the session
+    /// recorded is absent. `failures_total == 0` keeps this distinct from
+    /// "verify could not run", which also sets `journal_receipts` to 0.
+    pub fn empty_journal_with_all_session_receipts_gone(&self) -> bool {
+        self.journal_receipts == 0
+            && self.session_receipts == 0
+            && !self.missing.is_empty()
+            && self.failures_total == 0
+    }
+
+    /// Cover headline, JSON `verify.summary` and the CLI summary when
+    /// verify failed. `None` when it passed.
+    pub fn failure_summary(&self) -> Option<String> {
+        if self.passed {
+            return None;
+        }
+        Some(if self.empty_journal_with_all_session_receipts_gone() {
+            EMPTY_JOURNAL_SUMMARY.to_owned()
+        } else if self.journal_receipts == 0 && self.failures_total > 0 {
+            "The journal could not be verified.".to_owned()
+        } else {
+            format!(
+                "{} problem(s) found. {} of {} receipts in the journal verified; {} of {} in this session.",
+                self.failures_total + self.missing.len(),
+                self.journal_verified,
+                self.journal_receipts,
+                self.session_verified,
+                self.session_receipts
+            )
+        })
+    }
+}
+
 /// Everything the PDF shows.
 #[derive(Debug, Clone)]
 pub struct Report {
@@ -328,6 +374,9 @@ pub struct Generated {
     pub json: PathBuf,
     pub pdf: PathBuf,
     pub verify_passed: bool,
+    /// When verify failed, the same wording as the PDF headline and
+    /// `header.verify.summary`.
+    pub verify_summary: Option<String>,
 }
 
 pub fn file_stem(meta: &SessionMeta) -> String {
@@ -593,6 +642,7 @@ fn header_json(report: &Report) -> Value {
             "approval_journal_head": verify_approval,
             "approval_decisions": report.verify.approval_decisions,
             "approval_executions": report.verify.approval_executions,
+            "summary": report.verify.failure_summary(),
         },
         "summary": {
             "allow": summary.allow,
@@ -867,6 +917,7 @@ pub fn generate(home: &Home, source: Source) -> Result<Generated, String> {
         json,
         pdf,
         verify_passed: report.verify.passed,
+        verify_summary: report.verify.failure_summary(),
     })
 }
 
@@ -958,7 +1009,8 @@ fn last_closed(files: &[PathBuf]) -> Option<&PathBuf> {
 }
 
 /// Writes a new report of a session from the JSON file written at close
-/// (which names the session's receipts) and the journal as it is now.
+/// (which names the session's receipts and any evidence ids already
+/// missing at close) and the journal as it is now.
 /// `Last` is the session that closed last. The heads recorded at close are
 /// kept; `verify` runs again. The new pair is written next to the close
 /// report, which is never replaced.
@@ -1006,12 +1058,22 @@ pub fn regenerate(home: &Home, selector: &Selector) -> Result<Generated, String>
         started_at: parse_time(&header["started_at"]).ok_or_else(|| bad("invalid started_at"))?,
         ended_at: parse_time(&header["ended_at"]).ok_or_else(|| bad("invalid ended_at"))?,
     };
-    let evidence_ids = document["receipts"]
+    let mut evidence_ids: Vec<String> = document["receipts"]
         .as_array()
         .ok_or_else(|| bad("no receipts"))?
         .iter()
         .filter_map(|receipt| evidence_id_of(receipt).map(str::to_owned))
         .collect();
+    // Receipts copied at close omit ids already gone from the journal.
+    // Those ids are in the header; keep them so regenerate still fails.
+    let mut seen: BTreeSet<String> = evidence_ids.iter().cloned().collect();
+    if let Some(missing) = header["verify"]["missing_evidence_ids"].as_array() {
+        for id in missing.iter().filter_map(|id| id.as_str()) {
+            if seen.insert(id.to_owned()) {
+                evidence_ids.push(id.to_owned());
+            }
+        }
+    }
     let close_heads = Heads {
         receipt: header["receipt_journal_head"]["next_seq"]
             .as_u64()
@@ -1054,5 +1116,79 @@ mod tests {
             ended_at: OffsetDateTime::parse("2026-11-15T12:00:00-03:00", &Rfc3339).unwrap(),
         };
         assert_eq!(file_stem(&meta), "session-20261115T144207Z-a41f9c2e");
+    }
+
+    fn outcome(
+        passed: bool,
+        journal_receipts: usize,
+        journal_verified: usize,
+        failures_total: usize,
+        session_receipts: usize,
+        session_verified: usize,
+        missing: &[&str],
+    ) -> VerifyOutcome {
+        VerifyOutcome {
+            passed,
+            checked_at: OffsetDateTime::from_unix_timestamp(1_794_000_000).unwrap(),
+            journal_receipts,
+            journal_verified,
+            failures_total,
+            failures: Vec::new(),
+            session_receipts,
+            session_verified,
+            missing: missing.iter().map(|id| (*id).to_owned()).collect(),
+            heads: Heads::default(),
+            approval_decisions: 0,
+            approval_executions: 0,
+        }
+    }
+
+    #[test]
+    fn empty_journal_with_all_session_receipts_gone_has_plain_wording() {
+        let verify = outcome(false, 0, 0, 0, 0, 0, &["a", "b"]);
+        assert!(verify.empty_journal_with_all_session_receipts_gone());
+        assert_eq!(
+            EMPTY_JOURNAL_SUMMARY,
+            format!("{EMPTY_JOURNAL_SUMMARY_JOURNAL} {EMPTY_JOURNAL_SUMMARY_RECEIPTS}")
+        );
+        assert_eq!(
+            verify.failure_summary().as_deref(),
+            Some(EMPTY_JOURNAL_SUMMARY)
+        );
+        assert!(
+            !verify
+                .failure_summary()
+                .unwrap()
+                .contains("problem(s) found")
+        );
+    }
+
+    #[test]
+    fn a_non_empty_journal_with_a_missing_receipt_keeps_the_count_headline() {
+        let verify = outcome(false, 2, 1, 0, 1, 1, &["gone"]);
+        assert!(!verify.empty_journal_with_all_session_receipts_gone());
+        assert_eq!(
+            verify.failure_summary().as_deref(),
+            Some(
+                "1 problem(s) found. 1 of 2 receipts in the journal verified; 1 of 1 in this session."
+            )
+        );
+    }
+
+    #[test]
+    fn a_passed_verify_has_no_failure_summary() {
+        let verify = outcome(true, 2, 2, 0, 2, 2, &[]);
+        assert_eq!(verify.failure_summary(), None);
+    }
+
+    #[test]
+    fn verify_that_could_not_run_keeps_its_headline() {
+        // journal_receipts is 0 on this path, but failures_total is not.
+        let verify = outcome(false, 0, 0, 1, 0, 0, &["a"]);
+        assert!(!verify.empty_journal_with_all_session_receipts_gone());
+        assert_eq!(
+            verify.failure_summary().as_deref(),
+            Some("The journal could not be verified.")
+        );
     }
 }

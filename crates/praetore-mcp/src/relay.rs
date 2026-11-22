@@ -678,6 +678,9 @@ fn write_report(options: &WrapOptions, started_at: OffsetDateTime, log: &Session
                     " (verify FAILED; see the report)"
                 }
             );
+            if let Some(summary) = &generated.verify_summary {
+                eprintln!("praetore-mcp: {summary}");
+            }
             eprintln!("praetore-mcp: {}", dashboard_hint(&options.home, &id));
         }
         Ok(Ok(None)) => {}
