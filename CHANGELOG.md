@@ -112,6 +112,17 @@
 
 ### Changed
 
+- **praetore-mcp: a session report whose receipts journal is empty says so
+  plainly.** When `verify` fails because the journal has no entries and
+  every receipt the session named is gone, the PDF headline, the JSON
+  header (`verify.summary`) and the `report` / `wrap` summary say that the
+  journal is empty or was deleted or truncated after those receipts were
+  written, and that every receipt this session named is gone. `VERIFY
+  FAILED` is unchanged. A journal that still has entries, with some
+  session receipts missing, keeps the previous wording. The GUIDE says to
+  close the client and `wrap` before deleting the journals for a clean
+  demo or test.
+
 - **Observability: praetore-mcp observe warnings for ambiguous client lines
   include the SHA-256 and length of the raw line.** The warning names the
   line the same way the warning for an unparseable line does, so the
@@ -129,6 +140,17 @@
   still use `$'...'`. Copying a command and losing a quote around a
   typical path no longer makes zsh treat the whole line as one path.
   Windows is unchanged.
+
+- **praetore-mcp: `report` keeps evidence ids already missing at close.**
+  Regenerating a session took ids only from the close report's `receipts`
+  array. If the journal was emptied while `wrap` was still open, that
+  array was empty (or held only a receipt written after the wipe), so
+  `praetore-mcp report` printed `verify passed` and exited 0 even though
+  the close report had named the missing ids and failed `verify`. The
+  regenerated report now includes `header.verify.missing_evidence_ids` as
+  well, so those receipts stay missing, `verify` fails, and `report`
+  exits 1, as it does for any other failed verify. The wording of the
+  summary is unchanged.
 
 - **praetore-mcp: a JSON5 line can no longer hide a `safety*` name.** An
   unparseable client line was refused in both modes when the raw text, or a
