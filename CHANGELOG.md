@@ -130,6 +130,13 @@
 
 ### Fixed
 
+- **praetore-mcp: `report` lists a duplicated missing id once.**
+  Two copies of the same gone receipt in the close report's `receipts`
+  array were both copied into `missing_evidence_ids`, and the summary
+  counted both (`failures_total + missing.len()`). The id is kept once, in
+  first-seen order. The summary sentence is the same. Receipt lines that
+  are still in the journal are still copied as written.
+
 - **praetore-mcp: `report` refuses a malformed `missing_evidence_ids`.**
   Regenerating ignored the field when it was not an array, and skipped
   elements that were not strings. With an empty `receipts` array that

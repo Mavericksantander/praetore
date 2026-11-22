@@ -788,12 +788,16 @@ pub fn generate(home: &Home, source: Source) -> Result<Generated, String> {
         .iter()
         .filter_map(|line| evidence_id_of(&line.value))
         .collect();
-    let missing: Vec<String> = source
-        .evidence_ids
-        .iter()
-        .filter(|id| !found.contains(id.as_str()))
-        .cloned()
-        .collect();
+    // One id, once. A close report can list the same gone receipt twice;
+    // the summary adds `missing.len()`, so a repeat would inflate the count.
+    // Journal lines that are present are still copied as written.
+    let mut missing = Vec::new();
+    let mut missing_seen: BTreeSet<&str> = BTreeSet::new();
+    for id in &source.evidence_ids {
+        if !found.contains(id.as_str()) && missing_seen.insert(id.as_str()) {
+            missing.push(id.clone());
+        }
+    }
 
     // The approval journal: each line as written, with its record. If it
     // cannot be read the report says so and lists no approval record.
