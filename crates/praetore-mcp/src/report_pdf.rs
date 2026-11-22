@@ -9,7 +9,10 @@
 //! All coordinates below are in points from the top-left corner of an A4
 //! page; [`Canvas`] converts them to PDF space.
 
-use crate::report::{ApprovalRow, ApprovalStatus, Label, Report, Row, STATEMENT};
+use crate::report::{
+    ApprovalRow, ApprovalStatus, EMPTY_JOURNAL_SUMMARY_JOURNAL, EMPTY_JOURNAL_SUMMARY_RECEIPTS,
+    Label, Report, Row, STATEMENT,
+};
 use crate::when::local_offset;
 use pdf_writer::{Content, Filter, Finish, Name, Pdf, Rect, Ref, Str, TextStr};
 use time::{OffsetDateTime, UtcOffset};
@@ -478,19 +481,30 @@ fn cover(report: &Report) -> Canvas {
     let mut y = 262.0;
     if failed {
         let verify = &report.verify;
-        let headline = if verify.journal_receipts == 0 && verify.failures_total > 0 {
-            "The journal could not be verified.".to_owned()
+        let headline = verify
+            .failure_summary()
+            .expect("the cover lists problems only when verify failed");
+        if verify.empty_journal_with_all_session_receipts_gone() {
+            c.text(
+                Font::SansBold,
+                9.5,
+                RED,
+                LEFT,
+                y,
+                EMPTY_JOURNAL_SUMMARY_JOURNAL,
+            );
+            y += 13.0;
+            c.text(
+                Font::SansBold,
+                9.5,
+                RED,
+                LEFT,
+                y,
+                EMPTY_JOURNAL_SUMMARY_RECEIPTS,
+            );
         } else {
-            format!(
-                "{} problem(s) found. {} of {} receipts in the journal verified; {} of {} in this session.",
-                verify.failures_total + verify.missing.len(),
-                verify.journal_verified,
-                verify.journal_receipts,
-                verify.session_verified,
-                verify.session_receipts
-            )
-        };
-        c.text(Font::SansBold, 9.5, RED, LEFT, y, &headline);
+            c.text(Font::SansBold, 9.5, RED, LEFT, y, &headline);
+        }
         y += 13.0;
         c.text(
             Font::Sans,
@@ -1406,6 +1420,72 @@ mod tests {
             1
         );
         assert_eq!(count(&pdf, b"No approval record for this session."), 0);
+    }
+
+    #[test]
+    fn an_empty_journal_with_all_session_receipts_gone_uses_the_plain_headline() {
+        let mut report = sample(0, false);
+        report.verify.journal_receipts = 0;
+        report.verify.journal_verified = 0;
+        report.verify.failures_total = 0;
+        report.verify.session_receipts = 0;
+        report.verify.session_verified = 0;
+        report.verify.missing = vec!["id-a".into(), "id-b".into()];
+        let pdf = render(&report);
+        assert_eq!(count(&pdf, b"VERIFY FAILED"), 1);
+        assert_eq!(count(&pdf, EMPTY_JOURNAL_SUMMARY_JOURNAL.as_bytes()), 1);
+        assert_eq!(count(&pdf, EMPTY_JOURNAL_SUMMARY_RECEIPTS.as_bytes()), 1);
+        assert_eq!(
+            count(
+                &pdf,
+                b"Do not rely on these records until the journal is checked against an external copy of the heads."
+            ),
+            1
+        );
+        assert_eq!(count(&pdf, b"problem(s) found"), 0);
+        assert_eq!(
+            count(
+                &pdf,
+                b"2 receipt(s) of this session are no longer in the journal"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn a_missing_receipt_in_a_non_empty_journal_keeps_the_count_headline() {
+        let mut report = sample(1, false);
+        report.verify.journal_receipts = 2;
+        report.verify.journal_verified = 1;
+        report.verify.failures_total = 0;
+        report.verify.session_receipts = 1;
+        report.verify.session_verified = 1;
+        report.verify.missing = vec!["gone".into()];
+        let pdf = render(&report);
+        assert_eq!(count(&pdf, b"VERIFY FAILED"), 1);
+        assert_eq!(
+            count(
+                &pdf,
+                b"1 problem(s) found. 1 of 2 receipts in the journal verified; 1 of 1 in this session."
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &pdf,
+                b"1 receipt(s) of this session are no longer in the journal"
+            ),
+            1
+        );
+        assert_eq!(count(&pdf, EMPTY_JOURNAL_SUMMARY_JOURNAL.as_bytes()), 0);
+        assert_eq!(count(&pdf, EMPTY_JOURNAL_SUMMARY_RECEIPTS.as_bytes()), 0);
+        assert_eq!(
+            count(
+                &pdf,
+                b"Do not rely on these records until the journal is checked against an external copy of the heads."
+            ),
+            1
+        );
     }
 
     #[test]
