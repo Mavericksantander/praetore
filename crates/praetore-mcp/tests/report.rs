@@ -1633,3 +1633,63 @@ fn duplicate_receipts_of_a_missing_id_count_once() {
     assert!(summary.starts_with("1 problem(s) found"), "{summary}");
     assert_eq!(regen["header"]["verify"]["journal_receipts"], 1);
 }
+
+/// One id named in `missing_evidence_ids` is back in the journal and the
+/// other is not. `generate` keeps only the id that is still absent.
+#[test]
+fn a_partial_restore_keeps_only_the_id_still_absent() {
+    let (_temp, home) = init_home();
+    let out = wrap(
+        &home,
+        &[],
+        &[
+            call(20, "echo", json!({"text": "one"})),
+            call(21, "echo", json!({"text": "two"})),
+        ],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let close_path = json_reports(&home);
+    assert_eq!(close_path.len(), 1, "{close_path:?}");
+    let close = document(&close_path[0]);
+    let receipts = close["receipts"].as_array().unwrap().clone();
+    assert_eq!(receipts.len(), 2, "{receipts:?}");
+
+    let daily = praetore_mcp::journal::journal_files(&home.receipts_dir()).unwrap()[0].clone();
+    let text = fs::read_to_string(&daily).unwrap();
+    let kept = text.lines().next().unwrap().to_owned();
+    let kept_id = receipt_evidence_id(&serde_json::from_str(&kept).unwrap());
+    let gone_id = receipts
+        .iter()
+        .map(receipt_evidence_id)
+        .find(|id| id != &kept_id)
+        .unwrap();
+    fs::write(&daily, format!("{kept}\n")).unwrap();
+
+    let mut edited = close;
+    edited["receipts"] = json!([]);
+    edited["header"]["verify"]["missing_evidence_ids"] = json!([kept_id.clone(), gone_id.clone()]);
+    edited["header"]["verify"]["result"] = json!("failed");
+    write_report(&close_path[0], &edited);
+
+    let out = run(&["report", "--dir", dir(&home), "--last"], "");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout={stdout}; stderr={stderr}"
+    );
+    assert!(stdout.contains("verify FAILED"), "{stdout}");
+    let regen = document(regen_reports(&home).last().unwrap());
+    assert_eq!(regen["header"]["verify"]["result"], "failed");
+    assert_eq!(missing_ids(&regen), vec![gone_id]);
+    assert_eq!(regen["header"]["verify"]["session_receipts"], 1);
+    assert_eq!(regen["header"]["verify"]["journal_receipts"], 1);
+    let copied: Vec<String> = regen["receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(receipt_evidence_id)
+        .collect();
+    assert_eq!(copied, vec![kept_id]);
+}
