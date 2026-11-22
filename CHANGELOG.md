@@ -130,6 +130,14 @@
 
 ### Fixed
 
+- **praetore-mcp: `report` refuses a malformed `missing_evidence_ids`.**
+  Regenerating ignored the field when it was not an array, and skipped
+  elements that were not strings. With an empty `receipts` array that
+  dropped every gone id, so `report` printed `verify passed` and exited 0.
+  The field is still optional. When it is present and is not an array of
+  strings, `report` exits 2 and writes nothing. A well-formed array is
+  unchanged, and so are the JSON, the summary text and the PDF.
+
 - **praetore-mcp: `report` keeps evidence ids already missing at close.**
   Regenerating a session took ids only from the close report's `receipts`
   array. If the journal was emptied while `wrap` was still open, that

@@ -978,6 +978,37 @@ fn session_files(home: &Home) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
+/// Strings in `header.verify.missing_evidence_ids`.
+///
+/// The field is optional. When it is present it must be an array of
+/// strings; anything else is refused, so regenerate cannot ignore it and
+/// report a pass. The written report format is unchanged.
+fn missing_evidence_id_strings(header: &Value) -> Result<Vec<String>, String> {
+    let Some(verify) = header.get("verify") else {
+        return Ok(Vec::new());
+    };
+    let Some(missing) = verify.get("missing_evidence_ids") else {
+        return Ok(Vec::new());
+    };
+    let Some(list) = missing.as_array() else {
+        return Err(
+            "header.verify.missing_evidence_ids is not an array; report was not regenerated".into(),
+        );
+    };
+    let mut ids = Vec::with_capacity(list.len());
+    for (index, value) in list.iter().enumerate() {
+        match value.as_str() {
+            Some(id) => ids.push(id.to_owned()),
+            None => {
+                return Err(format!(
+                    "header.verify.missing_evidence_ids[{index}] is not a string; report was not regenerated"
+                ));
+            }
+        }
+    }
+    Ok(ids)
+}
+
 /// The header of a session JSON file. It is the first line of the file,
 /// which the receipts follow one per line, so only that line is read.
 pub fn read_header(path: &Path) -> Option<Value> {
@@ -1066,12 +1097,12 @@ pub fn regenerate(home: &Home, selector: &Selector) -> Result<Generated, String>
         .collect();
     // Receipts copied at close omit ids already gone from the journal.
     // Those ids are in the header; keep them so regenerate still fails.
+    // A present field that is not an array of strings is not dropped: that
+    // used to regenerate as a pass. Absent means an older report.
     let mut seen: BTreeSet<String> = evidence_ids.iter().cloned().collect();
-    if let Some(missing) = header["verify"]["missing_evidence_ids"].as_array() {
-        for id in missing.iter().filter_map(|id| id.as_str()) {
-            if seen.insert(id.to_owned()) {
-                evidence_ids.push(id.to_owned());
-            }
+    for id in missing_evidence_id_strings(header)? {
+        if seen.insert(id.clone()) {
+            evidence_ids.push(id);
         }
     }
     let close_heads = Heads {
