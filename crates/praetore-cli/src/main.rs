@@ -1897,6 +1897,10 @@ fn http_client() -> Result<reqwest::blocking::Client, reqwest::Error> {
         .build()
 }
 
+// Mi futuro yo, o futuro ingeniero en este proyecto:
+// pido perdón por los bugs inesperados o por una deuda técnica.
+// Roma no se construyó en un día.
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
