@@ -817,4 +817,34 @@ mod tests {
             golden["intent_signature_hex"].as_str()
         );
     }
+
+    /// `intent_signature_hex` was produced by ed25519-dalek 2.2.0
+    /// (`SigningKey::from_bytes(&[7; 32]).sign` over `PRAETORE_INTENT_V1\0`
+    /// plus `intent_signing_payload`). dalek 3 verifies those exact bytes.
+    #[test]
+    fn v1_golden_intent_signature_verifies_with_current_dalek() {
+        let golden: serde_json::Value =
+            serde_json::from_str(include_str!("../../../docs/golden/trust-chain-v1.json")).unwrap();
+        let agent_key = AgentKeyPair::from_secret_bytes(&[7; 32]);
+        let agent_id: AgentId =
+            serde_json::from_str("\"00000000-0000-0000-0000-000000000002\"").unwrap();
+        let agent = agent_key.identity(agent_id);
+        let mut authority =
+            Authority::new(agent.id.clone(), "golden-issuer", vec!["data:read".into()])
+                .with_validity(crate::authority::Validity {
+                    not_before: Some("2026-01-01T00:00:00Z".into()),
+                    not_after: Some("2027-01-01T00:00:00Z".into()),
+                });
+        authority.id = serde_json::from_str("\"00000000-0000-0000-0000-000000000001\"").unwrap();
+        authority
+            .sign_for_agent(&AgentKeyPair::from_secret_bytes(&[8; 32]), &agent)
+            .unwrap();
+        let action = Action::new("read_data", Some("dataset".into()), json!({}))
+            .unwrap()
+            .with_capability("data:read");
+        let mut request = AuthorizationRequest::new(agent, authority, mission(action)).unwrap();
+        request.request_id = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
+        request.agent_signature = Some(golden["intent_signature_hex"].as_str().unwrap().to_owned());
+        request.verify_intent_signature().unwrap();
+    }
 }
