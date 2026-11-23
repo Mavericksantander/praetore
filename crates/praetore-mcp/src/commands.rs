@@ -437,6 +437,14 @@ mod tests {
             ("hash word", "#hash"),
             ("tilde", "~"),
             ("tilde path", "~/x"),
+            ("bang", "a!b"),
+            ("semicolon", "a;b"),
+            ("ampersand", "a&b"),
+            ("pipe", "a|b"),
+            ("redirect in", "a<b"),
+            ("redirect out", "a>b"),
+            ("paren", "a(b)"),
+            ("brace", "a{b}"),
             ("unicode n", "cañón"),
             ("emoji", "ok😀"),
             ("rtl letters", "مرحبا"),
@@ -470,6 +478,30 @@ mod tests {
                 )),
             }
         }
+        let mut bash_meta_ok = 0usize;
+        for (label, value) in portable {
+            if !matches!(
+                *label,
+                "bang"
+                    | "semicolon"
+                    | "ampersand"
+                    | "pipe"
+                    | "redirect in"
+                    | "redirect out"
+                    | "paren"
+                    | "brace"
+            ) {
+                continue;
+            }
+            let quoted = quote(value);
+            match shell_word("bash", &quoted, &dir) {
+                Ok(got) if got == value.as_bytes() => bash_meta_ok += 1,
+                other => failures.push(format!(
+                    "{label}: quote={quoted:?} bash={other:?} want={value:?}"
+                )),
+            }
+        }
+        eprintln!("quote-edge: bash passed {bash_meta_ok}/8 metacharacter cases");
 
         // Absent zsh is skipped on purpose. A zsh that exists and does not
         // answer the probe is a failure, not a skip and not a pass.
