@@ -1507,3 +1507,189 @@ fn regenerating_after_a_mid_session_wipe_and_a_later_receipt_keeps_the_earlier_m
     assert_eq!(missing_ids(&regen_doc), missing);
     assert_eq!(regen_doc["receipts"].as_array().unwrap().len(), 1);
 }
+
+fn receipt_evidence_id(receipt: &Value) -> String {
+    receipt
+        .get("evidence")
+        .and_then(|evidence| evidence.get("evidence_id"))
+        .or_else(|| receipt.get("evidence_id"))
+        .and_then(|id| id.as_str())
+        .unwrap_or_else(|| panic!("receipt has no evidence_id: {receipt}"))
+        .to_owned()
+}
+
+/// Same shape `render_json` writes: the header is the first line and ends
+/// at `"receipts":[`, which is what `read_header` closes with `]}`.
+fn write_report(path: &Path, document: &Value) {
+    let approvals = document["approvals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| serde_json::to_string(value).unwrap())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut out = format!(
+        "{{\"schema\":{},\"header\":{},\"approvals\":[{}],\"receipts\":[\n",
+        serde_json::to_string(&document["schema"]).unwrap(),
+        serde_json::to_string(&document["header"]).unwrap(),
+        approvals
+    );
+    let receipts = document["receipts"].as_array().unwrap();
+    for (index, receipt) in receipts.iter().enumerate() {
+        out.push_str(&serde_json::to_string(receipt).unwrap());
+        if index + 1 < receipts.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    out.push_str("]}\n");
+    fs::write(path, out).unwrap();
+}
+
+/// `missing_evidence_ids` that is not an array of strings is the only
+/// record of ids already gone. Dropping it lets `report` exit 0.
+#[test]
+fn a_malformed_missing_evidence_ids_does_not_regenerate_as_a_pass() {
+    // A string where the array belongs, and an array of non-strings.
+    let malformed = [json!("not-an-array"), json!([1, null])];
+    for missing in malformed {
+        let (_temp, home) = init_home();
+        let out = wrap(&home, &[], &[call(20, "echo", json!({"text": "one"}))]);
+        assert!(out.status.success(), "{out:?}");
+        let close_path = json_reports(&home);
+        assert_eq!(close_path.len(), 1, "{close_path:?}");
+        let mut close = document(&close_path[0]);
+        let id = receipt_evidence_id(&close["receipts"][0]);
+        close["receipts"] = json!([]);
+        close["header"]["verify"]["missing_evidence_ids"] = missing;
+        close["header"]["verify"]["result"] = json!("failed");
+        write_report(&close_path[0], &close);
+        empty_receipts_journal(&home);
+
+        let out = run(&["report", "--dir", dir(&home), "--last"], "");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "id {id} was recorded with a malformed missing_evidence_ids and must not pass; stdout={stdout}; stderr={stderr}"
+        );
+        assert!(
+            !stdout.contains("verify passed"),
+            "stdout={stdout}; stderr={stderr}"
+        );
+        assert!(stderr.contains("missing_evidence_ids"), "stderr={stderr}");
+    }
+}
+
+/// The receipts array can name one gone id twice. `missing` and
+/// `failure_summary` (`failures_total + missing.len()`) count it once.
+#[test]
+fn duplicate_receipts_of_a_missing_id_count_once() {
+    let (_temp, home) = init_home();
+    let out = wrap(
+        &home,
+        &[],
+        &[
+            call(20, "echo", json!({"text": "one"})),
+            call(21, "echo", json!({"text": "two"})),
+        ],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let close_path = json_reports(&home);
+    assert_eq!(close_path.len(), 1, "{close_path:?}");
+    let close = document(&close_path[0]);
+    let receipts = close["receipts"].as_array().unwrap();
+    assert_eq!(receipts.len(), 2, "{receipts:?}");
+
+    let daily = praetore_mcp::journal::journal_files(&home.receipts_dir()).unwrap()[0].clone();
+    let text = fs::read_to_string(&daily).unwrap();
+    let kept = text.lines().next().unwrap().to_owned();
+    let kept_id = receipt_evidence_id(&serde_json::from_str(&kept).unwrap());
+    let gone = receipts
+        .iter()
+        .find(|receipt| receipt_evidence_id(receipt) != kept_id)
+        .unwrap()
+        .clone();
+    let gone_id = receipt_evidence_id(&gone);
+    fs::write(&daily, format!("{kept}\n")).unwrap();
+
+    let mut edited = close;
+    edited["receipts"] = json!([gone.clone(), gone]);
+    edited["header"]["verify"]["missing_evidence_ids"] = json!([]);
+    write_report(&close_path[0], &edited);
+
+    let out = run(&["report", "--dir", dir(&home), "--last"], "");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout={stdout}; stderr={stderr}"
+    );
+    let regen = document(regen_reports(&home).last().unwrap());
+    assert_eq!(missing_ids(&regen), vec![gone_id]);
+    let summary = regen["header"]["verify"]["summary"].as_str().unwrap();
+    assert!(summary.starts_with("1 problem(s) found"), "{summary}");
+    assert_eq!(regen["header"]["verify"]["journal_receipts"], 1);
+}
+
+/// One id named in `missing_evidence_ids` is back in the journal and the
+/// other is not. `generate` keeps only the id that is still absent.
+#[test]
+fn a_partial_restore_keeps_only_the_id_still_absent() {
+    let (_temp, home) = init_home();
+    let out = wrap(
+        &home,
+        &[],
+        &[
+            call(20, "echo", json!({"text": "one"})),
+            call(21, "echo", json!({"text": "two"})),
+        ],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let close_path = json_reports(&home);
+    assert_eq!(close_path.len(), 1, "{close_path:?}");
+    let close = document(&close_path[0]);
+    let receipts = close["receipts"].as_array().unwrap().clone();
+    assert_eq!(receipts.len(), 2, "{receipts:?}");
+
+    let daily = praetore_mcp::journal::journal_files(&home.receipts_dir()).unwrap()[0].clone();
+    let text = fs::read_to_string(&daily).unwrap();
+    let kept = text.lines().next().unwrap().to_owned();
+    let kept_id = receipt_evidence_id(&serde_json::from_str(&kept).unwrap());
+    let gone_id = receipts
+        .iter()
+        .map(receipt_evidence_id)
+        .find(|id| id != &kept_id)
+        .unwrap();
+    fs::write(&daily, format!("{kept}\n")).unwrap();
+
+    let mut edited = close;
+    edited["receipts"] = json!([]);
+    edited["header"]["verify"]["missing_evidence_ids"] = json!([kept_id.clone(), gone_id.clone()]);
+    edited["header"]["verify"]["result"] = json!("failed");
+    write_report(&close_path[0], &edited);
+
+    let out = run(&["report", "--dir", dir(&home), "--last"], "");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout={stdout}; stderr={stderr}"
+    );
+    assert!(stdout.contains("verify FAILED"), "{stdout}");
+    let regen = document(regen_reports(&home).last().unwrap());
+    assert_eq!(regen["header"]["verify"]["result"], "failed");
+    assert_eq!(missing_ids(&regen), vec![gone_id]);
+    assert_eq!(regen["header"]["verify"]["session_receipts"], 1);
+    assert_eq!(regen["header"]["verify"]["journal_receipts"], 1);
+    let copied: Vec<String> = regen["receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(receipt_evidence_id)
+        .collect();
+    assert_eq!(copied, vec![kept_id]);
+}
