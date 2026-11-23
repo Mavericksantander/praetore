@@ -1320,6 +1320,23 @@ mod tests {
         assert!(Evidence::from_json(golden["evidence_json"].as_str().unwrap()).is_ok());
     }
 
+    /// The v1 receipt in `docs/golden/trust-chain-v1.json` carries the
+    /// ed25519-dalek 2.2.0 agent signature (`agent_signature` equals
+    /// `intent_signature_hex`; `attester_signature` is null). dalek 3
+    /// `verify_strict` accepts that receipt unchanged.
+    #[test]
+    fn v1_golden_receipt_agent_signature_verifies_with_current_dalek() {
+        let golden: Value =
+            serde_json::from_str(include_str!("../../../docs/golden/trust-chain-v1.json")).unwrap();
+        let receipt = Evidence::from_json(golden["evidence_json"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            receipt.agent_signature.as_deref(),
+            golden["intent_signature_hex"].as_str()
+        );
+        assert!(receipt.attester_signature.is_none());
+        receipt.verify_agent_intent().unwrap();
+    }
+
     #[test]
     fn evidence_import_rejects_duplicate_json_fields() {
         assert!(

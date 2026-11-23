@@ -494,6 +494,36 @@ mod tests {
         );
     }
 
+    /// The hex in `docs/golden/trust-chain-v1.json` was produced by
+    /// ed25519-dalek 2.2.0 (`SigningKey::from_bytes(&[8; 32]).sign` over
+    /// `PRAETORE_AUTHORITY_V1\0` plus `authority_signing_payload`). This
+    /// checks that dalek 3's `verify_strict` path still accepts those bytes.
+    #[test]
+    fn v1_golden_authority_signature_verifies_with_current_dalek() {
+        let golden: serde_json::Value =
+            serde_json::from_str(include_str!("../../../docs/golden/trust-chain-v1.json")).unwrap();
+        let agent_key = AgentKeyPair::from_secret_bytes(&[7; 32]);
+        let agent_id: AgentId =
+            serde_json::from_str("\"00000000-0000-0000-0000-000000000002\"").unwrap();
+        let agent = agent_key.identity(agent_id);
+        let mut authority =
+            Authority::new(agent.id.clone(), "golden-issuer", vec!["data:read".into()])
+                .with_validity(Validity {
+                    not_before: Some("2026-01-01T00:00:00Z".into()),
+                    not_after: Some("2027-01-01T00:00:00Z".into()),
+                });
+        authority.id = serde_json::from_str("\"00000000-0000-0000-0000-000000000001\"").unwrap();
+        let issuer = AgentKeyPair::from_secret_bytes(&[8; 32]);
+        authority.sign_for_agent(&issuer, &agent).unwrap();
+        authority.signature = Some(
+            golden["authority_signature_hex"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+        authority.verify_signature(&issuer.public_key()).unwrap();
+    }
+
     #[test]
     fn authority_can_have_validity() {
         let validity = Validity {
