@@ -36,7 +36,7 @@
 use std::collections::BTreeSet;
 
 use ed25519_dalek::{Signer, SigningKey};
-use rand_core::OsRng;
+use getrandom::{SysRng, rand_core::UnwrapErr};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
@@ -249,7 +249,7 @@ impl std::fmt::Debug for SafetyNamespaceKey {
 impl SafetyNamespaceKey {
     pub fn generate() -> Self {
         Self {
-            signing_key: SigningKey::generate(&mut OsRng),
+            signing_key: SigningKey::generate(&mut UnwrapErr(SysRng)),
         }
     }
 

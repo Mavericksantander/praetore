@@ -11,7 +11,7 @@ description = "Local operator console: a PRÆTORE journal retold in plain langua
 
 [dependencies]
 axum = "0.8"
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 # D3: the compliance package is a .tar.gz built in memory.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 hex = "0.4.3"

@@ -180,11 +180,6 @@ const DISPLAY_EXCEPTIONS: &[Exception] = &[
         "quote() writes control characters as $'\\xHH'",
     ),
     allow(
-        "src/commands.rs",
-        "text.ends_with(&format!(\"{}'\", root.canonicalize().unwrap().display())),",
-        "unit test comparing with the exact path",
-    ),
-    allow(
         "src/policy.rs",
         "let data = format!(\"/System/Volumes/Data{}\", root.display());",
         "unit test building a path, not a message",
