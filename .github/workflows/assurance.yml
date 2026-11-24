@@ -28,7 +28,19 @@ jobs:
         run: |
           scripts/test-check-rust-version.sh
           scripts/check-rust-version.sh
+      - name: Install zsh so the print-cmd round-trip is not skipped
+        run: sudo apt-get update && sudo apt-get install -y zsh
       - run: cargo test --workspace --locked
+      - name: print-cmd round-trip includes zsh
+        run: |
+          set -euo pipefail
+          output="$(cargo test --locked -p praetore-mcp --lib quote_posix_sh_round_trips_shell_edge_cases -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -F 'quote-edge: zsh passed' <<<"$output"
+          if grep -F 'zsh not installed' <<<"$output"; then
+            echo "::error::zsh was skipped"
+            exit 1
+          fi
       # G7: shown separately so the log shows each test ran. A renamed or
       # missing test fails the step (the counts are pinned).
       - name: G7 safety actions never reach the evaluator (output shown)
