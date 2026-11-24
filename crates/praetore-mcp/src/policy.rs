@@ -626,12 +626,12 @@ fn plain_tool_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
 }
 
-/// `value` as one POSIX shell word: unchanged when it only has characters
-/// a shell does not interpret, otherwise in single quotes. Invisible
-/// characters are not rewritten here; Unix printed paths go through
-/// [`crate::commands::quote`] instead.
+/// `value` as one shell word. Printable words use POSIX single quotes.
+/// A control, zero-width or bidi character is written as `$'...'`, the
+/// same way [`crate::commands::quote`] prints a path, so the character
+/// is not copied raw into the line.
 pub(crate) fn shell_word(value: &str) -> String {
-    crate::commands::quote_if_needed(value)
+    crate::commands::quote(value)
 }
 
 /// The part of a rule id taken from a name: MCP tool name characters, at
@@ -1148,9 +1148,7 @@ mod tests {
         assert_eq!(shell_word(""), "''");
     }
 
-    /// A server name is printed with [`shell_word`], which single-quotes
-    /// but does not rewrite controls. ESC and newline stay in the line.
-    /// `commands::quote` would have used `$'...'` and left no raw control.
+    /// ESC and a newline in a server name are printed escaped, not raw.
     #[test]
     fn shell_word_does_not_emit_a_raw_escape_or_newline() {
         let mut raw = Vec::new();
