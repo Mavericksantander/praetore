@@ -1148,6 +1148,24 @@ mod tests {
         assert_eq!(shell_word(""), "''");
     }
 
+    /// A server name is printed with [`shell_word`], which single-quotes
+    /// but does not rewrite controls. ESC and newline stay in the line.
+    /// `commands::quote` would have used `$'...'` and left no raw control.
+    #[test]
+    fn shell_word_does_not_emit_a_raw_escape_or_newline() {
+        let mut raw = Vec::new();
+        for value in ["srv\x1b[2K", "srv\nname"] {
+            let word = shell_word(value);
+            if word.chars().any(praetore_core::display::is_invisible) {
+                raw.push(word);
+            }
+        }
+        assert!(
+            raw.is_empty(),
+            "printed server words still contain a raw control: {raw:?}"
+        );
+    }
+
     #[test]
     fn coverage_suggests_allow_lines_only_for_tools_no_rule_names() {
         let mut policy = default_policy();
