@@ -230,6 +230,16 @@ mod tests {
         }
     }
 
+    /// An interior NUL cannot be an argv byte. The printed word spells
+    /// it as `\x00` and does not contain a raw 0 byte.
+    #[test]
+    fn quote_writes_an_interior_nul_as_hex_not_as_a_raw_byte() {
+        let word = quote("a\0b");
+        assert!(word.contains("\\x00"), "{word:?}");
+        assert!(!word.as_bytes().contains(&0), "{word:?}");
+        assert!(word.starts_with("$'"), "{word:?}");
+    }
+
     /// m5: a path with a terminal escape, `\r`, `\n`, a C1 control or a
     /// zero-width space is printed with none of them and still pastes as the
     /// exact path in bash.

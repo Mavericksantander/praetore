@@ -230,6 +230,41 @@ impl VerifiedPublicKey {
 mod tests {
     use super::*;
 
+    /// Speccheck vector 2 (0-based) from "Taming the many EdDSAs"
+    /// (eprint 2020/1244). `cases.json` index 2 in
+    /// <https://github.com/novifinancial/ed25519-speccheck>: small-order
+    /// `R`, mixed-order public key, `0 < S < L`. `Verifier::verify`
+    /// accepts it. The production path rejects it through `verify_strict`.
+    #[test]
+    fn verify_strict_rejects_speccheck_small_order_r() {
+        use ed25519_dalek::Verifier;
+
+        let public_key =
+            hex::decode("f7badec5b8abeaf699583992219b7b223f1df3fbbea919844e3f7c554a43dd43")
+                .unwrap();
+        let message =
+            hex::decode("aebf3f2601a0c8c5d39cc7d8911642f740b78168218da8471772b35f9d35b9ab")
+                .unwrap();
+        let signature = hex::decode(
+            "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa\
+             8c4bd45aecaca5b24fb97bc10ac27ac8751a7dfe1baff8b953ec9f5833ca260e",
+        )
+        .unwrap();
+        let key = VerifiedPublicKey::from_bytes(&public_key).unwrap();
+        let verifying =
+            VerifyingKey::from_bytes(public_key.as_slice().try_into().unwrap()).unwrap();
+        let parsed = Signature::from_slice(&signature).unwrap();
+        assert!(
+            verifying.verify(&message, &parsed).is_ok(),
+            "speccheck index 2 is accepted by Verifier::verify"
+        );
+        assert!(
+            key.verify_domain_message(b"", &message, &signature)
+                .is_err(),
+            "production verify_strict must reject the small-order R"
+        );
+    }
+
     #[test]
     fn creates_unique_agent_ids() {
         let first = AgentId::new();
