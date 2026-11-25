@@ -1431,10 +1431,7 @@ fn submit_demo_request(
     let status = response.status();
     let body = response.text()?;
     let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
-    match &parsed {
-        Some(value) => println!("{}", serde_json::to_string_pretty(value)?),
-        None => println!("{body}"),
-    }
+    println!("{}", gateway_body_for_terminal(&body));
     if !status.is_success() {
         return Err(submit_failure_message(status, parsed.as_ref()).into());
     }
@@ -1802,10 +1799,7 @@ fn resolve_approval(
     let status = response.status();
     let body = response.text()?;
     let value = serde_json::from_str::<serde_json::Value>(&body).ok();
-    match &value {
-        Some(value) => println!("{}", serde_json::to_string_pretty(value)?),
-        None => println!("{body}"),
-    }
+    println!("{}", gateway_body_for_terminal(&body));
     if !status.is_success() {
         return Err(format!("gateway returned HTTP {status}; review the response above").into());
     }
@@ -1870,14 +1864,20 @@ fn dispatch_approved(
     })?;
     let status = response.status();
     let body = response.text()?;
-    match serde_json::from_str::<serde_json::Value>(&body) {
-        Ok(value) => println!("{}", serde_json::to_string_pretty(&value)?),
-        Err(_) => println!("{body}"),
-    }
+    println!("{}", gateway_body_for_terminal(&body));
     if !status.is_success() {
         return Err(format!("gateway returned HTTP {status}; review the response above").into());
     }
     Ok(())
+}
+
+/// A gateway response body as the terminal shows it: JSON pretty-printed,
+/// anything else as it came.
+fn gateway_body_for_terminal(body: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_default(),
+        Err(_) => body.to_owned(),
+    }
 }
 
 fn http_client() -> Result<reqwest::blocking::Client, reqwest::Error> {
@@ -1950,8 +1950,16 @@ mod tests {
     }
 
     fn challenge_view(directory: &Path, config: &LocalConfig) -> (ApprovalChallengeView, String) {
+        challenge_view_with_value(directory, config, "safe")
+    }
+
+    fn challenge_view_with_value(
+        directory: &Path,
+        config: &LocalConfig,
+        value: &str,
+    ) -> (ApprovalChallengeView, String) {
         let policy = load_policy(directory).unwrap();
-        let request = build_demo_request(directory, config, &policy, "mode", "safe").unwrap();
+        let request = build_demo_request(directory, config, &policy, "mode", value).unwrap();
         let action_digest = praetore_gateway::action_digest(&request.action).unwrap();
         let policy_digest = policy.digest().unwrap();
         let view = ApprovalChallengeView {
@@ -2048,6 +2056,66 @@ mod tests {
             terminal_safe("ok\n\u{1b}[2Jx\u{202e}y"),
             "ok\n\\u{001b}[2Jx\\u{202e}y"
         );
+    }
+
+    /// One character of each kind the terminal must never receive raw:
+    /// C0, C1 and DEL controls, bidi controls, zero-width characters, the
+    /// byte order mark, a tag character and non-ASCII spaces.
+    const INVISIBLE: &[char] = &[
+        '\u{1b}',
+        '\r',
+        '\u{7f}',
+        '\u{85}',
+        '\u{202e}',
+        '\u{2066}',
+        '\u{200f}',
+        '\u{61c}',
+        '\u{200b}',
+        '\u{2060}',
+        '\u{feff}',
+        '\u{e0041}',
+        '\u{a0}',
+        '\u{3000}',
+    ];
+
+    fn assert_no_invisible(shown: &str) {
+        for c in INVISIBLE {
+            assert!(!shown.contains(*c), "raw {c:?} in {shown:?}");
+        }
+    }
+
+    #[test]
+    fn gateway_bodies_are_escaped_for_the_terminal() {
+        let evil: String = INVISIBLE.iter().collect();
+        let text = gateway_body_for_terminal(&format!("upstream {evil} failed"));
+        let json = gateway_body_for_terminal(&serde_json::json!({"error": evil}).to_string());
+        // Both forms of a body are checked before either fails.
+        let shown = format!("text body: {text}\njson body: {json}");
+        assert_no_invisible(&shown);
+        assert!(text.starts_with("upstream \\u{1b}"), "{text:?}");
+        assert!(json.contains("\\u{202e}"), "{json:?}");
+    }
+
+    #[test]
+    fn approval_request_escapes_invisible_characters() {
+        let directory = env::temp_dir().join(format!("praetore-cli-test-{}", Uuid::new_v4()));
+        initialize(&directory, 8080).unwrap();
+        let config = load_config(&directory).unwrap();
+        let evil: String = INVISIBLE.iter().collect();
+        let (view, policy_digest) = challenge_view_with_value(&directory, &config, &evil);
+        let (agent, request) = (view.challenge.agent_id, view.challenge.request_id);
+        let shown = describe_challenge(
+            &view,
+            &config,
+            agent,
+            request,
+            &policy_digest,
+            HumanApprovalOutcome::Reject,
+        )
+        .unwrap();
+        fs::remove_dir_all(directory).unwrap();
+        assert_no_invisible(&shown);
+        assert!(shown.contains("\\u{200b}"), "{shown}");
     }
 
     #[test]

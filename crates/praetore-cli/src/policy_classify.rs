@@ -140,6 +140,44 @@ mod tests {
         );
     }
 
+    fn assert_no_raw(lines: &[String]) {
+        for line in lines {
+            for raw in ['\u{1b}', '\r', '\u{202e}'] {
+                assert!(!line.contains(raw), "raw {raw:?} in {line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn report_escapes_the_policy_id() {
+        let text = V1.replace(r#"{"id":"p""#, r#"{"id":"p\u001b[2K\r\u202e""#);
+        let report = report(&text).unwrap();
+        assert_no_raw(&report.stderr);
+        assert!(
+            report.stderr[0].starts_with("policy p\\u{1b}[2K\\u{d}\\u{202e} v3"),
+            "{:?}",
+            report.stderr[0]
+        );
+    }
+
+    #[test]
+    fn report_escapes_rule_ids_in_problems() {
+        let text = V1
+            .replace(r#"{"id":"w""#, r#"{"id":"w\u001b[2K\u202e""#)
+            .replace("fs:write_file", "safety:halt");
+        let report = report(&text).unwrap();
+        assert_eq!(report.problems, 1);
+        assert_no_raw(&report.stderr);
+        assert!(
+            report
+                .stderr
+                .iter()
+                .any(|line| line.contains("rule 'w\\u{1b}[2K\\u{202e}' targets safety action")),
+            "{:?}",
+            report.stderr
+        );
+    }
+
     #[test]
     fn never_writes_the_policy_file() {
         let directory =
