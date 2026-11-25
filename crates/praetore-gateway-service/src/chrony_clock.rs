@@ -114,7 +114,7 @@ impl TrustedClock for ChronyClock {
         let now = (self.inner.wall)();
         if state.last_returned.is_some_and(|last| now < last) {
             state.failed = true;
-            return Err(TrustedClockError::Untrusted);
+            return Err(TrustedClockError::Regressed);
         }
         state.last_returned = Some(now);
         Ok(now)
