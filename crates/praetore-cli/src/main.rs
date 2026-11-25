@@ -2101,6 +2101,15 @@ mod tests {
         assert!(json.contains("\\u{202e}"), "{json:?}");
     }
 
+    /// A JSON body without invisible characters prints exactly as before:
+    /// pretty-printed JSON that a script can still parse (`praetore demo`).
+    #[test]
+    fn gateway_json_bodies_stay_pretty_json() {
+        let body = serde_json::json!({"authorization": "allowed", "evidence": {"request_id": "r"}});
+        let shown = gateway_body_for_terminal(&body.to_string());
+        assert_eq!(shown, serde_json::to_string_pretty(&body).unwrap());
+    }
+
     #[test]
     fn approval_request_escapes_invisible_characters() {
         let directory = env::temp_dir().join(format!("praetore-cli-test-{}", Uuid::new_v4()));
@@ -2121,6 +2130,8 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
         assert_no_invisible(&shown);
         assert!(shown.contains("\\u{200b}"), "{shown}");
+        // The parameters keep one JSON line per terminal line.
+        assert!(shown.contains("\n      \"value\": \""), "{shown}");
     }
 
     #[test]
