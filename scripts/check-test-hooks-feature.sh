@@ -10,6 +10,11 @@
 #      the package, with default features, has it enabled;
 #   4. a release build command in the workflows, scripts or examples
 #      enables it or builds with --all-features.
+# Limits:
+#   (a) It does not cover images compiled outside this repository.
+#   (b) The resolved-graph layer (step 3) has no isolated mutant: a
+#       change that would enable the feature in that graph is already
+#       caught by the manifest layer (steps 1 and 2).
 # Usage: check-test-hooks-feature.sh [workspace-root]
 set -euo pipefail
 
