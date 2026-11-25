@@ -78,6 +78,14 @@
 
 ### Breaking
 
+- **`TrustedClockError` is `#[non_exhaustive]` and gains `Regressed`.** A
+  source returns `Regressed` when it reads a time earlier than one it
+  already returned. `TrustedClockSource` latches on it for good, so a
+  later healthy read (for example after `ChronyClock`'s monitor clears
+  its own failure) does not lift the engine's latch. Action: add a
+  wildcard arm to exhaustive matches, and handle `Regressed` if the
+  source distinguishes a regression from `Untrusted` or `Unavailable`.
+
 - **Delegated approval changes Rust types.** `HumanApprovalDecision` gains
   `delegation_chain: Option<Vec<String>>` (version 1 decisions leave it
   `None` and serialize as before), `OutcomeKeys` gains `delegation`,
