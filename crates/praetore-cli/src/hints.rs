@@ -2,12 +2,15 @@
 //! (`doctor` after `init`, `approve`/`reject` when a request is held, and
 //! `dispatch` after an approval).
 
-use praetore_core::display::Show;
+use praetore_core::shell::quote;
 use std::path::Path;
 
 /// The `doctor` line printed at the end of `init`.
 pub fn doctor(directory: &Path) -> String {
-    format!("Then run: praetore doctor {}", directory.shown())
+    format!(
+        "Then run: praetore doctor {}",
+        quote(&directory.to_string_lossy())
+    )
 }
 
 /// The `approve` and `reject` lines printed when a request is held.
@@ -15,10 +18,13 @@ pub fn doctor(directory: &Path) -> String {
 /// These strings are only the hint. Nothing here signs or sends a
 /// decision.
 pub fn approve_reject(directory: &Path, request_id: &str, approver: &str) -> String {
+    let directory = quote(&directory.to_string_lossy());
     format!(
-        "  praetore approve {} {request_id} --approver {approver}\n  praetore reject {} {request_id} --approver {approver}",
-        directory.shown(),
-        directory.shown(),
+        "  praetore approve {directory} {} --approver {}\n  praetore reject {directory} {} --approver {}",
+        quote(request_id),
+        quote(approver),
+        quote(request_id),
+        quote(approver),
     )
 }
 
@@ -26,8 +32,10 @@ pub fn approve_reject(directory: &Path, request_id: &str, approver: &str) -> Str
 /// action has not run.
 pub fn dispatch(directory: &Path, request_id: &str, agent_id: &str) -> String {
     format!(
-        "  praetore dispatch {} {request_id} --agent {agent_id}",
-        directory.shown()
+        "  praetore dispatch {} {} --agent {}",
+        quote(&directory.to_string_lossy()),
+        quote(request_id),
+        quote(agent_id),
     )
 }
 
