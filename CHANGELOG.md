@@ -82,9 +82,11 @@
   source returns `Regressed` when it reads a time earlier than one it
   already returned. `TrustedClockSource` latches on it for good, so a
   later healthy read (for example after `ChronyClock`'s monitor clears
-  its own failure) does not lift the engine's latch. Action: add a
-  wildcard arm to exhaustive matches, and handle `Regressed` if the
-  source distinguishes a regression from `Untrusted` or `Unavailable`.
+  its own failure) does not lift the engine's latch. The latch lives
+  only in process memory and does not survive a restart; an explicit
+  way out is pending P-54-5/P-16-4 (schema 3). Action: add a wildcard
+  arm to exhaustive matches, and handle `Regressed` if the source
+  distinguishes a regression from `Untrusted` or `Unavailable`.
 
 - **Delegated approval changes Rust types.** `HumanApprovalDecision` gains
   `delegation_chain: Option<Vec<String>>` (version 1 decisions leave it
