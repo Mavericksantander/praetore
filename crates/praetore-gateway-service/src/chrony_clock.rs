@@ -370,6 +370,111 @@ Leap status     : Normal\n";
         );
     }
 
+    /// A ChronyClock whose wall clock the test sets, with one healthy
+    /// sample and no monitor thread: the test applies each health poll
+    /// with `record_health`.
+    fn controlled_clock(start: OffsetDateTime) -> (ChronyClock, Arc<RwLock<OffsetDateTime>>) {
+        let wall = Arc::new(RwLock::new(start));
+        let read = wall.clone();
+        let inner = Arc::new(ClockInner {
+            chronyc_path: PathBuf::from("/nonexistent/chronyc"),
+            wall: Box::new(move || *read.read().unwrap()),
+            poll_interval: Duration::from_secs(1),
+            max_sample_age: Duration::from_secs(3600),
+            max_error: Duration::from_millis(100),
+            state: RwLock::new(ClockState {
+                sample: Some(HealthSample {
+                    status: parse_tracking(HEALTHY_TRACKING).unwrap(),
+                    observed_at: Instant::now(),
+                }),
+                failed: false,
+                last_returned: None,
+            }),
+        });
+        (ChronyClock { inner }, wall)
+    }
+
+    struct NoReplay;
+
+    impl praetore_core::ReplayGuard for NoReplay {
+        fn claim_once(
+            &self,
+            _tenant_id: uuid::Uuid,
+            _agent_id: uuid::Uuid,
+            _request_id: uuid::Uuid,
+        ) -> Result<(), praetore_core::ReplayGuardError> {
+            Ok(())
+        }
+    }
+
+    struct NoFreshness;
+
+    impl praetore_core::FreshnessProvider for NoFreshness {
+        fn check(
+            &self,
+            _agent: &praetore_core::AgentKeyFingerprint,
+            _authority_id: &praetore_core::AuthorityId,
+            _policy_digest: &str,
+            _now: OffsetDateTime,
+        ) -> Result<praetore_core::FreshnessLease, praetore_core::FreshnessError> {
+            Err(praetore_core::FreshnessError::Unavailable)
+        }
+    }
+
+    /// The gateway's composition (`main.rs`): a HighAssurance engine over
+    /// a ChronyClock.
+    fn engine_over(clock: ChronyClock) -> praetore_core::engine::AuthorizationEngine {
+        let policy = praetore_core::Policy::new_v2("chrony-latch", 1, vec![]);
+        let issuer = praetore_core::AgentKeyPair::generate();
+        let pin = praetore_core::TrustedAuthorityIssuer::new("praetore-root", issuer.public_key())
+            .unwrap()
+            .with_validity(praetore_core::authority::Validity {
+                not_before: Some("2026-01-01T00:00:00Z".into()),
+                not_after: Some("2027-01-01T00:00:00Z".into()),
+            })
+            .unwrap();
+        let config = praetore_core::HighAssuranceConfig::new(
+            policy.digest().unwrap(),
+            vec![pin],
+            praetore_core::EvidenceAttesterKey::generate(),
+        )
+        .unwrap()
+        .with_audience("chrony-latch-test")
+        .with_replay_guard(Arc::new(NoReplay))
+        .with_freshness_provider(Arc::new(NoFreshness));
+        praetore_core::engine::AuthorizationEngine::production_with_trusted_clock(
+            policy, config, clock,
+        )
+        .unwrap()
+    }
+
+    /// P-50-2: a backward step of the wall clock latches the engine for
+    /// good, even after the next healthy chrony poll and after the wall
+    /// clock passes the last time it returned.
+    #[test]
+    fn a_wall_clock_regression_stays_latched_after_a_healthy_poll() {
+        let start = OffsetDateTime::from_unix_timestamp(1_780_315_200).unwrap();
+        let (clock, wall) = controlled_clock(start);
+        let inner = clock.inner.clone();
+        let engine = engine_over(clock);
+        assert_eq!(engine.trusted_now().unwrap(), start);
+
+        *wall.write().unwrap() = start - time::Duration::seconds(30);
+        assert!(engine.trusted_now().is_err(), "a backward read is refused");
+
+        // The monitor thread's next poll: chrony is healthy.
+        assert!(record_health(
+            &inner,
+            Ok(parse_tracking(HEALTHY_TRACKING).unwrap())
+        ));
+        *wall.write().unwrap() = start + time::Duration::seconds(60);
+        assert!(
+            engine.trusted_now().is_err(),
+            "after a regression the engine must stay latched, even after a healthy poll \
+             and once the wall clock passes the last returned time"
+        );
+    }
+
     #[test]
     fn rejects_local_reference_clock_as_unsynchronized() {
         let status = parse_tracking(&HEALTHY_TRACKING.replace("C0A80101", "7F7F0101")).unwrap();
