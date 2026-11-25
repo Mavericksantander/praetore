@@ -1650,7 +1650,7 @@ fn describe_challenge(
             .map(|value| escape_invisible(&serde_json::to_string(value).unwrap_or_default()))
             .unwrap_or_else(|| "(none)".into())
     };
-    let parameters = escape_invisible(&serde_json::to_string_pretty(&action.parameters)?)
+    let parameters = json_for_terminal(&action.parameters)?
         .lines()
         .map(|line| format!("    {line}"))
         .collect::<Vec<_>>()
@@ -1883,12 +1883,23 @@ fn dispatch_approved(
     Ok(())
 }
 
+/// `value` as pretty JSON for the terminal: each line with the invisible
+/// characters JSON leaves (DEL, C1, bidi, zero-width, tags) escaped. JSON
+/// strings never hold a raw newline, so the lines are the JSON's own.
+fn json_for_terminal(value: &impl Serialize) -> serde_json::Result<String> {
+    Ok(serde_json::to_string_pretty(value)?
+        .lines()
+        .map(escape_invisible)
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
 /// A gateway response body as the terminal shows it: JSON pretty-printed
 /// with the invisible characters JSON leaves escaped, anything else escaped
 /// in full.
 fn gateway_body_for_terminal(body: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(body) {
-        Ok(value) => escape_invisible(&serde_json::to_string_pretty(&value).unwrap_or_default()),
+        Ok(value) => json_for_terminal(&value).unwrap_or_default(),
         Err(_) => escape_for_display(body),
     }
 }
