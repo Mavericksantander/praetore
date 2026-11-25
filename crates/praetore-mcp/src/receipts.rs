@@ -121,8 +121,8 @@ pub fn render_table(
                     });
                 out.push_str(&format!(
                     "{:<20} {:<7} {:<16} {:<22} {:<18} {:<24} {:<36} {}\n",
-                    time,
-                    mode,
+                    truncate(&time, 20),
+                    truncate(mode, 7),
                     truncate(evidence.action.target.as_deref().unwrap_or("-"), 16),
                     truncate(&tool, 22),
                     decision_label(outcome),
@@ -643,4 +643,64 @@ pub fn verify_journal_with(
     report.approval_executions = approvals.executions;
     report.approval_head = approvals.head;
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use praetore_core::{Action, AgentId, AgentIdentity, Authority, DecidedBy, Decision};
+    use uuid::Uuid;
+
+    #[test]
+    fn render_table_escapes_mode() {
+        let id = AgentId::new();
+        let agent = AgentIdentity::new(id.clone(), b"test-public-key".to_vec(), "ed25519").unwrap();
+        let authority = Authority::new(
+            id,
+            "praetore-root",
+            vec![crate::store::CAPABILITY.to_owned()],
+        );
+        let action = Action::new(
+            crate::store::ACTION_TYPE,
+            Some("srv".into()),
+            serde_json::json!({"server": "srv", "tool": "echo", "arguments": {}}),
+        )
+        .unwrap();
+        let decision = Decision::allow(
+            "ok",
+            DecidedBy::Rule {
+                rule_id: "r1".into(),
+            },
+        );
+        let context = BTreeMap::from([(
+            MODE_CONTEXT_KEY.to_owned(),
+            serde_json::json!("m\x1b[2K\r\n\u{202e}\u{200b}"),
+        )]);
+        let evidence = Evidence::new_with_context(
+            Uuid::nil(),
+            agent,
+            authority,
+            action,
+            decision,
+            None,
+            context,
+        )
+        .unwrap();
+        let evidence_json = evidence.to_json().unwrap();
+        let line = JournalLine {
+            file: PathBuf::from("2026-11-24.jsonl"),
+            line_number: 1,
+            text: format!(
+                "{{\"seq\":0,\"prev\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"evidence\":{evidence_json}}}"
+            ),
+        };
+        let table = render_table(&[line], 10, &BTreeMap::new());
+        for forbidden in ["\x1b", "\r", "\u{202e}", "\u{200b}", "[2K\n"] {
+            assert!(
+                !table.contains(forbidden),
+                "raw {forbidden:?} in render_table:\n{table:?}"
+            );
+        }
+        assert!(table.contains("\\u{1b"), "{table}");
+    }
 }

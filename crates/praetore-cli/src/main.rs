@@ -3,7 +3,10 @@ use postgres::Client;
 use praetore_core::{
     Action, AgentId, AgentKeyPair, Authority, AuthorizationRequest, EvidenceAttesterKey,
     FreshnessError, FreshnessLease, FreshnessProvider, HighAssuranceConfig, Policy, PolicyEffect,
-    PolicyRule, TrustedAuthorityIssuer, authority::Validity, engine::AuthorizationEngine,
+    PolicyRule, TrustedAuthorityIssuer,
+    authority::Validity,
+    display::{Show, escape_for_display, escape_invisible},
+    engine::AuthorizationEngine,
     identity::AgentKeyFingerprint,
 };
 use praetore_gateway::{
@@ -180,7 +183,7 @@ impl ExecutionAttestationSigner for LocalExecutionSigner {
 
 fn main() {
     if let Err(error) = run_cli() {
-        eprintln!("Error: {error}");
+        eprintln!("Error: {}", error.to_string().shown());
         std::process::exit(1);
     }
 }
@@ -520,11 +523,11 @@ fn initialize_with_options(
     write_execution_pin(directory, &execution_key_bytes)?;
     write_attester_pin(directory, &evidence_key_bytes)?;
 
-    println!("Initialized local demo at {}", directory.display());
+    println!("Initialized local demo at {}", directory.shown());
     println!("Human approver id: {LOCAL_APPROVER_ID}");
     println!("Private keys were generated locally with owner-only file permissions.");
     println!("Next, set PRAETORE_GATEWAY_DATABASE_URL to a local PostgreSQL database URL.");
-    println!("Then run: praetore doctor {}", directory.display());
+    println!("Then run: praetore doctor {}", directory.shown());
     println!(
         "The loopback HTTP API requires the generated {AGENT_TOKEN_FILE} / {APPROVER_TOKEN_FILE} bearer tokens; this demo is not production key custody."
     );
@@ -552,7 +555,7 @@ fn export_execution_pin(directory: &Path) -> Result<(), Box<dyn std::error::Erro
     let pin = write_execution_pin(directory, &secret)?;
     println!(
         "Wrote {} (key_id {}). It holds only the public key.",
-        directory.join(EXECUTION_PIN_FILE).display(),
+        directory.join(EXECUTION_PIN_FILE).shown(),
         pin.key_id
     );
     Ok(())
@@ -588,7 +591,7 @@ fn export_attester_pin(directory: &Path) -> Result<(), Box<dyn std::error::Error
     write_attester_pin(directory, &secret)?;
     println!(
         "Wrote {}. It holds only the public key.",
-        directory.join(ATTESTER_PIN_FILE).display()
+        directory.join(ATTESTER_PIN_FILE).shown()
     );
     Ok(())
 }
@@ -730,7 +733,10 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
             Some(config)
         }
         Err(error) => {
-            println!("[failed] local configuration: {error}");
+            println!(
+                "[failed] local configuration: {}",
+                error.to_string().shown()
+            );
             healthy = false;
             None
         }
@@ -741,7 +747,7 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
             Some(policy)
         }
         Err(error) => {
-            println!("[failed] policy: {error}");
+            println!("[failed] policy: {}", error.to_string().shown());
             healthy = false;
             None
         }
@@ -752,7 +758,7 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
             Some(pin)
         }
         Err(error) => {
-            println!("[failed] issuer pin: {error}");
+            println!("[failed] issuer pin: {}", error.to_string().shown());
             healthy = false;
             None
         }
@@ -768,7 +774,7 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
         match read_secret(directory, secret_file) {
             Ok(_) => println!("[ok] {secret_file} exists with owner-only permissions"),
             Err(error) => {
-                println!("[failed] {secret_file}: {error}");
+                println!("[failed] {secret_file}: {}", error.to_string().shown());
                 healthy = false;
             }
         }
@@ -788,14 +794,17 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
                     println!("[failed] {APPROVER_KEY_FILE} does not match the approver pin");
                     healthy = false;
                 }
-                Err(error) => println!("[info] {APPROVER_KEY_FILE} not usable here: {error}"),
+                Err(error) => println!(
+                    "[info] {APPROVER_KEY_FILE} not usable here: {}",
+                    error.to_string().shown()
+                ),
             }
         }
         Ok(None) => {
             println!("[info] no {APPROVER_PIN_FILE}; human approval is disabled (fail-closed)")
         }
         Err(error) => {
-            println!("[failed] approver pin: {error}");
+            println!("[failed] approver pin: {}", error.to_string().shown());
             healthy = false;
         }
     }
@@ -807,11 +816,11 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
         match open_sandbox(directory, root) {
             Ok(dispatcher) => println!(
                 "[ok] sandbox root {} (gateway-executed fs actions; path resolution: {})",
-                root.display(),
+                root.shown(),
                 dispatcher.path_resolution()
             ),
             Err(error) => {
-                println!("[failed] sandbox root: {error}");
+                println!("[failed] sandbox root: {}", error.to_string().shown());
                 healthy = false;
             }
         }
@@ -821,7 +830,7 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
     match config.as_ref().map(http_options) {
         Some(Ok(options)) => println!("{}", exec_mode_notice(options.exec_mode)),
         Some(Err(error)) => {
-            println!("[failed] {error}");
+            println!("[failed] {}", error.to_string().shown());
             healthy = false;
         }
         None => {}
@@ -847,7 +856,7 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 match client.query_one("SELECT 1", &[]) {
                     Ok(_) => println!("[ok] local PostgreSQL connection"),
                     Err(error) => {
-                        println!("[failed] PostgreSQL query: {error}");
+                        println!("[failed] PostgreSQL query: {}", error.to_string().shown());
                         healthy = false;
                     }
                 }
@@ -861,17 +870,28 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 match praetore_replay_postgres::verify_runtime_role_with(&mut client, &options) {
                     Ok(()) => println!("[ok] least-privilege runtime database role"),
-                    Err(error) => println!("[warn] {error} (acceptable for the local demo only)"),
+                    Err(error) => println!(
+                        "[warn] {} (acceptable for the local demo only)",
+                        error.to_string().shown()
+                    ),
                 }
                 match praetore_replay_postgres::legacy_baseline_adoption(&mut client) {
                     Ok(Some(adoption)) => println!("[info] {adoption}"),
                     Ok(None) => {}
-                    Err(error) => println!("[warn] legacy baseline record unreadable: {error}"),
+                    Err(error) => println!(
+                        "[warn] legacy baseline record unreadable: {}",
+                        error.to_string().shown()
+                    ),
                 }
                 match praetore_replay_postgres::migration_record_inconsistency(&mut client) {
-                    Ok(Some(problem)) => println!("[warn] migration record: {problem}"),
+                    Ok(Some(problem)) => {
+                        println!("[warn] migration record: {}", problem.to_string().shown())
+                    }
                     Ok(None) => {}
-                    Err(error) => println!("[warn] migration record unreadable: {error}"),
+                    Err(error) => println!(
+                        "[warn] migration record unreadable: {}",
+                        error.to_string().shown()
+                    ),
                 }
                 match praetore_replay_postgres::describe_trusted_security_definer(
                     &mut client,
@@ -891,7 +911,7 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
                             );
                         }
                     }
-                    Err(error) => println!("[failed] {error}"),
+                    Err(error) => println!("[failed] {}", error.to_string().shown()),
                 }
                 let migration_options = migration_options_from_env();
                 for (name, entries) in [
@@ -914,7 +934,7 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 if let Err(error) = praetore_replay_postgres::parse_trusted_default_privileges(
                     &migration_options.trusted_default_privileges,
                 ) {
-                    println!("[failed] {error}");
+                    println!("[failed] {}", error.to_string().shown());
                     healthy = false;
                 }
                 match praetore_replay_postgres::event_trigger_report(
@@ -928,11 +948,16 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
                                     "[warn] trusted event trigger {} verified; it runs during migrations",
                                     status.name
                                 ),
-                                Some(problem) => println!("[failed] {problem}"),
+                                Some(problem) => {
+                                    println!("[failed] {}", problem.to_string().shown())
+                                }
                             }
                         }
                     }
-                    Err(error) => println!("[warn] event triggers unreadable: {error}"),
+                    Err(error) => println!(
+                        "[warn] event triggers unreadable: {}",
+                        error.to_string().shown()
+                    ),
                 }
                 match praetore_replay_postgres::runtime_role_members(&mut client) {
                     Ok(members) if members.is_empty() => {}
@@ -940,7 +965,10 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
                         "[info] other login members of praetore_runtime: {}",
                         members.join(", ")
                     ),
-                    Err(error) => println!("[warn] praetore_runtime members unreadable: {error}"),
+                    Err(error) => println!(
+                        "[warn] praetore_runtime members unreadable: {}",
+                        error.to_string().shown()
+                    ),
                 }
                 for table in REQUIRED_DATABASE_TABLES {
                     let exists: bool = client
@@ -957,7 +985,7 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Err(error) => {
-                println!("[failed] PostgreSQL: {error}");
+                println!("[failed] PostgreSQL: {}", error.to_string().shown());
                 healthy = false;
             }
         },
@@ -1275,7 +1303,7 @@ fn run_gateway(
     }
     if let Some(root) = &config.sandbox_root {
         tracing::warn!(
-            sandbox_root = %root.display(),
+            sandbox_root = %root.shown(),
             "gateway executes fs:write_file / fs:delete_file inside the sandbox root; agents must not execute effects themselves (cooperative execution is refused)"
         );
     }
@@ -1431,10 +1459,7 @@ fn submit_demo_request(
     let status = response.status();
     let body = response.text()?;
     let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
-    match &parsed {
-        Some(value) => println!("{}", serde_json::to_string_pretty(value)?),
-        None => println!("{body}"),
-    }
+    println!("{}", gateway_body_for_terminal(&body));
     if !status.is_success() {
         return Err(submit_failure_message(status, parsed.as_ref()).into());
     }
@@ -1447,8 +1472,8 @@ fn submit_demo_request(
             receipt["evidence"]["freshness_valid_until"]
                 .as_str()
                 .unwrap_or("unknown"),
-            directory.display(),
-            directory.display(),
+            directory.shown(),
+            directory.shown(),
         );
     }
     Ok(())
@@ -1587,24 +1612,6 @@ enum Confirmation {
     AssumeYes,
 }
 
-/// Escapes control and bidirectional-formatting characters so gateway- or
-/// agent-supplied text cannot rewrite the terminal or disguise itself.
-fn terminal_safe(text: &str) -> String {
-    let mut safe = String::with_capacity(text.len());
-    for character in text.chars() {
-        let bidi = matches!(
-            character,
-            '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
-        );
-        if (character.is_control() && character != '\n') || bidi {
-            safe.push_str(&format!("\\u{{{:04x}}}", character as u32));
-        } else {
-            safe.push(character);
-        }
-    }
-    safe
-}
-
 /// Checks that the challenge belongs to this execution, that the shown
 /// action is exactly the one the challenge's digest commits to, and that it
 /// was evaluated under this demo's policy; then renders it for the human.
@@ -1636,12 +1643,14 @@ fn describe_challenge(
         );
     }
     let action = &view.action;
+    // JSON strings keep their quotes and escapes; invisible characters the
+    // JSON escaping leaves (DEL, C1, bidi, zero-width, tags) are escaped.
     let quoted = |value: Option<&str>| {
         value
-            .map(|value| serde_json::to_string(value).unwrap_or_default())
+            .map(|value| escape_invisible(&serde_json::to_string(value).unwrap_or_default()))
             .unwrap_or_else(|| "(none)".into())
     };
-    let parameters = serde_json::to_string_pretty(&action.parameters)?
+    let parameters = json_for_terminal(&action.parameters)?
         .lines()
         .map(|line| format!("    {line}"))
         .collect::<Vec<_>>()
@@ -1650,7 +1659,7 @@ fn describe_challenge(
         HumanApprovalOutcome::Approve => "APPROVE",
         HumanApprovalOutcome::Reject => "REJECT",
     };
-    Ok(terminal_safe(&format!(
+    Ok(format!(
         "Approval request\n  \
          tenant:         {}\n  \
          agent:          {}\n  \
@@ -1671,8 +1680,8 @@ fn describe_challenge(
         quoted(action.capability.as_deref()),
         challenge.action_digest,
         challenge.policy_digest,
-        challenge.expires_at,
-    )))
+        challenge.expires_at.shown(),
+    ))
 }
 
 fn confirm_decision(confirmation: Confirmation) -> Result<(), Box<dyn std::error::Error>> {
@@ -1771,7 +1780,7 @@ fn resolve_approval(
     let status = response.status();
     let body = response.text()?;
     if !status.is_success() {
-        println!("{}", terminal_safe(&body));
+        println!("{}", gateway_body_for_terminal(&body));
         return Err(format!("gateway refused the approval challenge (HTTP {status})").into());
     }
     let view = ApprovalChallengeView::from_json(&body)
@@ -1802,10 +1811,7 @@ fn resolve_approval(
     let status = response.status();
     let body = response.text()?;
     let value = serde_json::from_str::<serde_json::Value>(&body).ok();
-    match &value {
-        Some(value) => println!("{}", serde_json::to_string_pretty(value)?),
-        None => println!("{body}"),
-    }
+    println!("{}", gateway_body_for_terminal(&body));
     if !status.is_success() {
         return Err(format!("gateway returned HTTP {status}; review the response above").into());
     }
@@ -1814,7 +1820,7 @@ fn resolve_approval(
     {
         println!(
             "approved_pending_dispatch: the approval is recorded and the action has NOT run. Dispatch it once with:\n  praetore dispatch {} {request_id} --agent {agent_id}",
-            directory.display()
+            directory.shown()
         );
     }
     Ok(())
@@ -1870,14 +1876,32 @@ fn dispatch_approved(
     })?;
     let status = response.status();
     let body = response.text()?;
-    match serde_json::from_str::<serde_json::Value>(&body) {
-        Ok(value) => println!("{}", serde_json::to_string_pretty(&value)?),
-        Err(_) => println!("{body}"),
-    }
+    println!("{}", gateway_body_for_terminal(&body));
     if !status.is_success() {
         return Err(format!("gateway returned HTTP {status}; review the response above").into());
     }
     Ok(())
+}
+
+/// `value` as pretty JSON for the terminal: each line with the invisible
+/// characters JSON leaves (DEL, C1, bidi, zero-width, tags) escaped. JSON
+/// strings never hold a raw newline, so the lines are the JSON's own.
+fn json_for_terminal(value: &impl Serialize) -> serde_json::Result<String> {
+    Ok(serde_json::to_string_pretty(value)?
+        .lines()
+        .map(escape_invisible)
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// A gateway response body as the terminal shows it: JSON pretty-printed
+/// with the invisible characters JSON leaves escaped, anything else escaped
+/// in full.
+fn gateway_body_for_terminal(body: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(value) => json_for_terminal(&value).unwrap_or_default(),
+        Err(_) => escape_for_display(body),
+    }
 }
 
 fn http_client() -> Result<reqwest::blocking::Client, reqwest::Error> {
@@ -1950,8 +1974,16 @@ mod tests {
     }
 
     fn challenge_view(directory: &Path, config: &LocalConfig) -> (ApprovalChallengeView, String) {
+        challenge_view_with_value(directory, config, "safe")
+    }
+
+    fn challenge_view_with_value(
+        directory: &Path,
+        config: &LocalConfig,
+        value: &str,
+    ) -> (ApprovalChallengeView, String) {
         let policy = load_policy(directory).unwrap();
-        let request = build_demo_request(directory, config, &policy, "mode", "safe").unwrap();
+        let request = build_demo_request(directory, config, &policy, "mode", value).unwrap();
         let action_digest = praetore_gateway::action_digest(&request.action).unwrap();
         let policy_digest = policy.digest().unwrap();
         let view = ApprovalChallengeView {
@@ -2042,12 +2074,75 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    /// One character of each kind the terminal must never receive raw:
+    /// C0, C1 and DEL controls, bidi controls, zero-width characters, the
+    /// byte order mark, a tag character and non-ASCII spaces.
+    const INVISIBLE: &[char] = &[
+        '\u{1b}',
+        '\r',
+        '\u{7f}',
+        '\u{85}',
+        '\u{202e}',
+        '\u{2066}',
+        '\u{200f}',
+        '\u{61c}',
+        '\u{200b}',
+        '\u{2060}',
+        '\u{feff}',
+        '\u{e0041}',
+        '\u{a0}',
+        '\u{3000}',
+    ];
+
+    fn assert_no_invisible(shown: &str) {
+        for c in INVISIBLE {
+            assert!(!shown.contains(*c), "raw {c:?} in {shown:?}");
+        }
+    }
+
     #[test]
-    fn terminal_output_escapes_control_and_bidi_characters() {
-        assert_eq!(
-            terminal_safe("ok\n\u{1b}[2Jx\u{202e}y"),
-            "ok\n\\u{001b}[2Jx\\u{202e}y"
-        );
+    fn gateway_bodies_are_escaped_for_the_terminal() {
+        let evil: String = INVISIBLE.iter().collect();
+        let text = gateway_body_for_terminal(&format!("upstream {evil} failed"));
+        let json = gateway_body_for_terminal(&serde_json::json!({"error": evil}).to_string());
+        // Both forms of a body are checked before either fails.
+        let shown = format!("text body: {text}\njson body: {json}");
+        assert_no_invisible(&shown);
+        assert!(text.starts_with("upstream \\u{1b}"), "{text:?}");
+        assert!(json.contains("\\u{202e}"), "{json:?}");
+    }
+
+    /// A JSON body without invisible characters prints exactly as before:
+    /// pretty-printed JSON that a script can still parse (`praetore demo`).
+    #[test]
+    fn gateway_json_bodies_stay_pretty_json() {
+        let body = serde_json::json!({"authorization": "allowed", "evidence": {"request_id": "r"}});
+        let shown = gateway_body_for_terminal(&body.to_string());
+        assert_eq!(shown, serde_json::to_string_pretty(&body).unwrap());
+    }
+
+    #[test]
+    fn approval_request_escapes_invisible_characters() {
+        let directory = env::temp_dir().join(format!("praetore-cli-test-{}", Uuid::new_v4()));
+        initialize(&directory, 8080).unwrap();
+        let config = load_config(&directory).unwrap();
+        let evil: String = INVISIBLE.iter().collect();
+        let (view, policy_digest) = challenge_view_with_value(&directory, &config, &evil);
+        let (agent, request) = (view.challenge.agent_id, view.challenge.request_id);
+        let shown = describe_challenge(
+            &view,
+            &config,
+            agent,
+            request,
+            &policy_digest,
+            HumanApprovalOutcome::Reject,
+        )
+        .unwrap();
+        fs::remove_dir_all(directory).unwrap();
+        assert_no_invisible(&shown);
+        assert!(shown.contains("\\u{200b}"), "{shown}");
+        // The parameters keep one JSON line per terminal line.
+        assert!(shown.contains("\n      \"value\": \""), "{shown}");
     }
 
     #[test]
