@@ -30,6 +30,7 @@ pub trait Clock: Send + Sync {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum TrustedClockError {
     #[error("trusted clock is unavailable")]
     Unavailable,
