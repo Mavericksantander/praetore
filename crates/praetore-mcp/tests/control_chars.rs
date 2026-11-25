@@ -444,3 +444,66 @@ fn the_lossy_guard_finds_each_macro_and_spans_lines() {
         .collect();
     assert_eq!(lines, [3, 6, 8]);
 }
+
+#[test]
+fn policy_check_escapes_policy_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let home_arg = home.to_str().unwrap();
+    assert!(run(&["init", "--dir", home_arg], "").status.success());
+
+    let policy_path = home.join("policy.json");
+    let mut policy: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&policy_path).unwrap()).unwrap();
+    policy["id"] = serde_json::json!(format!("pol{EVIL}\u{202e}"));
+    fs::write(&policy_path, serde_json::to_string_pretty(&policy).unwrap()).unwrap();
+
+    let out = run(&["policy", "check", "--dir", home_arg], "");
+    assert!(out.status.success(), "{out:?}");
+    let text = terminal_text(&out);
+    assert!(
+        !text.contains('\u{202e}'),
+        "raw bidi character in policy check output:\n{text:?}"
+    );
+    assert!(text.contains(&format!("pol{SHOWN}\\u{{202e}}")), "{text}");
+}
+
+/// Lines that may pass `.to_compact()` into a formatting macro: JSON
+/// builders or internal strings whose renderer escapes with `.shown()`.
+const COMPACT_EXCEPTIONS: &[Exception] = &[
+    allow(
+        "src/install.rs",
+        "return Some(format!(\"transport type {} is not stdio\", kind.to_compact()));",
+        "internal ChangeKind::Skipped string; render_changes formats reason with .shown()",
+    ),
+    allow(
+        "src/install.rs",
+        "JsonValue::string(key).to_compact(),",
+        "render_member writes strict JSON, not a terminal message",
+    ),
+    allow(
+        "src/install.rs",
+        "None => format!(\",{key_text}:{}\", value.to_compact()),",
+        "render_member writes strict JSON, not a terminal message",
+    ),
+];
+
+/// JsonValue::to_compact() only escapes JSON C0 controls, leaving DEL, C1,
+/// zero-width, and bidi characters unescaped. Any human-facing message
+/// formatting `to_compact()` must escape it through `.shown()`.
+#[test]
+fn src_escapes_json_to_compact_in_messages() {
+    let (found, stale) = check_guard(COMPACT_EXCEPTIONS, |source| {
+        inside_format_macros(source, ".to_compact()")
+    });
+    assert!(
+        found.is_empty(),
+        "escape .to_compact() with .shown() in human messages, or add an exception with its exact line and reason:\n{}",
+        found.join("\n")
+    );
+    assert!(
+        stale.is_empty(),
+        "exceptions that match no line any more:\n{}",
+        stale.join("\n")
+    );
+}
