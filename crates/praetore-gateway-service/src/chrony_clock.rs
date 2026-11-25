@@ -462,16 +462,30 @@ Leap status     : Normal\n";
         *wall.write().unwrap() = start - time::Duration::seconds(30);
         assert!(engine.trusted_now().is_err(), "a backward read is refused");
 
-        // The monitor thread's next poll: chrony is healthy.
+        // The monitor thread's next poll: chrony is healthy. That clears
+        // the source's own failure; a later read is healthy. The engine
+        // stays latched all the same.
         assert!(record_health(
             &inner,
             Ok(parse_tracking(HEALTHY_TRACKING).unwrap())
         ));
+        assert!(
+            !inner.state.read().unwrap().failed,
+            "a healthy poll clears ChronyClock's own failure"
+        );
         *wall.write().unwrap() = start + time::Duration::seconds(60);
+        assert_eq!(
+            ChronyClock {
+                inner: inner.clone()
+            }
+            .now()
+            .unwrap(),
+            start + time::Duration::seconds(60),
+            "the source reports health once the wall clock passes the last returned time"
+        );
         assert!(
             engine.trusted_now().is_err(),
-            "after a regression the engine must stay latched, even after a healthy poll \
-             and once the wall clock passes the last returned time"
+            "after a regression the engine must stay latched, even after a healthy poll              and once the wall clock passes the last returned time"
         );
     }
 
