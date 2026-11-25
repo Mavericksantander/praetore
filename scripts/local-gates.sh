@@ -85,21 +85,36 @@ for (pkg, tgt, mode), names in sorted(groups.items()):
             sys.stderr.write(f"  - {m}\n")
         sys.exit(1)
     if mode == "runnable":
-        skip_args = []
+        skip_args = ["--exact"]
         for n in names:
             skip_args.extend(["--skip", n])
         filt_out = subprocess.check_output(cmd + skip_args, text=True)
         filt_listed = {l[:-6] for l in filt_out.splitlines() if l.endswith(": test")}
-        leaked = sorted(set(names) & filt_listed)
+        deny_set = set(names)
+        leaked = sorted(deny_set & filt_listed)
+        over_skipped = sorted((listed - deny_set) - filt_listed)
+        skipped_count = len(listed) - len(filt_listed)
         if leaked:
             sys.stderr.write(
-                f"ERROR: --skip failed to exclude denylisted test(s) in {pkg} {tgt}:\n"
+                f"ERROR: --exact --skip failed to exclude denylisted test(s) in {pkg} {tgt}:\n"
             )
             for l in leaked:
                 sys.stderr.write(f"  - {l}\n")
             sys.exit(1)
-    print(f"verified {pkg} {tgt} ({mode}): {len(names)} denylisted tests present")
+        if over_skipped or skipped_count != len(deny_set):
+            sys.stderr.write(
+                f"ERROR: --exact --skip mismatch in {pkg} {tgt}: "
+                f"denylist={len(deny_set)} skipped={skipped_count} over_skipped={over_skipped}\n"
+            )
+            sys.exit(1)
+        print(
+            f"verified {pkg} {tgt} ({mode}): total={len(listed)} "
+            f"denylist={len(deny_set)} skipped={skipped_count} over_skipped={over_skipped}"
+        )
+    else:
+        print(f"verified {pkg} {tgt} ({mode}): {len(names)} denylisted tests present")
 PY
+"$repo_root/scripts/test-local-gates-skip-exact.sh" "$denylist"
 
 if [[ "$validate_only" -eq 1 ]]; then
   echo "OK: denylist validation passed"
@@ -155,7 +170,7 @@ run_with_denylist() {
   done < <(skip_flags_for "$pkg" "$tgt")
   echo "--- cargo test --locked -p $pkg $tgt (${#skips[@]} skip args)"
   if [[ ${#skips[@]} -gt 0 ]]; then
-    cargo test --locked -p "$pkg" $tgt -- "${skips[@]}"
+    cargo test --locked -p "$pkg" $tgt -- --exact "${skips[@]}"
   else
     cargo test --locked -p "$pkg" $tgt
   fi
@@ -179,9 +194,9 @@ cargo test --locked -p praetore-gateway --doc
 cargo test --locked -p praetore-gateway --test safety_actions
 run_with_denylist praetore-gateway --test enforcement
 
-# praetore-mcp: build binary for approvals::tests::run_verify, then --doc, --lib with --skip, and every --test target with --skip
+# praetore-mcp: build binary + fake_server example for integration tests, then --doc, --lib with --skip, and every --test target with --skip
 echo "--- cargo test --locked -p praetore-mcp"
-cargo build --locked -p praetore-mcp --bin praetore-mcp
+cargo build --locked -p praetore-mcp --bin praetore-mcp --example fake_server
 cargo test --locked -p praetore-mcp --doc
 run_with_denylist praetore-mcp --lib
 mcp_tests="$(cargo metadata --no-deps --format-version 1 --locked | python3 -c '
