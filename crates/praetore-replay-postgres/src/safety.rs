@@ -325,14 +325,23 @@ impl PostgresSafetyStore {
         Ok(heads)
     }
 
-    /// Stores `prepared` in one transaction with `synchronous_commit = on`.
-    /// The insert trigger refuses a record that does not extend its chain.
+    /// Stores `prepared` in one READ COMMITTED transaction (whatever the
+    /// database's default) with `synchronous_commit = on`. The insert
+    /// trigger refuses a record that does not extend its chain.
     pub fn store(
         &mut self,
         tenant_id: Uuid,
         prepared: &PreparedRecords,
     ) -> Result<(), SafetyStoreError> {
-        let mut transaction = self.client.transaction()?;
+        // READ COMMITTED whatever the database's default, like the
+        // execution journal: a writer that waits on the chain position of
+        // another gets a unique violation once that one commits, not a
+        // serialization failure that depends on the default.
+        let mut transaction = self
+            .client
+            .build_transaction()
+            .isolation_level(postgres::IsolationLevel::ReadCommitted)
+            .start()?;
         transaction.batch_execute("SET LOCAL synchronous_commit = on")?;
         set_tenant_context(&mut transaction, tenant_id)?;
         if prepared.high_waters.len() != prepared.records.len() {
