@@ -31,6 +31,11 @@ jobs:
       - name: Install zsh so the print-cmd round-trip is not skipped
         run: sudo apt-get update && sudo apt-get install -y zsh
       - run: cargo test --workspace --locked
+      # After the tests: the self-test resolves copies of the tree offline.
+      - name: test-hooks of praetore-replay-postgres never reaches a shipped build
+        run: |
+          scripts/test-check-test-hooks-feature.sh
+          scripts/check-test-hooks-feature.sh
       - name: print-cmd round-trip includes zsh
         run: |
           set -euo pipefail
@@ -562,6 +567,16 @@ jobs:
         # superuser, or around a restart) are listed in the script, which
         # fails if one of them no longer exists.
         run: ./scripts/postgres-ignored-tests.sh
+      # Built with the development feature test-hooks (the store() hook);
+      # the script above runs without it, so this test is not listed there.
+      - name: Lost-lock permutations of the safety ingest (test-hooks)
+        run: |
+          set -euo pipefail
+          name=g1_safety::permutations::postgres_safety_lost_lock_permutations_keep_the_chain_linear
+          output="$(cargo test -p praetore-replay-postgres --locked --features test-hooks --test postgres -- --ignored --exact "$name" --nocapture 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::$name did not run"; exit 1; }
+          grep -q "read committed: 35 schedules" <<<"$output" || { echo "::error::$name did not cover the 35 schedules"; exit 1; }
       - name: Runtime-role check connects as the postgres superuser
         run: |
           set -euo pipefail
