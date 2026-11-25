@@ -29,8 +29,13 @@ struct ClockState {
     last_returned: Option<OffsetDateTime>,
 }
 
+/// The wall clock that `now` reads: `OffsetDateTime::now_utc` in
+/// production, a controlled one in tests.
+type WallClock = Box<dyn Fn() -> OffsetDateTime + Send + Sync>;
+
 struct ClockInner {
     chronyc_path: PathBuf,
+    wall: WallClock,
     poll_interval: Duration,
     max_sample_age: Duration,
     max_error: Duration,
@@ -70,6 +75,7 @@ impl ChronyClock {
 
         let inner = Arc::new(ClockInner {
             chronyc_path: chronyc_path.to_owned(),
+            wall: Box::new(OffsetDateTime::now_utc),
             poll_interval,
             max_sample_age,
             max_error,
@@ -105,7 +111,7 @@ impl TrustedClock for ChronyClock {
             return Err(TrustedClockError::Untrusted);
         }
 
-        let now = OffsetDateTime::now_utc();
+        let now = (self.inner.wall)();
         if state.last_returned.is_some_and(|last| now < last) {
             state.failed = true;
             return Err(TrustedClockError::Untrusted);
@@ -123,40 +129,7 @@ fn spawn_health_monitor(inner: Weak<ClockInner>) -> Result<(), String> {
                 let Some(clock) = inner.upgrade() else {
                     return;
                 };
-                let result = query_tracking(&clock.chronyc_path);
-                if let Ok(mut state) = clock.state.write() {
-                    match result {
-                        Ok(status)
-                            if status.synchronized && status.estimated_error <= clock.max_error =>
-                        {
-                            if state.failed {
-                                tracing::info!("chrony clock health recovered");
-                            }
-                            state.sample = Some(HealthSample {
-                                status,
-                                observed_at: Instant::now(),
-                            });
-                            state.failed = false;
-                        }
-                        Ok(_) => {
-                            if !state.failed {
-                                tracing::warn!(
-                                    "chrony clock is unsynchronized or exceeds the configured error bound; authorization will fail closed"
-                                );
-                            }
-                            state.failed = true;
-                        }
-                        Err(error) => {
-                            if !state.failed {
-                                tracing::warn!(
-                                    error = %error,
-                                    "chrony clock health query failed; authorization will fail closed"
-                                );
-                            }
-                            state.failed = true;
-                        }
-                    }
-                } else {
+                if !record_health(&clock, query_tracking(&clock.chronyc_path)) {
                     return;
                 }
                 let poll_interval = clock.poll_interval;
@@ -166,6 +139,45 @@ fn spawn_health_monitor(inner: Weak<ClockInner>) -> Result<(), String> {
         })
         .map(|_| ())
         .map_err(|error| format!("failed to start chrony health monitor thread: {error}"))
+}
+
+/// Applies one health query result to the clock's state, as the monitor
+/// thread does after each poll. `false` when the state lock is poisoned
+/// (the monitor stops).
+fn record_health(clock: &ClockInner, result: Result<TrackingStatus, String>) -> bool {
+    let Ok(mut state) = clock.state.write() else {
+        return false;
+    };
+    match result {
+        Ok(status) if status.synchronized && status.estimated_error <= clock.max_error => {
+            if state.failed {
+                tracing::info!("chrony clock health recovered");
+            }
+            state.sample = Some(HealthSample {
+                status,
+                observed_at: Instant::now(),
+            });
+            state.failed = false;
+        }
+        Ok(_) => {
+            if !state.failed {
+                tracing::warn!(
+                    "chrony clock is unsynchronized or exceeds the configured error bound; authorization will fail closed"
+                );
+            }
+            state.failed = true;
+        }
+        Err(error) => {
+            if !state.failed {
+                tracing::warn!(
+                    error = %error,
+                    "chrony clock health query failed; authorization will fail closed"
+                );
+            }
+            state.failed = true;
+        }
+    }
+    true
 }
 
 fn query_tracking(path: &Path) -> Result<TrackingStatus, String> {
