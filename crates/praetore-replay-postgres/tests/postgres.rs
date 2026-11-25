@@ -10019,6 +10019,72 @@ mod g1_safety {
         verify_runtime_role(&mut gateway).expect("the 0016 grants do not upset the runtime check");
     }
 
+    /// H-50-3: `store()` writes in a READ COMMITTED transaction whatever
+    /// the database's default isolation, like the execution journal. A
+    /// probe trigger, added by the superuser to this scratch database
+    /// only, records the isolation level of the transaction that inserts
+    /// each safety record.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_safety_store_is_read_committed_whatever_the_default_isolation() {
+        let (scratch, ingest_role, _runtime) = scratch_with_roles();
+        scratch
+            .connect()
+            .batch_execute(
+                "CREATE TABLE public.isolation_probe (seq BIGINT NOT NULL, isolation TEXT NOT NULL); \
+                 CREATE FUNCTION public.record_isolation() RETURNS TRIGGER \
+                 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$ \
+                 BEGIN \
+                     INSERT INTO public.isolation_probe \
+                     VALUES (NEW.chain_seq, current_setting('transaction_isolation')); \
+                     RETURN NEW; \
+                 END $$; \
+                 CREATE TRIGGER isolation_probe AFTER INSERT ON praetore.safety_records \
+                 FOR EACH ROW EXECUTE FUNCTION public.record_isolation();",
+            )
+            .unwrap();
+        let mut ingestor = ingestor(TENANT_A);
+        let defaults = ["serializable", "repeatable read", "read committed"];
+        for (seq, default) in defaults.iter().enumerate() {
+            scratch
+                .connect()
+                .batch_execute(&format!(
+                    "ALTER DATABASE {} SET default_transaction_isolation = '{default}'",
+                    scratch.name
+                ))
+                .unwrap();
+            let mut client = connect_scratch_as(&scratch, &ingest_role.name);
+            let shown: String = client
+                .query_one("SHOW default_transaction_isolation", &[])
+                .unwrap()
+                .get(0);
+            assert_eq!(shown, *default, "the session took the database default");
+            let mut store = PostgresSafetyStore::from_client(client);
+            ingest(
+                &mut ingestor,
+                &mut store,
+                &event(seq as u64 + 1, "safety:halt"),
+            );
+        }
+        let observed: Vec<(i64, String)> = scratch
+            .connect()
+            .query(
+                "SELECT seq, isolation FROM public.isolation_probe ORDER BY seq",
+                &[],
+            )
+            .unwrap()
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        let expected: Vec<(i64, String)> = (0..defaults.len() as i64)
+            .map(|seq| (seq, "read committed".to_owned()))
+            .collect();
+        assert_eq!(
+            observed, expected,
+            "store() under defaults {defaults:?} must insert in READ COMMITTED"
+        );
+    }
+
     /// Resumes a fresh ingester of tenant A from the stored heads.
     fn resumed_ingestor(store: &mut PostgresSafetyStore) -> SafetyIngestor {
         let pin = ingest_key().public_key().unwrap();
