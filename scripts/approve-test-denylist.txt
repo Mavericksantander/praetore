@@ -1,0 +1,199 @@
+# Explicit denylist of tests that execute approve/reject (directly or via helpers).
+# Format: package | target_args | mode (runnable|ignored) | test_name
+# Maintained with scripts/check-approve-test-denylist.sh and scripts/local-gates.sh.
+
+# crates/praetore-mcp/src/approvals.rs (5)
+praetore-mcp | --lib | runnable | approvals::tests::approval_journal_short_write_keeps_previous_length
+praetore-mcp | --lib | runnable | approvals::tests::approval_journal_file_too_large_keeps_previous_length
+praetore-mcp | --lib | runnable | approvals::tests::an_unchanged_path_still_consumes_the_approval
+praetore-mcp | --lib | runnable | approvals::tests::a_symlink_in_place_of_the_held_directory_does_not_consume_the_approval
+praetore-mcp | --lib | runnable | approvals::tests::decide_refuses_a_pending_file_edited_to_2099
+
+# crates/praetore-mcp/src/journal_io.rs (1)
+praetore-mcp | --lib | runnable | journal_io::tests::rlimit_fsize_leaves_both_journals_intact
+
+# crates/praetore-mcp/tests/approvals.rs (18)
+praetore-mcp | --test approvals | runnable | enforce_holds_the_call_and_names_the_exact_command
+praetore-mcp | --test approvals | runnable | approve_without_a_terminal_signs_nothing
+praetore-mcp | --test approvals | runnable | approved_call_forwards_once_and_a_second_retry_asks_again
+praetore-mcp | --test approvals | runnable | different_arguments_do_not_use_the_approval
+praetore-mcp | --test approvals | runnable | unknown_approval_id_is_rejected
+praetore-mcp | --test approvals | runnable | unknown_id_on_a_terminal_is_not_signed
+praetore-mcp | --test approvals | runnable | rejected_call_is_not_forwarded
+praetore-mcp | --test approvals | runnable | expired_pending_and_expired_approval_do_not_pass
+praetore-mcp | --test approvals | runnable | verify_rejects_a_bad_signature_and_a_reused_approval
+praetore-mcp | --test approvals | runnable | pending_changed_after_it_was_shown_is_not_signed
+praetore-mcp | --test approvals | runnable | edited_pending_is_not_signed_and_the_edited_call_is_not_forwarded
+praetore-mcp | --test approvals | runnable | verify_rejects_an_execution_after_the_approval_window
+praetore-mcp | --test approvals | runnable | the_status_tells_an_expired_unused_approval_from_an_executed_one
+praetore-mcp | --test approvals | runnable | reject_of_an_expired_pending_call_signs_nothing
+praetore-mcp | --test approvals | runnable | decide_refuses_an_expired_pending_call_without_the_cli_check
+praetore-mcp | --test approvals | runnable | approve_of_a_pending_call_with_an_unreadable_expiry_asks_for_no_code
+praetore-mcp | --test approvals | runnable | approvals_prints_no_commands_for_an_id_already_decided
+praetore-mcp | --test approvals | runnable | a_decided_id_whose_pending_file_was_left_is_not_reused
+
+# crates/praetore-mcp/tests/report.rs (1)
+praetore-mcp | --test report | runnable | a_session_with_allow_deny_and_an_approval_writes_both_files
+
+# crates/praetore-mcp/tests/evasion.rs (17)
+praetore-mcp | --test evasion | runnable | truncating_the_approval_journal_holds_a_used_approval_and_fails_verify
+praetore-mcp | --test evasion | runnable | truncating_both_journals_runs_an_approval_again_and_only_the_saved_heads_find_it
+praetore-mcp | --test evasion | runnable | a_cut_receipt_line_that_names_an_approval_holds_the_retry_and_fails_verify
+praetore-mcp | --test evasion | runnable | an_execution_record_that_cannot_be_written_spends_the_approval_and_fails_verify
+praetore-mcp | --test evasion | runnable | the_approval_id_in_a_forwarded_receipt_is_signed
+praetore-mcp | --test evasion | runnable | verify_says_where_to_keep_the_approval_head_and_when_one_use_holds
+praetore-mcp | --test evasion | runnable | verify_with_the_expected_approval_head_fails_after_a_cut_or_a_deletion
+praetore-mcp | --test evasion | runnable | the_readme_approval_head_check_finds_a_cut_or_deleted_journal
+praetore-mcp | --test evasion | runnable | deleting_the_approval_journal_holds_the_call_and_fails_verify_after_it_ran
+praetore-mcp | --test evasion | runnable | two_receipts_naming_one_approval_fail_verify
+praetore-mcp | --test evasion | runnable | a_receipt_naming_a_rejected_or_malformed_approval_fails_verify
+praetore-mcp | --test evasion | runnable | an_approval_is_used_once
+praetore-mcp | --test evasion | runnable | an_approval_does_not_cover_other_arguments
+praetore-mcp | --test evasion | runnable | an_approval_does_not_cover_another_server_or_another_held_tool
+praetore-mcp | --test evasion | runnable | the_ttl_env_var_of_wrap_does_not_set_the_signed_window
+praetore-mcp | --test evasion | runnable | the_ttl_seconds_file_in_the_home_stretches_new_approvals
+praetore-mcp | --test evasion | runnable | the_ttl_in_config_toml_stretches_new_approvals
+
+# crates/praetore-mcp/tests/dashboard.rs (3)
+praetore-mcp | --test dashboard | runnable | verification_status_matches_verify_with_an_expected_approval_head
+praetore-mcp | --test dashboard | runnable | cached_verification_is_redone_for_each_approval_and_issuer_file
+praetore-mcp | --test dashboard | runnable | approval_history_and_live_rows_carry_the_time_of_the_human_decision
+
+# crates/praetore-gateway/tests/enforcement.rs (90)
+praetore-gateway | --test enforcement | runnable | signed_human_approval_dispatches_the_exact_persisted_action_once
+praetore-gateway | --test enforcement | runnable | approved_action_is_not_dispatched_if_freshness_expires_during_approval_commit
+praetore-gateway | --test enforcement | runnable | human_approval_signature_cannot_be_reused_for_modified_action_scope
+praetore-gateway | --test enforcement | runnable | rejected_human_approval_is_persisted_without_dispatch
+praetore-gateway | --test enforcement | runnable | expired_human_rejection_uses_the_engine_clock
+praetore-gateway | --test enforcement | runnable | http_human_approval_resumes_the_pending_execution
+praetore-gateway | --test enforcement | runnable | requesting_agent_key_cannot_approve_its_own_action
+praetore-gateway | --test enforcement | runnable | approval_for_unknown_execution_is_rejected_without_dispatch
+praetore-gateway | --test enforcement | runnable | approval_resolution_reports_pending_then_approved
+praetore-gateway | --test enforcement | runnable | approval_resolution_reports_rejected_without_dispatch
+praetore-gateway | --test enforcement | runnable | http_conflicts_and_status_report_the_resolution
+praetore-gateway | --test enforcement | runnable | saf10_today::p5_no_approval_by_silence
+praetore-gateway | --test enforcement | runnable | saf10_full::p5_exactly_one_expiration_receipt
+praetore-gateway | --test enforcement | runnable | saf10_full::p6_decision_then_expiry_keeps_only_the_decision
+praetore-gateway | --test enforcement | runnable | saf10_full::p6_expiry_then_decision_is_refused_by_the_journal
+praetore-gateway | --test enforcement | runnable | saf10_full::http_410_carries_the_expiration_receipt_id
+praetore-gateway | --test enforcement | runnable | apd::receipt_fixtures_for_external_verifiers
+praetore-gateway | --test enforcement | runnable | apd::reconcile_closes_apd_as_crash_recovered_without_the_adapter
+praetore-gateway | --test enforcement | runnable | apd::saved_202_receipt_stays_awaiting_approval_after_approval_and_execution
+praetore-gateway | --test enforcement | runnable | apd::approved_request_never_closes_as_approval_expired
+praetore-gateway | --test enforcement | runnable | apd::finality_receipt_fixtures_for_external_verifiers
+praetore-gateway | --test enforcement | runnable | apd::engine_clock_expiry_before_claim_closes_as_approved_claim_expired
+praetore-gateway | --test enforcement | runnable | apd::journal_claim_expiry_closes_as_approved_claim_expired
+praetore-gateway | --test enforcement | runnable | apd::http_410_code_is_the_signed_approved_claim_expired_reason
+praetore-gateway | --test enforcement | runnable | apd::held_request_with_a_decision_and_no_close_is_not_signed
+praetore-gateway | --test enforcement | runnable | apd::receipts_and_attestations_never_carry_apd_or_a_stray_reason
+praetore-gateway | --test enforcement | runnable | apd::apd_sequences_dispatch_at_most_once
+praetore-gateway | --test enforcement | runnable | tenant_scoped_approver_key_does_not_verify_for_another_tenant
+praetore-gateway | --test enforcement | runnable | tenant_scoped_approver_key_verifies_only_its_own_tenant
+praetore-gateway | --test enforcement | runnable | transient_clock_failure_at_claim_leaves_the_approval_retryable
+praetore-gateway | --test enforcement | runnable | unavailable_freshness_at_claim_is_retryable_but_revocation_is_terminal
+praetore-gateway | --test enforcement | runnable | approval_resolution_reports_not_dispatched_after_crash_recovery_or_expiry
+praetore-gateway | --test enforcement | runnable | claim_reverifies_the_recorded_approval_before_dispatch
+praetore-gateway | --test enforcement | runnable | http_api_requires_tenant_scoped_role_bound_credentials
+praetore-gateway | --test enforcement | runnable | uppercase_human_approval_signature_is_refused
+praetore-gateway | --test enforcement | runnable | human_approval_rejects_bad_signatures_without_writing_the_journal
+praetore-gateway | --test enforcement | runnable | approval_signed_for_action_a_does_not_authorize_action_b
+praetore-gateway | --test enforcement | runnable | a_second_signed_approval_cannot_replay_the_same_action
+praetore-gateway | --test enforcement | runnable | expired_human_approval_is_not_written_to_the_journal
+praetore-gateway | --test enforcement | runnable | claim_dispatch_refuses_an_approved_action_the_adapter_no_longer_admits
+praetore-gateway | --test enforcement | runnable | terminal_preflight_refusal_while_held_closes_the_request_for_good
+praetore-gateway | --test enforcement | runnable | transient_preflight_refusal_while_held_keeps_the_decision_unconsumed
+praetore-gateway | --test enforcement | runnable | exec_mode_header_runs_after_auth_and_never_changes_who_executes
+praetore-gateway | --test enforcement | runnable | approval_refused_at_submission_is_closed_terminally_and_never_approvable
+praetore-gateway | --test enforcement | runnable | transient_refusal_at_claim_keeps_the_approval_pending_dispatch
+praetore-gateway | --test enforcement | runnable | refusal_before_effect_at_dispatch_is_a_signed_terminal_failed_state
+praetore-gateway | --test enforcement | runnable | effect_failed_at_dispatch_is_a_signed_failed_state_with_class_effect_failed
+praetore-gateway | --test enforcement | runnable | execution_attestations_are_timestamped_with_the_engine_clock
+praetore-gateway | --test enforcement | runnable | a_failed_rejection_write_records_nothing_and_can_be_retried
+praetore-gateway | --test enforcement | runnable | outcomes::each_held_request_ends_as_its_verified_records_say
+praetore-gateway | --test enforcement | runnable | outcomes::a_record_that_does_not_verify_fails_the_whole_file
+praetore-gateway | --test enforcement | runnable | outcomes::a_pin_that_verified_nothing_is_reported
+praetore-gateway | --test enforcement | runnable | delegated_approval::the_root_approves_itself_only_when_the_policy_allows_it
+praetore-gateway | --test enforcement | runnable | delegated_approval::an_explicit_false_refuses_the_root_before_anything_is_written
+praetore-gateway | --test enforcement | runnable | delegated_approval::without_the_option_the_root_may_not_approve_and_the_policy_digest_is_unchanged
+praetore-gateway | --test enforcement | runnable | delegated_approval::the_option_is_recorded_in_the_evidence_and_the_challenge
+praetore-gateway | --test enforcement | runnable | delegated_approval::a_delegated_approver_approves_once_and_the_chain_is_reported
+praetore-gateway | --test enforcement | runnable | delegated_approval::a_delegated_rejection_is_recorded_and_verifies
+praetore-gateway | --test enforcement | runnable | delegated_approval::the_claim_re_verifies_the_chain_against_the_loaded_revocations
+praetore-gateway | --test enforcement | runnable | delegated_approval::an_expired_delegation_is_refused
+praetore-gateway | --test enforcement | runnable | delegated_approval::a_delegation_not_yet_valid_is_refused
+praetore-gateway | --test enforcement | runnable | delegated_approval::a_delegation_that_ends_inside_the_approval_window_is_refused
+praetore-gateway | --test enforcement | runnable | delegated_approval::a_delegation_that_starts_inside_the_approval_window_is_refused
+praetore-gateway | --test enforcement | runnable | delegated_approval::a_delegation_that_covers_exactly_the_window_is_accepted
+praetore-gateway | --test enforcement | runnable | delegated_approval::a_revoked_delegation_is_refused
+praetore-gateway | --test enforcement | runnable | delegated_approval::a_child_of_a_revoked_delegation_is_refused
+praetore-gateway | --test enforcement | runnable | delegated_approval::the_issuer_of_a_delegation_may_revoke_it
+praetore-gateway | --test enforcement | runnable | delegated_approval::offline_a_revocation_effective_after_the_window_does_not_count_and_the_gateway_refuses_any_loaded_one
+praetore-gateway | --test enforcement | runnable | delegated_approval::a_child_cannot_add_an_action_type
+praetore-gateway | --test enforcement | runnable | delegated_approval::a_child_cannot_outlive_its_parent
+praetore-gateway | --test enforcement | runnable | delegated_approval::a_child_cannot_start_before_its_parent
+praetore-gateway | --test enforcement | runnable | delegated_approval::a_child_max_depth_must_be_lower_than_its_parent
+praetore-gateway | --test enforcement | runnable | delegated_approval::an_approver_cannot_issue_delegations
+praetore-gateway | --test enforcement | runnable | delegated_approval::a_chain_longer_than_the_maximum_is_refused
+praetore-gateway | --test enforcement | runnable | delegated_approval::nobody_grants_authority_to_itself_or_to_an_earlier_key
+praetore-gateway | --test enforcement | runnable | delegated_approval::a_delegation_for_another_tenant_cannot_join_the_chain
+praetore-gateway | --test enforcement | runnable | delegated_approval::a_key_in_no_chain_cannot_approve
+praetore-gateway | --test enforcement | runnable | delegated_approval::a_delegator_cannot_sign_a_decision
+praetore-gateway | --test enforcement | runnable | delegated_approval::an_approver_for_other_actions_cannot_approve_this_one
+praetore-gateway | --test enforcement | runnable | delegated_approval::an_altered_signature_is_refused
+praetore-gateway | --test enforcement | runnable | delegated_approval::a_delegate_of_another_tenant_cannot_approve_for_this_one
+praetore-gateway | --test enforcement | runnable | delegated_approval::the_agent_key_cannot_be_a_delegate
+praetore-gateway | --test enforcement | runnable | delegated_approval::the_agent_key_cannot_be_the_root_of_a_chain
+praetore-gateway | --test enforcement | runnable | delegated_approval::a_pinned_approver_v1_decision_works_with_and_without_a_delegation_file
+praetore-gateway | --test enforcement | runnable | delegated_approval::the_root_cannot_approve_with_a_v1_decision
+praetore-gateway | --test enforcement | runnable | delegated_approval::a_v2_decision_changed_after_signing_does_not_verify
+praetore-gateway | --test enforcement | runnable | delegated_approval::a_v2_decision_on_a_gateway_without_delegation_is_refused
+praetore-gateway | --test enforcement | runnable | delegated_approval::a_child_cannot_be_moved_under_another_delegation_of_the_same_key
+praetore-gateway | --test enforcement | runnable | delegated_approval::a_version_1_decision_signed_with_a_chain_is_refused
+praetore-gateway | --test enforcement | runnable | delegated_approval::a_policy_that_allows_the_root_does_not_apply_to_requests_held_under_another
+
+# crates/praetore-replay-postgres/tests/postgres.rs (25)
+praetore-replay-postgres | --test postgres | ignored | postgres_human_approval_is_persisted_atomically_and_consumed_once
+praetore-replay-postgres | --test postgres | ignored | postgres_approval_expiration_is_signed_unique_exclusive_and_append_only
+praetore-replay-postgres | --test postgres | ignored | postgres_apd_crash_between_approve_and_claim_closes_as_crash_recovered
+praetore-replay-postgres | --test postgres | ignored | postgres_apd_concurrent_claims_dispatch_exactly_once
+praetore-replay-postgres | --test postgres | ignored | postgres_apd_expiry_before_claim_closes_as_approved_claim_expired
+praetore-replay-postgres | --test postgres | ignored | postgres_apd_journal_checks_use_the_injected_clock
+praetore-replay-postgres | --test postgres | ignored | postgres_apd_illegal_transitions_are_rejected_by_sql
+praetore-replay-postgres | --test postgres | ignored | postgres_apd_and_migrations_survive_restart
+praetore-replay-postgres | --test postgres | ignored | postgres_apd_failed_approval_commit_leaves_the_request_pending_and_undispatched
+praetore-replay-postgres | --test postgres | ignored | postgres_apd_lost_claim_acknowledgement_never_invokes_the_adapter
+praetore-replay-postgres | --test postgres | ignored | postgres_apd_parse_record_rejects_forged_apd_rows
+praetore-replay-postgres | --test postgres | ignored | crash_helper_approve_then_hang
+praetore-replay-postgres | --test postgres | ignored | postgres_apd_sigkill_between_approve_and_claim
+praetore-replay-postgres | --test postgres | ignored | postgres_sql_refuses_dispatch_of_an_expired_or_expiration_receipted_approval
+praetore-replay-postgres | --test postgres | ignored | postgres_concurrent_human_approval_dispatches_exactly_once
+praetore-replay-postgres | --test postgres | ignored | postgres_dispatch_refused_close_is_final_and_tenant_isolated
+praetore-replay-postgres | --test postgres | ignored | postgres_closed_execution_and_approval_exclude_each_other
+praetore-replay-postgres | --test postgres | ignored | postgres_approval_close_reasons_migration_rolls_back_and_applies_again
+praetore-replay-postgres | --test postgres | ignored | postgres_rejection_and_its_close_commit_together
+praetore-replay-postgres | --test postgres | ignored | postgres_saved_202_receipt_stays_awaiting_approval_after_execution
+praetore-replay-postgres | --test postgres | ignored | postgres_awaiting_approval_attestation_only_on_a_held_row
+praetore-replay-postgres | --test postgres | ignored | postgres_approved_claim_expired_needs_an_approve_decision
+praetore-replay-postgres | --test postgres | ignored | postgres_awaiting_approval_migration_rolls_back_and_applies_again
+praetore-replay-postgres | --test postgres | ignored | delegated_approval_postgres::postgres_delegated_approval_is_recorded_dispatched_exported_and_verified
+praetore-replay-postgres | --test postgres | ignored | delegated_approval_postgres::postgres_root_decision_refused_by_policy_writes_no_row
+
+# crates/praetore-cli/src/main.rs (14)
+praetore-cli | --bin praetore | runnable | tests::missing_approver_pin_disables_approval_and_cli_refuses
+praetore-cli | --bin praetore | runnable | tests::approve_rejects_malformed_ids_and_unknown_approvers_before_any_io
+praetore-cli | --bin praetore | ignored | tests::postgres_approval_dispatches_once_and_rejection_is_final
+praetore-cli | --bin praetore | ignored | tests::postgres_sandbox_approval_executes_once_in_the_gateway
+praetore-cli | --bin praetore | ignored | tests::postgres_sandbox_http_cooperative_refusal_and_gateway_down
+praetore-cli | --bin praetore | ignored | tests::postgres_t019_cooperative_exec_is_refused_without_sandbox_root
+praetore-cli | --bin praetore | ignored | tests::postgres_t019b_development_flag_alone_enables_cooperative_exec
+praetore-cli | --bin praetore | ignored | tests::postgres_sandbox_symlink_swapped_in_after_approval_is_refused_at_dispatch
+praetore-cli | --bin praetore | ignored | tests::postgres_sandbox_http_t7_approval_expiry_never_executes
+praetore-cli | --bin praetore | ignored | tests::postgres_t013b_refusal_before_effect_is_a_signed_failed_state
+praetore-cli | --bin praetore | ignored | tests::postgres_t013b_challenge_refusal_is_final_even_if_the_file_returns
+praetore-cli | --bin praetore | ignored | tests::postgres_t013b_t20_rejected_and_expired_have_distinct_signed_reasons
+praetore-cli | --bin praetore | ignored | tests::postgres_t013b_t7b_approved_then_expired_before_dispatch_is_approved_claim_expired
+praetore-cli | --bin praetore | ignored | tests::postgres_t013b_t17_tampered_final_state_fails_praetore_verify
+
+# crates/praetore-cli/tests/console_inbox_postgres.rs (2)
+praetore-cli | --test console_inbox_postgres | ignored | postgres_console_inbox_approves_dispatches_and_rejects_through_the_gateway
+praetore-cli | --test console_inbox_postgres | ignored | postgres_console_compliance_pack_verifies_with_praetore_verify

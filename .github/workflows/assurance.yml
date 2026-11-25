@@ -173,6 +173,10 @@ jobs:
       # .cargo/config.toml, workspace lints, a crate-level allow).
       - name: Clippy canary (Expiry::at without expect fails)
         run: scripts/clippy-canary.sh
+      - name: Approve/reject test denylist covers all source calls and has no stale entries
+        run: |
+          scripts/test-check-approve-test-denylist.sh
+          scripts/check-approve-test-denylist.sh
       - run: cargo fmt --all -- --check
       - run: cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check
       - name: Validate Kubernetes manifest YAML syntax
