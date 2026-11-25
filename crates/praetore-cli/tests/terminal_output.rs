@@ -25,12 +25,11 @@ fn init_shows_the_directory_escaped() {
     fs::remove_dir_all(&parent).unwrap();
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).unwrap();
-    // Both lines that name the directory are checked before either fails.
+    // The "Initialized ... at" line is for reading (shown). The doctor
+    // line is a command to copy: the path is one shell word.
+    let quoted = praetore_core::shell::quote(&parent.join(EVIL).to_string_lossy());
     let initialized = stdout.contains(&format!("{SHOWN}\nHuman approver id:"));
-    let doctor = stdout.contains(&format!(
-        "Then run: praetore doctor {}",
-        parent.join(SHOWN).display()
-    ));
+    let doctor = stdout.contains(&format!("Then run: praetore doctor {quoted}"));
     assert!(initialized && doctor, "{stdout:?}");
     for raw in ['\x1b', '\r', '\u{202e}'] {
         assert!(!stdout.contains(raw), "raw {raw:?} in {stdout:?}");
