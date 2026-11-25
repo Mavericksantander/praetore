@@ -10019,6 +10019,443 @@ mod g1_safety {
         verify_runtime_role(&mut gateway).expect("the 0016 grants do not upset the runtime check");
     }
 
+    /// P-50-4: P-43-4 as controlled permutations, with the development
+    /// feature `test-hooks` cutting `store()` between its INSERT and its
+    /// COMMIT. Sessions: A (ingester that held the lock: `is_held`,
+    /// INSERT, COMMIT), B (second ingester: take the lock, INSERT, COMMIT)
+    /// and K (the lock's connection is terminated). Both write one record
+    /// prepared from the same head. Every interleaving that keeps each
+    /// session's order and has B take the lock after K (35) runs once
+    /// under each default isolation. Steps are driven over channels, with
+    /// no sleep: a step that must wait on the other's uncommitted row is
+    /// confirmed waiting with `pg_blocking_pids`, or the run is
+    /// inconclusive and fails.
+    #[cfg(feature = "test-hooks")]
+    mod permutations {
+        use super::*;
+        use std::sync::mpsc::{Receiver, Sender, channel};
+        use std::time::{Duration, Instant};
+
+        const WAIT: Duration = Duration::from_secs(10);
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Step {
+            AIsHeld,
+            AInsert,
+            ACommit,
+            BLock,
+            BInsert,
+            BCommit,
+            Kill,
+        }
+
+        /// Every interleaving of A, B and K that keeps each session's
+        /// order and has `Kill` before `BLock`.
+        fn schedules() -> Vec<Vec<Step>> {
+            fn walk(
+                sessions: &mut [Vec<Step>; 3],
+                prefix: &mut Vec<Step>,
+                killed: bool,
+                out: &mut Vec<Vec<Step>>,
+            ) {
+                if sessions.iter().all(Vec::is_empty) {
+                    out.push(prefix.clone());
+                    return;
+                }
+                for index in 0..3 {
+                    let Some(&step) = sessions[index].first() else {
+                        continue;
+                    };
+                    if step == Step::BLock && !killed {
+                        continue;
+                    }
+                    sessions[index].remove(0);
+                    prefix.push(step);
+                    walk(sessions, prefix, killed || step == Step::Kill, out);
+                    prefix.pop();
+                    sessions[index].insert(0, step);
+                }
+            }
+            let mut out = Vec::new();
+            walk(
+                &mut [
+                    vec![Step::AIsHeld, Step::AInsert, Step::ACommit],
+                    vec![Step::BLock, Step::BInsert, Step::BCommit],
+                    vec![Step::Kill],
+                ],
+                &mut Vec::new(),
+                false,
+                &mut out,
+            );
+            out
+        }
+
+        enum Event {
+            Inserted,
+            Done(Result<(), SafetyStoreError>),
+        }
+
+        #[derive(Debug)]
+        enum Phase {
+            Idle,
+            Waiting,
+            Inserted,
+            Finished(Result<(), String>),
+        }
+
+        /// One writer session on its own thread: `Store` runs
+        /// `store_before_commit`, which reports `Inserted` and waits for
+        /// `Commit` before it commits.
+        struct Writer {
+            pid: i32,
+            commands: Sender<()>,
+            events: Receiver<Event>,
+            phase: Phase,
+            thread: Option<std::thread::JoinHandle<()>>,
+        }
+
+        impl Writer {
+            fn spawn(mut store: PostgresSafetyStore, prepared: PreparedRecords) -> Self {
+                let pid: i32 = store
+                    .client()
+                    .query_one("SELECT pg_catalog.pg_backend_pid()", &[])
+                    .unwrap()
+                    .get(0);
+                let (commands, command_rx) = channel::<()>();
+                let (event_tx, events) = channel();
+                let thread = std::thread::spawn(move || {
+                    if command_rx.recv().is_err() {
+                        return;
+                    }
+                    let result = store.store_before_commit(TENANT_A, &prepared, || {
+                        let _ = event_tx.send(Event::Inserted);
+                        let _ = command_rx.recv();
+                    });
+                    let _ = event_tx.send(Event::Done(result));
+                });
+                Self {
+                    pid,
+                    commands,
+                    events,
+                    phase: Phase::Idle,
+                    thread: Some(thread),
+                }
+            }
+
+            fn next_event(&mut self, label: &str) {
+                match self.events.recv_timeout(WAIT) {
+                    Ok(Event::Inserted) => self.phase = Phase::Inserted,
+                    Ok(Event::Done(result)) => {
+                        self.phase = Phase::Finished(result.map_err(|error| refusal(&error)));
+                    }
+                    Err(error) => panic!("{label}: no event within {WAIT:?}: {error}"),
+                }
+            }
+        }
+
+        impl Drop for Writer {
+            fn drop(&mut self) {
+                let _ = self.commands.send(());
+                if let Some(thread) = self.thread.take() {
+                    let _ = thread.join();
+                }
+            }
+        }
+
+        /// The class of a refused write, from a closed set: the chain
+        /// position primary key, a serialization failure, or the link
+        /// trigger. Anything else fails the test.
+        fn refusal(error: &SafetyStoreError) -> String {
+            let SafetyStoreError::Database(error) = error else {
+                panic!("not a database refusal: {error}");
+            };
+            let db = error.as_db_error().expect("a server error");
+            match (db.code(), db.constraint()) {
+                (&postgres::error::SqlState::UNIQUE_VIOLATION, Some("safety_records_pkey")) => {
+                    "pkey".into()
+                }
+                (&postgres::error::SqlState::T_R_SERIALIZATION_FAILURE, _) => "40001".into(),
+                (&postgres::error::SqlState::RAISE_EXCEPTION, _)
+                    if db.message().contains("does not extend its chain") =>
+                {
+                    "link".into()
+                }
+                _ => panic!("refusal outside the closed set: {error}"),
+            }
+        }
+
+        /// Waits, without sleeping, until the server shows `waiter`
+        /// blocked by `holder`. `false` once `WAIT` passes: inconclusive.
+        fn blocked_by(admin: &mut Client, waiter: i32, holder: i32) -> bool {
+            let deadline = Instant::now() + WAIT;
+            while Instant::now() < deadline {
+                let blocked: bool = admin
+                    .query_one(
+                        "SELECT $2 = ANY (pg_catalog.pg_blocking_pids($1))",
+                        &[&waiter, &holder],
+                    )
+                    .unwrap()
+                    .get(0);
+                if blocked {
+                    return true;
+                }
+            }
+            false
+        }
+
+        struct Outcome {
+            blocked: bool,
+            winner: Option<char>,
+            refusals: Vec<String>,
+        }
+
+        fn run(default_isolation: &str, schedule: &[Step]) -> Outcome {
+            let label = format!("{default_isolation} {schedule:?}");
+            let (scratch, ingest_role, _runtime) = scratch_with_roles();
+            scratch
+                .connect()
+                .batch_execute(&format!(
+                    "ALTER DATABASE {} SET default_transaction_isolation = '{default_isolation}'",
+                    scratch.name
+                ))
+                .unwrap();
+            let connect = || connect_scratch_as(&scratch, &ingest_role.name);
+            let mut admin = scratch.connect();
+            let mut lock_a = Some(TenantLock::acquire(connect(), TENANT_A).unwrap());
+            let lock_pid: i32 = admin
+                .query_one(
+                    "SELECT pid FROM pg_stat_activity WHERE usename = $1 \
+                     AND state = 'idle in transaction'",
+                    &[&ingest_role.name],
+                )
+                .unwrap()
+                .get(0);
+            let mut store_a = PostgresSafetyStore::from_client(connect());
+            let mut store_b = PostgresSafetyStore::from_client(connect());
+            ingest(
+                &mut ingestor(TENANT_A),
+                &mut store_a,
+                &event(1, "safety:halt"),
+            );
+            let pin = ingest_key().public_key().unwrap();
+            let resume = |store: &mut PostgresSafetyStore| {
+                let heads = store
+                    .load_heads(TENANT_A, std::slice::from_ref(&pin))
+                    .unwrap();
+                let mut resumed = ingestor(TENANT_A);
+                resumed
+                    .resume_heads(heads.into_values().map(|stored| stored.record), &[])
+                    .unwrap();
+                resumed
+            };
+            let prepared_a = resume(&mut store_a)
+                .prepare(&event(2, "safety:halt"), test_now(), &mut store_a)
+                .unwrap();
+            let prepared_b = resume(&mut store_b)
+                .prepare(&event(2, "safety:freeze"), test_now(), &mut store_b)
+                .unwrap();
+            let hash_a = prepared_a.records[0].record_hash().to_string();
+            let hash_b = prepared_b.records[0].record_hash().to_string();
+            let mut writers = [
+                Writer::spawn(store_a, prepared_a),
+                Writer::spawn(store_b, prepared_b),
+            ];
+            let mut killed = false;
+            let mut blocked = false;
+            let mut _lock_b = None;
+
+            for step in schedule {
+                match step {
+                    Step::AIsHeld => {
+                        let held = lock_a.as_mut().unwrap().is_held();
+                        assert_eq!(held, !killed, "{label}: is_held before and after K");
+                    }
+                    Step::Kill => {
+                        let gone: bool = admin
+                            .query_one("SELECT pg_terminate_backend($1, 10000)", &[&lock_pid])
+                            .unwrap()
+                            .get(0);
+                        assert!(gone, "{label}: the lock's backend did not end");
+                        killed = true;
+                    }
+                    Step::BLock => {
+                        _lock_b = Some(
+                            TenantLock::acquire(connect(), TENANT_A)
+                                .unwrap_or_else(|error| panic!("{label}: B lock: {error}")),
+                        );
+                    }
+                    Step::AInsert | Step::BInsert => {
+                        let (me, other) = if *step == Step::AInsert {
+                            (0, 1)
+                        } else {
+                            (1, 0)
+                        };
+                        writers[me].commands.send(()).unwrap();
+                        writers[me].phase = Phase::Waiting;
+                        if matches!(writers[other].phase, Phase::Inserted) {
+                            // The other's row is uncommitted: this INSERT must
+                            // wait on it, and the server must show it waiting.
+                            assert!(
+                                blocked_by(&mut admin, writers[me].pid, writers[other].pid),
+                                "{label}: inconclusive, the wait on the other's row was not observed"
+                            );
+                            blocked = true;
+                        } else {
+                            writers[me].next_event(&label);
+                        }
+                    }
+                    Step::ACommit | Step::BCommit => {
+                        let (me, other) = if *step == Step::ACommit {
+                            (0, 1)
+                        } else {
+                            (1, 0)
+                        };
+                        if matches!(writers[me].phase, Phase::Inserted) {
+                            writers[me].commands.send(()).unwrap();
+                            writers[me].next_event(&label);
+                            if matches!(writers[other].phase, Phase::Waiting) {
+                                writers[other].next_event(&label);
+                            }
+                        }
+                    }
+                }
+            }
+            // A session the schedule left inside the hook commits now.
+            for index in 0..2 {
+                if matches!(writers[index].phase, Phase::Inserted) {
+                    writers[index].commands.send(()).unwrap();
+                    writers[index].next_event(&label);
+                }
+                assert!(
+                    matches!(writers[index].phase, Phase::Finished(_)),
+                    "{label}: writer {index} did not finish: {:?}",
+                    writers[index].phase
+                );
+            }
+
+            let mut winner = None;
+            let mut refusals = Vec::new();
+            for (name, writer) in ['A', 'B'].into_iter().zip(&writers) {
+                match &writer.phase {
+                    Phase::Finished(Ok(())) => {
+                        assert!(winner.is_none(), "{label}: both writers committed");
+                        winner = Some(name);
+                    }
+                    Phase::Finished(Err(class)) => refusals.push(class.clone()),
+                    phase => panic!("{label}: {phase:?}"),
+                }
+            }
+            drop(writers);
+
+            // Oracle: the stored chain is linear and verifies.
+            let rows: Vec<(i64, String, String)> = admin
+                .query(
+                    "SELECT chain_seq, prev_record_hash::text, record_hash::text \
+                     FROM praetore.safety_records WHERE chain = 'executor-1' \
+                     ORDER BY chain_seq, record_hash",
+                    &[],
+                )
+                .unwrap()
+                .iter()
+                .map(|row| (row.get(0), row.get(1), row.get(2)))
+                .collect();
+            let mut previous = "0".repeat(64);
+            for (index, (chain_seq, prev, hash)) in rows.iter().enumerate() {
+                assert_eq!(
+                    *chain_seq, index as i64,
+                    "{label}: one row per seq: {rows:?}"
+                );
+                assert_eq!(*prev, previous, "{label}: row {chain_seq} links back");
+                previous = hash.clone();
+            }
+            let expected_rows = 1 + usize::from(winner.is_some());
+            assert_eq!(rows.len(), expected_rows, "{label}: {rows:?}");
+            if let Some(name) = winner {
+                let expected = if name == 'A' { &hash_a } else { &hash_b };
+                assert_eq!(
+                    &rows[1].2, expected,
+                    "{label}: the head is the winner's record"
+                );
+            }
+            let text = chain_text(&mut admin, TENANT_A, "executor-1");
+            verify_safety_chain(&text, std::slice::from_ref(&pin), None, None)
+                .unwrap_or_else(|error| panic!("{label}: chain does not verify: {error:?}"));
+            drop(lock_a.take());
+            Outcome {
+                blocked,
+                winner,
+                refusals,
+            }
+        }
+
+        /// Reference model: the first INSERT wins; the second waits when
+        /// it comes while the first is uncommitted.
+        fn model(schedule: &[Step]) -> (char, bool) {
+            let first = schedule
+                .iter()
+                .find(|step| matches!(step, Step::AInsert | Step::BInsert))
+                .unwrap();
+            let (first_commit, second_insert) = if *first == Step::AInsert {
+                (Step::ACommit, Step::BInsert)
+            } else {
+                (Step::BCommit, Step::AInsert)
+            };
+            let at = |wanted: Step| schedule.iter().position(|step| *step == wanted).unwrap();
+            let winner = if *first == Step::AInsert { 'A' } else { 'B' };
+            (winner, at(second_insert) < at(first_commit))
+        }
+
+        #[test]
+        #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+        fn postgres_safety_lost_lock_permutations_keep_the_chain_linear() {
+            let schedules = schedules();
+            assert_eq!(
+                schedules.len(),
+                35,
+                "7!/(3!3!1!) = 140, a quarter with K before B's lock"
+            );
+            let expected_waits = schedules.iter().filter(|s| model(s).1).count();
+            for default_isolation in ["read committed", "serializable"] {
+                let mut waits = 0;
+                let mut classes = BTreeMap::<String, usize>::new();
+                for schedule in &schedules {
+                    let outcome = run(default_isolation, schedule);
+                    let (winner, waits_here) = model(schedule);
+                    assert_eq!(
+                        outcome.blocked, waits_here,
+                        "{default_isolation} {schedule:?}"
+                    );
+                    waits += usize::from(outcome.blocked);
+                    for class in &outcome.refusals {
+                        *classes.entry(class.clone()).or_default() += 1;
+                    }
+                    if default_isolation == "read committed" {
+                        // Strict: the first INSERT wins and the loser is
+                        // refused by the chain-position primary key.
+                        assert_eq!(outcome.winner, Some(winner), "{schedule:?}");
+                        assert_eq!(outcome.refusals, ["pkey"], "{schedule:?}");
+                    } else {
+                        // Closed set: at most one winner, every loser refused
+                        // by a class above.
+                        assert_eq!(
+                            outcome.refusals.len(),
+                            2 - usize::from(outcome.winner.is_some()),
+                            "{schedule:?}"
+                        );
+                    }
+                }
+                // Coverage: the wait on the other's row happened exactly in
+                // the schedules the model says, and at least once.
+                assert!(expected_waits > 0);
+                assert_eq!(waits, expected_waits, "{default_isolation}: waits observed");
+                eprintln!(
+                    "{default_isolation}: {} schedules, {waits} with the wait observed, refusals {classes:?}",
+                    schedules.len()
+                );
+            }
+        }
+    }
+
     #[test]
     #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
     fn postgres_safety_ingest_role_is_separate_from_the_runtime_role() {
