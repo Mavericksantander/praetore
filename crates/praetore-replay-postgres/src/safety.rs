@@ -333,6 +333,30 @@ impl PostgresSafetyStore {
         tenant_id: Uuid,
         prepared: &PreparedRecords,
     ) -> Result<(), SafetyStoreError> {
+        self.store_then_commit(tenant_id, prepared, || ())
+    }
+
+    /// [`Self::store`], running `before_commit` after the INSERTs and
+    /// before `COMMIT`, so that a test can order another session's steps
+    /// in that gap. Only with the development feature `test-hooks`, which
+    /// no shipped build enables (`scripts/check-test-hooks-feature.sh`).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn store_before_commit(
+        &mut self,
+        tenant_id: Uuid,
+        prepared: &PreparedRecords,
+        before_commit: impl FnOnce(),
+    ) -> Result<(), SafetyStoreError> {
+        self.store_then_commit(tenant_id, prepared, before_commit)
+    }
+
+    fn store_then_commit(
+        &mut self,
+        tenant_id: Uuid,
+        prepared: &PreparedRecords,
+        before_commit: impl FnOnce(),
+    ) -> Result<(), SafetyStoreError> {
         // READ COMMITTED whatever the database's default, like the
         // execution journal: a writer that waits on the chain position of
         // another gets a unique violation once that one commits, not a
@@ -380,6 +404,7 @@ impl PostgresSafetyStore {
                 ],
             )?;
         }
+        before_commit();
         transaction.commit()?;
         Ok(())
     }
