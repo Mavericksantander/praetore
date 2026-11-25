@@ -196,7 +196,7 @@ fn command_line(entry: &JsonValue) -> String {
             if p.is_empty() || p.contains(char::is_whitespace) {
                 format!("{p:?}")
             } else {
-                p.clone()
+                p.shown().to_string()
             }
         })
         .collect::<Vec<_>>()
@@ -474,17 +474,28 @@ pub fn render_changes(path: &Path, changes: &[Change]) -> String {
             ChangeKind::Wrapped { before, after } | ChangeKind::Unwrapped { before, after } => {
                 out.push_str(&format!(
                     "  ~ {}\n    - {before}\n    + {after}\n",
-                    change.server
+                    change.server.shown()
                 ));
             }
             ChangeKind::Skipped(reason) => {
-                out.push_str(&format!("  = {} (skipped: {reason})\n", change.server));
+                out.push_str(&format!(
+                    "  = {} (skipped: {})\n",
+                    change.server.shown(),
+                    reason.shown()
+                ));
             }
             ChangeKind::NotWrapped(reason) => {
-                out.push_str(&format!("  ! {}: not wrapped ({reason})\n", change.server));
+                out.push_str(&format!(
+                    "  ! {}: not wrapped ({})\n",
+                    change.server.shown(),
+                    reason.shown()
+                ));
             }
             ChangeKind::CreatedKey => {
-                out.push_str(&format!("  + {} (key created, empty)\n", change.server));
+                out.push_str(&format!(
+                    "  + {} (key created, empty)\n",
+                    change.server.shown()
+                ));
             }
         }
     }
@@ -574,13 +585,13 @@ pub fn render_local_scope(entries: &[LocalScopeEntry]) -> String {
     for entry in entries {
         out.push_str(&format!(
             "  ! {}: not wrapped (local scope, project {})\n",
-            entry.server,
+            entry.server.shown(),
             entry.project.shown()
         ));
         if entry.overrides_wrapped_user_entry {
             out.push_str(&format!(
                 "    a local-scope entry named {0} overrides the wrapped user-scope {0}; that server is NOT governed\n",
-                entry.server
+                entry.server.shown()
             ));
         }
     }
@@ -1198,5 +1209,45 @@ mod tests {
             "a local-scope entry named filesystem overrides the wrapped user-scope filesystem; that server is NOT governed"
         ));
         assert!(!report.contains("named db overrides"));
+    }
+
+    #[test]
+    fn render_changes_and_local_scope_escape_control_and_bidi() {
+        let evil = "s\x1b[2K\r\n\u{202e}\u{200b}";
+        let doc_text = format!(
+            "{{\"mcpServers\":{{\"{evil_json}\":{{\"command\":\"srv\"}},\"cmd\":{{\"command\":\"/usr/bin/srv\\u001b[2K\\u0000\\u202e\",\"args\":[\"--flag\\u200b\"]}},\"bad-type\":{{\"type\":\"http\\u202e\\u200b\",\"command\":\"srv\"}}}}}}",
+            evil_json = "s\\u001b[2K\\r\\n\\u202e\\u200b"
+        );
+        let mut doc = JsonValue::parse(&doc_text).unwrap();
+        let changes = wrap_config(&mut doc, Client::ClaudeCode, &target());
+        let mut cursor_doc = JsonValue::parse(&doc_text).unwrap();
+        let cursor_changes = wrap_config(&mut cursor_doc, Client::Cursor, &target());
+        let rendered = format!(
+            "{}{}",
+            render_changes(Path::new("/tmp/c.json"), &changes),
+            render_changes(Path::new("/tmp/cursor.json"), &cursor_changes)
+        );
+        for forbidden in ["\x1b", "\r", "\0", "\u{202e}", "\u{200b}", "[2K\n"] {
+            assert!(
+                !rendered.contains(forbidden),
+                "raw {forbidden:?} in render_changes:\n{rendered:?}"
+            );
+        }
+        assert!(rendered.contains("\\u{1b}"), "{rendered}");
+        assert!(rendered.contains("\\u{202e}"), "{rendered}");
+
+        let local = render_local_scope(&[LocalScopeEntry {
+            project: "/p/a".to_owned(),
+            server: evil.to_owned(),
+            overrides_wrapped_user_entry: true,
+        }]);
+        for forbidden in ["\x1b", "\r", "\u{202e}", "\u{200b}", "[2K\n"] {
+            assert!(
+                !local.contains(forbidden),
+                "raw {forbidden:?} in render_local_scope:\n{local:?}"
+            );
+        }
+        assert!(local.contains("\\u{1b}"), "{local}");
+        assert!(local.contains("\\u{202e}"), "{local}");
     }
 }

@@ -356,6 +356,7 @@ fn decide(
     evaluator: &mut dyn Evaluator,
     warnings: &mut Vec<String>,
 ) -> CallDecision {
+    let server_shown = display_safe(server);
     let tool = call
         .params
         .get("name")
@@ -368,7 +369,7 @@ fn decide(
         // modes; its record is left to a separate ingestion path.
         Err(error @ GateError::SafetyActionNotGoverned { .. }) => {
             warnings.push(format!(
-                "praetore-mcp: {server}/{tool}: {error}; forwarded WITHOUT a receipt ({})",
+                "praetore-mcp: {server_shown}/{tool}: {error}; forwarded WITHOUT a receipt ({})",
                 mode.as_str()
             ));
             CallDecision::Forward
@@ -378,7 +379,7 @@ fn decide(
         // classified, so it is neither decided nor passed through.
         Err(error @ GateError::UnclassifiedAction { .. }) => {
             warnings.push(format!(
-                "praetore-mcp: {server}/{tool}: {error}; call REFUSED ({})",
+                "praetore-mcp: {server_shown}/{tool}: {error}; call REFUSED ({})",
                 mode.as_str()
             ));
             CallDecision::Block(format!(
@@ -388,7 +389,7 @@ fn decide(
         Err(error) => match mode {
             Mode::Enforce => {
                 warnings.push(format!(
-                    "praetore-mcp: ERROR evaluating {server}/{tool}: {error}; call REFUSED (enforce, fail closed)"
+                    "praetore-mcp: ERROR evaluating {server_shown}/{tool}: {error}; call REFUSED (enforce, fail closed)"
                 ));
                 CallDecision::Block(format!(
                     "PRÆTORE could not evaluate this tool call, so it was refused (fail closed): {error}"
@@ -396,12 +397,12 @@ fn decide(
             }
             Mode::Observe => {
                 warnings.push(format!(
-                    "praetore-mcp: WARNING evaluating {server}/{tool} failed: {error}; call forwarded WITHOUT a receipt (observe mode)"
+                    "praetore-mcp: WARNING evaluating {server_shown}/{tool} failed: {error}; call forwarded WITHOUT a receipt (observe mode)"
                 ));
                 CallDecision::Forward
             }
         },
-        Ok(verdict) => decide_verdict(mode, server, &tool, &verdict, warnings),
+        Ok(verdict) => decide_verdict(mode, &server_shown, &tool, &verdict, warnings),
     }
 }
 
@@ -449,7 +450,7 @@ fn decide_verdict(
     let rules = if verdict.rule_ids.is_empty() {
         "none (default deny)".to_owned()
     } else {
-        verdict.rule_ids.join(", ")
+        display_safe(&verdict.rule_ids.join(", "))
     };
     // Every DENY gets the same client-facing text, whatever decided it, so
     // the client cannot tell from it what the policy declares or which rule
@@ -1930,6 +1931,41 @@ mod tests {
             let reply = oversized(prefix);
             assert_eq!(reply["id"], Value::Null, "{prefix}");
             assert_eq!(reply["error"]["code"], -32700, "{prefix}");
+        }
+    }
+
+    struct BidiRuleEvaluator;
+
+    impl Evaluator for BidiRuleEvaluator {
+        fn evaluate(&mut self, _server: &str, _params: &Value) -> Result<Verdict, GateError> {
+            Ok(Verdict {
+                unclassified: false,
+                outcome: DecisionOutcome::Deny,
+                evidence_id: Uuid::nil(),
+                rule_ids: vec!["rule\x1b[2K\r\n\u{202e}\u{200b}".into()],
+                reason: "denied".into(),
+                journaled: Ok(PathBuf::from("/j")),
+                consumed_approval: None,
+                hold_message: None,
+            })
+        }
+    }
+
+    #[test]
+    fn warnings_escape_server_name_and_rule_ids() {
+        let server = "srv\u{202e}\u{200b}\x1b[2K\r\n";
+        for mode in [Mode::Observe, Mode::Enforce] {
+            let mut eval = BidiRuleEvaluator;
+            let out = handle_client_line(CALL, mode, server, &mut eval);
+            let joined = out.warnings.join("\n");
+            for forbidden in ["\x1b", "\r", "\u{202e}", "\u{200b}", "[2K\n"] {
+                assert!(
+                    !joined.contains(forbidden),
+                    "raw {forbidden:?} in {mode:?} warnings:\n{joined:?}"
+                );
+            }
+            assert!(joined.contains("\\u{202e}"), "{joined}");
+            assert!(joined.contains("\\u{1b}"), "{joined}");
         }
     }
 }

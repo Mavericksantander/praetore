@@ -5,6 +5,14 @@
 //! person (a log line, a table, `--format text`) escapes the characters that
 //! render invisibly or reorder text, so `local:set_value\u{200b}` does not
 //! read as `local:set_value`.
+//!
+//! This module is the one escaping rule of the workspace: `praetore`,
+//! `praetore-safety-ingest`, `praetore-verify` and `praetore-mcp` show
+//! paths, names, errors and response bodies through [`escape_for_display`]
+//! (directly or as [`Shown`]), and `praetore-mcp`'s dashboard holds its copy
+//! in the browser equal to [`is_invisible`] with a fixture test.
+
+use std::{borrow::Cow, fmt, path::Path};
 
 /// Whether `c` renders invisibly, moves the cursor or reorders text: control
 /// characters, format characters (zero-width characters, bidi controls,
@@ -66,6 +74,34 @@ pub fn escape_for_display(value: &str) -> String {
     out
 }
 
+/// A path or a name, escaped with [`escape_for_display`] when it is
+/// formatted: `println!("{}", path.shown())`.
+#[derive(Debug, Clone)]
+pub struct Shown<'a>(Cow<'a, str>);
+
+impl fmt::Display for Shown<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&escape_for_display(&self.0))
+    }
+}
+
+/// `.shown()`: the [`Shown`] form of a path or a text.
+pub trait Show {
+    fn shown(&self) -> Shown<'_>;
+}
+
+impl Show for Path {
+    fn shown(&self) -> Shown<'_> {
+        Shown(self.to_string_lossy())
+    }
+}
+
+impl Show for str {
+    fn shown(&self) -> Shown<'_> {
+        Shown(Cow::Borrowed(self))
+    }
+}
+
 /// [`escape_for_display`] for text that is already JSON-encoded (its
 /// backslashes are already escaped): only invisible characters are written
 /// as `\u{XXXX}`. JSON never writes a brace after `\u`, so the result stays
@@ -111,6 +147,11 @@ mod tests {
             assert_eq!(escape_for_display(input), expected, "{input:?}");
         }
         assert_eq!(escape_bounded("abcdef", 3), "abc…");
+        assert_eq!(
+            Path::new("/tmp/a\x1b[2K\r\n\u{202e}b").shown().to_string(),
+            "/tmp/a\\u{1b}[2K\\u{d}\\u{a}\\u{202e}b"
+        );
+        assert_eq!("a\u{200b}\\".shown().to_string(), "a\\u{200b}\\\\");
         assert_eq!(
             escape_invisible("\"x\\\\u{200b}\u{200b}\""),
             "\"x\\\\u{200b}\\u{200b}\""

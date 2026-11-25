@@ -13,6 +13,7 @@
 
 #[cfg(test)]
 use praetore_core::Evidence;
+use praetore_core::display::Show;
 use praetore_core::{
     VerifiedPublicKey,
     journal_chain::{ChainHead, DatabaseHead, MAX_CHAIN_ENTRIES},
@@ -329,7 +330,10 @@ fn read_journal(database_url: &str, tenant_id: Uuid) -> CliResult<Vec<String>> {
     // the local demo, but then row-level security may not apply and only the
     // tenant filter of the query isolates tenants.
     if let Err(error) = praetore_replay_postgres::verify_runtime_role(&mut client) {
-        eprintln!("warning: {error} (the export query still filters by tenant)");
+        eprintln!(
+            "warning: {} (the export query still filters by tenant)",
+            error.to_string().shown()
+        );
     }
     read_journal_rows(&mut client, tenant_id)
 }
@@ -344,7 +348,10 @@ fn read_storage_records_only(database_url: &str) -> CliResult<Vec<String>> {
 fn connect_for_tenant_export(database_url: &str) -> CliResult<postgres::Client> {
     let mut client = crate::connect_local_database(database_url)?;
     if let Err(error) = praetore_replay_postgres::verify_runtime_role(&mut client) {
-        eprintln!("warning: {error} (the export query still filters by tenant)");
+        eprintln!(
+            "warning: {} (the export query still filters by tenant)",
+            error.to_string().shown()
+        );
     }
     Ok(client)
 }
