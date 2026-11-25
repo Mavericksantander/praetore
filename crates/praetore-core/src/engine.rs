@@ -30,11 +30,16 @@ pub trait Clock: Send + Sync {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum TrustedClockError {
     #[error("trusted clock is unavailable")]
     Unavailable,
     #[error("trusted clock health check failed")]
     Untrusted,
+    /// The clock read a time earlier than one it already returned. The
+    /// engine latches on it for good, whatever the clock reports later.
+    #[error("trusted clock moved backwards")]
+    Regressed,
 }
 
 /// A time source that checks its trust/health status on every read and fails
@@ -78,10 +83,17 @@ impl TrustedClockSource {
         if state.failed {
             return Err(PraetoreError::TrustedClockUnavailable);
         }
-        let now = self
-            .clock
-            .now()
-            .map_err(|_| PraetoreError::TrustedClockUnavailable)?;
+        let now = match self.clock.now() {
+            Ok(now) => now,
+            // A source that saw its own regression may report healthy
+            // again later (ChronyClock's monitor clears its failure on the
+            // next good poll): the latch is kept here, not in the source.
+            Err(TrustedClockError::Regressed) => {
+                state.failed = true;
+                return Err(PraetoreError::TrustedClockUnavailable);
+            }
+            Err(_) => return Err(PraetoreError::TrustedClockUnavailable),
+        };
         if state.last_returned.is_some_and(|last| now < last) {
             state.failed = true;
             return Err(PraetoreError::TrustedClockUnavailable);
@@ -1682,6 +1694,43 @@ mod tests {
             engine.validate_evidence_time_bounds(&evidence),
             Err(PraetoreError::TrustedClockUnavailable)
         ));
+    }
+
+    struct ReportingTrustedClock {
+        reads: Mutex<Vec<std::result::Result<OffsetDateTime, TrustedClockError>>>,
+    }
+
+    impl TrustedClock for ReportingTrustedClock {
+        fn now(&self) -> std::result::Result<OffsetDateTime, TrustedClockError> {
+            self.reads.lock().unwrap().remove(0)
+        }
+    }
+
+    /// A source that reports its own regression (`Regressed`) latches the
+    /// engine even when every later read is healthy and ahead of the last
+    /// returned time; a health error (`Untrusted`) does not latch.
+    #[test]
+    fn trusted_clock_source_latches_on_a_reported_regression_only() {
+        let start = FixedClock::new("2026-06-01T12:00:00Z").now();
+        let later = start + Duration::minutes(5);
+        let source = |reported: TrustedClockError| {
+            TrustedClockSource::new(Arc::new(ReportingTrustedClock {
+                reads: Mutex::new(vec![Ok(start), Err(reported), Ok(later)]),
+            }))
+        };
+
+        let regressed = source(TrustedClockError::Regressed);
+        assert_eq!(regressed.now().unwrap(), start);
+        assert!(regressed.now().is_err());
+        assert!(
+            matches!(regressed.now(), Err(PraetoreError::TrustedClockUnavailable)),
+            "a reported regression must stay latched"
+        );
+
+        let unhealthy = source(TrustedClockError::Untrusted);
+        assert_eq!(unhealthy.now().unwrap(), start);
+        assert!(unhealthy.now().is_err());
+        assert_eq!(unhealthy.now().unwrap(), later, "health loss recovers");
     }
 
     /// P-37-5: the latch fires only on a strict regression. Two reads of
