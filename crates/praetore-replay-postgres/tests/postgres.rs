@@ -10429,20 +10429,17 @@ mod g1_safety {
                     for class in &outcome.refusals {
                         *classes.entry(class.clone()).or_default() += 1;
                     }
-                    if default_isolation == "read committed" {
-                        // Strict: the first INSERT wins and the loser is
-                        // refused by the chain-position primary key.
-                        assert_eq!(outcome.winner, Some(winner), "{schedule:?}");
-                        assert_eq!(outcome.refusals, ["pkey"], "{schedule:?}");
-                    } else {
-                        // Closed set: at most one winner, every loser refused
-                        // by a class above.
-                        assert_eq!(
-                            outcome.refusals.len(),
-                            2 - usize::from(outcome.winner.is_some()),
-                            "{schedule:?}"
-                        );
-                    }
+                    // After #245, store() opens a READ COMMITTED transaction whatever the
+                    // database default, like the execution journal. A writer waiting on
+                    // the other's uncommitted row then sees a unique violation on
+                    // (tenant_id, chain, chain_seq), not a serialization failure (40001).
+                    // SSI can report 40001 for a read-write conflict, but that path is
+                    // no longer taken: the store transaction is not serializable even
+                    // when the database default is. The closed set (pkey, 40001, link
+                    // trigger) stays in refusal() for a refusal that arrives some other
+                    // way; this run expects only pkey.
+                    assert_eq!(outcome.winner, Some(winner), "{schedule:?}");
+                    assert_eq!(outcome.refusals, ["pkey"], "{schedule:?}");
                 }
                 // Coverage: the wait on the other's row happened exactly in
                 // the schedules the model says, and at least once.
