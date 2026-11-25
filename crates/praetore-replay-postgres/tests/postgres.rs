@@ -10456,6 +10456,262 @@ mod g1_safety {
         }
     }
 
+    /// H-50-3: `store()` writes in a READ COMMITTED transaction whatever
+    /// the database's default isolation, like the execution journal. A
+    /// probe trigger, added by the superuser to this scratch database
+    /// only, records the isolation level of the transaction that inserts
+    /// each safety record.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_safety_store_is_read_committed_whatever_the_default_isolation() {
+        let (scratch, ingest_role, _runtime) = scratch_with_roles();
+        scratch
+            .connect()
+            .batch_execute(
+                "CREATE TABLE public.isolation_probe (seq BIGINT NOT NULL, isolation TEXT NOT NULL); \
+                 CREATE FUNCTION public.record_isolation() RETURNS TRIGGER \
+                 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$ \
+                 BEGIN \
+                     INSERT INTO public.isolation_probe \
+                     VALUES (NEW.chain_seq, current_setting('transaction_isolation')); \
+                     RETURN NEW; \
+                 END $$; \
+                 CREATE TRIGGER isolation_probe AFTER INSERT ON praetore.safety_records \
+                 FOR EACH ROW EXECUTE FUNCTION public.record_isolation();",
+            )
+            .unwrap();
+        let mut ingestor = ingestor(TENANT_A);
+        let defaults = ["serializable", "repeatable read", "read committed"];
+        for (seq, default) in defaults.iter().enumerate() {
+            scratch
+                .connect()
+                .batch_execute(&format!(
+                    "ALTER DATABASE {} SET default_transaction_isolation = '{default}'",
+                    scratch.name
+                ))
+                .unwrap();
+            let mut client = connect_scratch_as(&scratch, &ingest_role.name);
+            let shown: String = client
+                .query_one("SHOW default_transaction_isolation", &[])
+                .unwrap()
+                .get(0);
+            assert_eq!(shown, *default, "the session took the database default");
+            let mut store = PostgresSafetyStore::from_client(client);
+            ingest(
+                &mut ingestor,
+                &mut store,
+                &event(seq as u64 + 1, "safety:halt"),
+            );
+        }
+        let observed: Vec<(i64, String)> = scratch
+            .connect()
+            .query(
+                "SELECT seq, isolation FROM public.isolation_probe ORDER BY seq",
+                &[],
+            )
+            .unwrap()
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        let expected: Vec<(i64, String)> = (0..defaults.len() as i64)
+            .map(|seq| (seq, "read committed".to_owned()))
+            .collect();
+        assert_eq!(
+            observed, expected,
+            "store() under defaults {defaults:?} must insert in READ COMMITTED"
+        );
+    }
+
+    /// Resumes a fresh ingester of tenant A from the stored heads.
+    fn resumed_ingestor(store: &mut PostgresSafetyStore) -> SafetyIngestor {
+        let pin = ingest_key().public_key().unwrap();
+        let heads = store
+            .load_heads(TENANT_A, std::slice::from_ref(&pin))
+            .unwrap();
+        let mut resumed = ingestor(TENANT_A);
+        resumed
+            .resume_heads(heads.into_values().map(|stored| stored.record), &[])
+            .unwrap();
+        resumed
+    }
+
+    /// The stored chain is linear: one row per `chain_seq` from 0, each
+    /// linking to the hash of the row before it, and it verifies.
+    fn assert_linear_chain(admin: &mut Client, chain: &str) -> usize {
+        let rows: Vec<(i64, String, String)> = admin
+            .query(
+                "SELECT chain_seq, prev_record_hash::text, record_hash::text \
+                 FROM praetore.safety_records WHERE tenant_id = $1 AND chain = $2 \
+                 ORDER BY chain_seq, record_hash",
+                &[&TENANT_A, &chain],
+            )
+            .unwrap()
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+        let mut previous = "0".repeat(64);
+        for (index, (chain_seq, prev, hash)) in rows.iter().enumerate() {
+            assert_eq!(*chain_seq, index as i64, "one row per chain_seq: {rows:?}");
+            assert_eq!(*prev, previous, "row {chain_seq} links to the row before");
+            previous = hash.clone();
+        }
+        let pin = ingest_key().public_key().unwrap();
+        let text = chain_text(admin, TENANT_A, chain);
+        verify_safety_chain(&text, std::slice::from_ref(&pin), None, None)
+            .expect("the stored chain verifies");
+        rows.len()
+    }
+
+    /// The loser of a write to a taken chain position: the primary key
+    /// `(tenant_id, chain, chain_seq)` refuses it, not a message text.
+    fn assert_refused_by_chain_position(error: SafetyStoreError) {
+        let SafetyStoreError::Database(error) = &error else {
+            panic!("expected a database refusal, got {error}");
+        };
+        let db = error.as_db_error().expect("a server error");
+        assert_eq!(
+            (db.code(), db.constraint()),
+            (
+                &postgres::error::SqlState::UNIQUE_VIOLATION,
+                Some("safety_records_pkey")
+            ),
+            "{error}"
+        );
+    }
+
+    /// P-50-5 (1): a record at the right `chain_seq`, validly signed, whose
+    /// `prev_record_hash` is not the hash of the row before it, is refused
+    /// by the insert trigger.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_safety_record_with_the_next_seq_and_another_prev_hash_is_refused() {
+        let (scratch, ingest_role, _runtime) = scratch_with_roles();
+        let mut store =
+            PostgresSafetyStore::from_client(connect_scratch_as(&scratch, &ingest_role.name));
+        let mut ingestor = ingestor(TENANT_A);
+        ingest(&mut ingestor, &mut store, &event(1, "safety:halt"));
+
+        let mut forged = ingestor
+            .prepare(&event(2, "safety:halt"), test_now(), &mut store)
+            .unwrap();
+        assert_eq!(forged.records.len(), 1);
+        let mut payload = forged.records[0].payload().clone();
+        assert_eq!(payload.chain_seq, 1);
+        payload.prev_record_hash = "1".repeat(64);
+        forged.records[0] = ingest_key().sign_record(payload).unwrap();
+        let error = store.store(TENANT_A, &forged).unwrap_err().to_string();
+        assert!(error.contains("does not extend its chain"), "{error}");
+        assert_eq!(assert_linear_chain(&mut scratch.connect(), "executor-1"), 1);
+    }
+
+    /// P-50-5 (2): two different records prepared from the same head for
+    /// the same `chain_seq` (two `record_id`s, so the per-tenant
+    /// `record_id` uniqueness does not apply): the second is refused by
+    /// the chain-position primary key and the chain stays linear.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_safety_two_records_prepared_from_one_head_store_only_the_first() {
+        let (scratch, ingest_role, _runtime) = scratch_with_roles();
+        let mut store_a =
+            PostgresSafetyStore::from_client(connect_scratch_as(&scratch, &ingest_role.name));
+        let mut store_b =
+            PostgresSafetyStore::from_client(connect_scratch_as(&scratch, &ingest_role.name));
+        ingest(
+            &mut ingestor(TENANT_A),
+            &mut store_a,
+            &event(1, "safety:halt"),
+        );
+
+        let mut a = resumed_ingestor(&mut store_a);
+        let b = resumed_ingestor(&mut store_b);
+        let first = a
+            .prepare(&event(2, "safety:halt"), test_now(), &mut store_a)
+            .unwrap();
+        let second = b
+            .prepare(&event(2, "safety:freeze"), test_now(), &mut store_b)
+            .unwrap();
+        let position = |prepared: &PreparedRecords| {
+            let payload = prepared.records[0].payload();
+            (payload.chain_seq, payload.prev_record_hash.clone())
+        };
+        assert_eq!(position(&first), position(&second), "same head, same seq");
+        assert_ne!(
+            first.records[0].payload().record_id,
+            second.records[0].payload().record_id
+        );
+
+        store_a.store(TENANT_A, &first).unwrap();
+        a.commit(&first).unwrap();
+        assert_refused_by_chain_position(store_b.store(TENANT_A, &second).unwrap_err());
+        assert_eq!(assert_linear_chain(&mut scratch.connect(), "executor-1"), 2);
+    }
+
+    /// P-43-4 (simple part): the tenant lock saves repeated work, the
+    /// database prevents the fork. Ingester A checks its lock, the lock's
+    /// connection is terminated, ingester B takes the lock and extends the
+    /// chain from the same head, and A's write from its stale head is
+    /// refused; A, re-reading the heads, sees B's record.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_safety_writer_that_lost_its_lock_cannot_fork_the_chain() {
+        let (scratch, ingest_role, _runtime) = scratch_with_roles();
+        let connect = || connect_scratch_as(&scratch, &ingest_role.name);
+        let mut store_a = PostgresSafetyStore::from_client(connect());
+        let mut store_b = PostgresSafetyStore::from_client(connect());
+        let mut lock_a = TenantLock::acquire(connect(), TENANT_A).unwrap();
+        ingest(
+            &mut ingestor(TENANT_A),
+            &mut store_a,
+            &event(1, "safety:halt"),
+        );
+
+        let a = resumed_ingestor(&mut store_a);
+        let mut b = resumed_ingestor(&mut store_b);
+        let stale = a
+            .prepare(&event(2, "safety:halt"), test_now(), &mut store_a)
+            .unwrap();
+        assert!(lock_a.is_held(), "A checks its lock before writing");
+
+        // The lock's connection is terminated, as an operator would, and
+        // the server confirms the backend is gone (and its row lock with
+        // it) before B tries: pg_terminate_backend's timeout, no polling.
+        let mut admin = scratch.connect();
+        let pid: i32 = admin
+            .query_one(
+                "SELECT pid FROM pg_stat_activity WHERE usename = $1 \
+                 AND state = 'idle in transaction'",
+                &[&ingest_role.name],
+            )
+            .unwrap()
+            .get(0);
+        let gone: bool = admin
+            .query_one("SELECT pg_terminate_backend($1, 10000)", &[&pid])
+            .unwrap()
+            .get(0);
+        assert!(gone, "the lock's backend did not end within 10 s");
+        let _lock_b = TenantLock::acquire(connect(), TENANT_A).expect("B takes the freed lock");
+
+        let winner = b
+            .prepare(&event(2, "safety:freeze"), test_now(), &mut store_b)
+            .unwrap();
+        store_b.store(TENANT_A, &winner).unwrap();
+        b.commit(&winner).unwrap();
+
+        // A writes anyway, from the head it read before losing the lock.
+        assert_refused_by_chain_position(store_a.store(TENANT_A, &stale).unwrap_err());
+        assert!(!lock_a.is_held());
+        assert_eq!(assert_linear_chain(&mut admin, "executor-1"), 2);
+        let pin = ingest_key().public_key().unwrap();
+        let heads = store_a
+            .load_heads(TENANT_A, std::slice::from_ref(&pin))
+            .unwrap();
+        assert_eq!(
+            heads["executor-1"].record.record_hash(),
+            winner.records.last().unwrap().record_hash(),
+            "A re-reads B's record as the head"
+        );
+    }
+
     #[test]
     #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
     fn postgres_safety_ingest_role_is_separate_from_the_runtime_role() {

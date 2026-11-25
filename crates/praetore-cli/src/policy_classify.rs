@@ -3,7 +3,7 @@
 //! document, and prints it. It reads the file and never writes or rewrites
 //! any file.
 
-use praetore_core::{ActionClassProposal, RecordedPolicy};
+use praetore_core::{ActionClassProposal, RecordedPolicy, display::Show};
 use std::{fs, io::Read, path::Path};
 
 const MAX_POLICY_BYTES: u64 = 1024 * 1024;
@@ -40,7 +40,7 @@ pub fn report(text: &str) -> Result<Report, Box<dyn std::error::Error>> {
     }))? + "\n";
     let mut stderr = vec![format!(
         "policy {} v{} is format {} (digest {})",
-        recorded.id(),
+        recorded.id().shown(),
         recorded.version(),
         recorded.format_version(),
         recorded.digest()
@@ -54,7 +54,7 @@ pub fn report(text: &str) -> Result<Report, Box<dyn std::error::Error>> {
         "review every Mission entry: an action the executor runs without waiting for PRÆTORE must be renamed `safety:<name>`, declared Safety and have no rule.".into(),
     );
     for problem in &problems {
-        stderr.push(format!("problem: {problem}"));
+        stderr.push(format!("problem: {}", problem.to_string().shown()));
     }
     Ok(Report {
         stdout,
@@ -137,6 +137,44 @@ mod tests {
                 .stderr
                 .iter()
                 .any(|line| line.contains("'ops:skip_safety' contains \"safety\""))
+        );
+    }
+
+    fn assert_no_raw(lines: &[String]) {
+        for line in lines {
+            for raw in ['\u{1b}', '\r', '\u{202e}'] {
+                assert!(!line.contains(raw), "raw {raw:?} in {line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn report_escapes_the_policy_id() {
+        let text = V1.replace(r#"{"id":"p""#, r#"{"id":"p\u001b[2K\r\u202e""#);
+        let report = report(&text).unwrap();
+        assert_no_raw(&report.stderr);
+        assert!(
+            report.stderr[0].starts_with("policy p\\u{1b}[2K\\u{d}\\u{202e} v3"),
+            "{:?}",
+            report.stderr[0]
+        );
+    }
+
+    #[test]
+    fn report_escapes_rule_ids_in_problems() {
+        let text = V1
+            .replace(r#"{"id":"w""#, r#"{"id":"w\u001b[2K\u202e""#)
+            .replace("fs:write_file", "safety:halt");
+        let report = report(&text).unwrap();
+        assert_eq!(report.problems, 1);
+        assert_no_raw(&report.stderr);
+        assert!(
+            report
+                .stderr
+                .iter()
+                .any(|line| line.contains("rule 'w\\u{1b}[2K\\u{202e}' targets safety action")),
+            "{:?}",
+            report.stderr
         );
     }
 

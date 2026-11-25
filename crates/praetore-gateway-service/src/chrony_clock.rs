@@ -29,8 +29,13 @@ struct ClockState {
     last_returned: Option<OffsetDateTime>,
 }
 
+/// The wall clock that `now` reads: `OffsetDateTime::now_utc` in
+/// production, a controlled one in tests.
+type WallClock = Box<dyn Fn() -> OffsetDateTime + Send + Sync>;
+
 struct ClockInner {
     chronyc_path: PathBuf,
+    wall: WallClock,
     poll_interval: Duration,
     max_sample_age: Duration,
     max_error: Duration,
@@ -70,6 +75,7 @@ impl ChronyClock {
 
         let inner = Arc::new(ClockInner {
             chronyc_path: chronyc_path.to_owned(),
+            wall: Box::new(OffsetDateTime::now_utc),
             poll_interval,
             max_sample_age,
             max_error,
@@ -105,10 +111,10 @@ impl TrustedClock for ChronyClock {
             return Err(TrustedClockError::Untrusted);
         }
 
-        let now = OffsetDateTime::now_utc();
+        let now = (self.inner.wall)();
         if state.last_returned.is_some_and(|last| now < last) {
             state.failed = true;
-            return Err(TrustedClockError::Untrusted);
+            return Err(TrustedClockError::Regressed);
         }
         state.last_returned = Some(now);
         Ok(now)
@@ -123,40 +129,7 @@ fn spawn_health_monitor(inner: Weak<ClockInner>) -> Result<(), String> {
                 let Some(clock) = inner.upgrade() else {
                     return;
                 };
-                let result = query_tracking(&clock.chronyc_path);
-                if let Ok(mut state) = clock.state.write() {
-                    match result {
-                        Ok(status)
-                            if status.synchronized && status.estimated_error <= clock.max_error =>
-                        {
-                            if state.failed {
-                                tracing::info!("chrony clock health recovered");
-                            }
-                            state.sample = Some(HealthSample {
-                                status,
-                                observed_at: Instant::now(),
-                            });
-                            state.failed = false;
-                        }
-                        Ok(_) => {
-                            if !state.failed {
-                                tracing::warn!(
-                                    "chrony clock is unsynchronized or exceeds the configured error bound; authorization will fail closed"
-                                );
-                            }
-                            state.failed = true;
-                        }
-                        Err(error) => {
-                            if !state.failed {
-                                tracing::warn!(
-                                    error = %error,
-                                    "chrony clock health query failed; authorization will fail closed"
-                                );
-                            }
-                            state.failed = true;
-                        }
-                    }
-                } else {
+                if !record_health(&clock, query_tracking(&clock.chronyc_path)) {
                     return;
                 }
                 let poll_interval = clock.poll_interval;
@@ -166,6 +139,45 @@ fn spawn_health_monitor(inner: Weak<ClockInner>) -> Result<(), String> {
         })
         .map(|_| ())
         .map_err(|error| format!("failed to start chrony health monitor thread: {error}"))
+}
+
+/// Applies one health query result to the clock's state, as the monitor
+/// thread does after each poll. `false` when the state lock is poisoned
+/// (the monitor stops).
+fn record_health(clock: &ClockInner, result: Result<TrackingStatus, String>) -> bool {
+    let Ok(mut state) = clock.state.write() else {
+        return false;
+    };
+    match result {
+        Ok(status) if status.synchronized && status.estimated_error <= clock.max_error => {
+            if state.failed {
+                tracing::info!("chrony clock health recovered");
+            }
+            state.sample = Some(HealthSample {
+                status,
+                observed_at: Instant::now(),
+            });
+            state.failed = false;
+        }
+        Ok(_) => {
+            if !state.failed {
+                tracing::warn!(
+                    "chrony clock is unsynchronized or exceeds the configured error bound; authorization will fail closed"
+                );
+            }
+            state.failed = true;
+        }
+        Err(error) => {
+            if !state.failed {
+                tracing::warn!(
+                    error = %error,
+                    "chrony clock health query failed; authorization will fail closed"
+                );
+            }
+            state.failed = true;
+        }
+    }
+    true
 }
 
 fn query_tracking(path: &Path) -> Result<TrackingStatus, String> {
@@ -355,6 +367,125 @@ Leap status     : Normal\n";
                 "Root dispersion : -1 seconds"
             ))
             .is_err()
+        );
+    }
+
+    /// A ChronyClock whose wall clock the test sets, with one healthy
+    /// sample and no monitor thread: the test applies each health poll
+    /// with `record_health`.
+    fn controlled_clock(start: OffsetDateTime) -> (ChronyClock, Arc<RwLock<OffsetDateTime>>) {
+        let wall = Arc::new(RwLock::new(start));
+        let read = wall.clone();
+        let inner = Arc::new(ClockInner {
+            chronyc_path: PathBuf::from("/nonexistent/chronyc"),
+            wall: Box::new(move || *read.read().unwrap()),
+            poll_interval: Duration::from_secs(1),
+            max_sample_age: Duration::from_secs(3600),
+            max_error: Duration::from_millis(100),
+            state: RwLock::new(ClockState {
+                sample: Some(HealthSample {
+                    status: parse_tracking(HEALTHY_TRACKING).unwrap(),
+                    observed_at: Instant::now(),
+                }),
+                failed: false,
+                last_returned: None,
+            }),
+        });
+        (ChronyClock { inner }, wall)
+    }
+
+    struct NoReplay;
+
+    impl praetore_core::ReplayGuard for NoReplay {
+        fn claim_once(
+            &self,
+            _tenant_id: uuid::Uuid,
+            _agent_id: uuid::Uuid,
+            _request_id: uuid::Uuid,
+        ) -> Result<(), praetore_core::ReplayGuardError> {
+            Ok(())
+        }
+    }
+
+    struct NoFreshness;
+
+    impl praetore_core::FreshnessProvider for NoFreshness {
+        fn check(
+            &self,
+            _agent: &praetore_core::AgentKeyFingerprint,
+            _authority_id: &praetore_core::AuthorityId,
+            _policy_digest: &str,
+            _now: OffsetDateTime,
+        ) -> Result<praetore_core::FreshnessLease, praetore_core::FreshnessError> {
+            Err(praetore_core::FreshnessError::Unavailable)
+        }
+    }
+
+    /// The gateway's composition (`main.rs`): a HighAssurance engine over
+    /// a ChronyClock.
+    fn engine_over(clock: ChronyClock) -> praetore_core::engine::AuthorizationEngine {
+        let policy = praetore_core::Policy::new_v2("chrony-latch", 1, vec![]);
+        let issuer = praetore_core::AgentKeyPair::generate();
+        let pin = praetore_core::TrustedAuthorityIssuer::new("praetore-root", issuer.public_key())
+            .unwrap()
+            .with_validity(praetore_core::authority::Validity {
+                not_before: Some("2026-01-01T00:00:00Z".into()),
+                not_after: Some("2027-01-01T00:00:00Z".into()),
+            })
+            .unwrap();
+        let config = praetore_core::HighAssuranceConfig::new(
+            policy.digest().unwrap(),
+            vec![pin],
+            praetore_core::EvidenceAttesterKey::generate(),
+        )
+        .unwrap()
+        .with_audience("chrony-latch-test")
+        .with_replay_guard(Arc::new(NoReplay))
+        .with_freshness_provider(Arc::new(NoFreshness));
+        praetore_core::engine::AuthorizationEngine::production_with_trusted_clock(
+            policy, config, clock,
+        )
+        .unwrap()
+    }
+
+    /// P-50-2: a backward step of the wall clock latches the engine for
+    /// good, even after the next healthy chrony poll and after the wall
+    /// clock passes the last time it returned.
+    #[test]
+    fn a_wall_clock_regression_stays_latched_after_a_healthy_poll() {
+        let start = OffsetDateTime::from_unix_timestamp(1_780_315_200).unwrap();
+        let (clock, wall) = controlled_clock(start);
+        let inner = clock.inner.clone();
+        let engine = engine_over(clock);
+        assert_eq!(engine.trusted_now().unwrap(), start);
+
+        *wall.write().unwrap() = start - time::Duration::seconds(30);
+        assert!(engine.trusted_now().is_err(), "a backward read is refused");
+
+        // The monitor thread's next poll: chrony is healthy. That clears
+        // the source's own failure; a later read is healthy. The engine
+        // stays latched all the same.
+        assert!(record_health(
+            &inner,
+            Ok(parse_tracking(HEALTHY_TRACKING).unwrap())
+        ));
+        assert!(
+            !inner.state.read().unwrap().failed,
+            "a healthy poll clears ChronyClock's own failure"
+        );
+        *wall.write().unwrap() = start + time::Duration::seconds(60);
+        assert_eq!(
+            ChronyClock {
+                inner: inner.clone()
+            }
+            .now()
+            .unwrap(),
+            start + time::Duration::seconds(60),
+            "the source reports health once the wall clock passes the last returned time"
+        );
+        assert!(
+            engine.trusted_now().is_err(),
+            "after a regression the engine must stay latched, even after a healthy poll              and once the wall clock passes the last returned time"
         );
     }
 

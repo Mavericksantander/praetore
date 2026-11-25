@@ -18,6 +18,7 @@ pub mod probe;
 pub mod replay;
 pub mod safety_ingest;
 pub mod safety_namespace;
+pub mod shell;
 pub mod storage_record;
 
 pub use action::{
