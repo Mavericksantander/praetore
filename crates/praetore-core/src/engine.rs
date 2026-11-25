@@ -1733,6 +1733,141 @@ mod tests {
         assert_eq!(unhealthy.now().unwrap(), later, "health loss recovers");
     }
 
+    /// P-37-5: the latch fires only on a strict regression. Two reads of
+    /// the same instant are both trusted; a `<=` latch would refuse the
+    /// second one.
+    #[test]
+    fn high_assurance_accepts_two_consecutive_equal_trusted_clock_reads() {
+        let (mut engine, request) = production_engine_with_provider(test_freshness_provider());
+        let clock = Arc::new(MutableTrustedClock {
+            instant: Mutex::new(FixedClock::new("2026-06-01T12:00:00Z").now()),
+        });
+        engine.clock = ClockSource::Trusted(Arc::new(TrustedClockSource::new(clock)));
+
+        let evidence = engine
+            .evaluate(request)
+            .expect("first read of the trusted instant authorizes");
+        assert_eq!(evidence.decision.outcome, DecisionOutcome::Allow);
+        engine
+            .validate_evidence_time_bounds(&evidence)
+            .expect("second read of the same trusted instant must not latch");
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ClockStep {
+        Less,
+        Equal,
+        Greater,
+        Fails,
+    }
+
+    const CLOCK_STEPS: [ClockStep; 4] = [
+        ClockStep::Less,
+        ClockStep::Equal,
+        ClockStep::Greater,
+        ClockStep::Fails,
+    ];
+
+    struct ScriptedTrustedClock {
+        reads: Mutex<
+            std::collections::VecDeque<std::result::Result<OffsetDateTime, TrustedClockError>>,
+        >,
+    }
+
+    impl TrustedClock for ScriptedTrustedClock {
+        fn now(&self) -> std::result::Result<OffsetDateTime, TrustedClockError> {
+            self.reads
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("the script has one read per step")
+        }
+    }
+
+    /// Reference model of `TrustedClockSource`, written apart from it:
+    /// only an `Ok(t)` with `t < last accepted` latches; an inner `Err`
+    /// never latches; once latched, every read is refused.
+    struct ClockModel {
+        last: OffsetDateTime,
+        latched: bool,
+    }
+
+    impl ClockModel {
+        fn read(&self, step: ClockStep) -> std::result::Result<OffsetDateTime, TrustedClockError> {
+            match step {
+                ClockStep::Less => Ok(self.last - Duration::seconds(1)),
+                ClockStep::Equal => Ok(self.last),
+                ClockStep::Greater => Ok(self.last + Duration::seconds(1)),
+                ClockStep::Fails => Err(TrustedClockError::Untrusted),
+            }
+        }
+
+        fn expect(
+            &mut self,
+            read: std::result::Result<OffsetDateTime, TrustedClockError>,
+        ) -> Option<OffsetDateTime> {
+            if self.latched {
+                return None;
+            }
+            let now = read.ok()?;
+            if now < self.last {
+                self.latched = true;
+                return None;
+            }
+            self.last = now;
+            Some(now)
+        }
+    }
+
+    /// P-50-1: every script of one accepted read followed by one to three
+    /// reads that are less, equal, greater or an inner error (84 cases)
+    /// gives the same result as the reference model at every step.
+    #[test]
+    fn trusted_clock_latch_matches_reference_model_on_every_short_script() {
+        let start = FixedClock::new("2026-06-01T12:00:00Z").now();
+        let mut scripts: Vec<Vec<ClockStep>> = vec![Vec::new()];
+        let mut checked = 0usize;
+        for _ in 0..3 {
+            scripts = scripts
+                .iter()
+                .flat_map(|prefix| {
+                    CLOCK_STEPS.iter().map(move |step| {
+                        let mut script = prefix.clone();
+                        script.push(*step);
+                        script
+                    })
+                })
+                .collect();
+            for script in &scripts {
+                let mut model = ClockModel {
+                    last: start,
+                    latched: false,
+                };
+                let mut reads = vec![Ok(start)];
+                let mut expected = vec![Some(start)];
+                for step in script {
+                    let read = model.read(*step);
+                    reads.push(read);
+                    expected.push(model.expect(read));
+                }
+                let source = TrustedClockSource::new(Arc::new(ScriptedTrustedClock {
+                    reads: Mutex::new(reads.into_iter().collect()),
+                }));
+                let observed: Vec<Option<OffsetDateTime>> = expected
+                    .iter()
+                    .map(|_| match source.now() {
+                        Ok(now) => Some(now),
+                        Err(PraetoreError::TrustedClockUnavailable) => None,
+                        Err(other) => panic!("unexpected clock error {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(observed, expected, "script {script:?}");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 4 + 16 + 64, "every script was checked");
+    }
+
     #[test]
     fn high_assurance_tenant_issuer_binding_rejects_cross_tenant_authority() {
         let request_tenant_id = Uuid::from_u128(100);

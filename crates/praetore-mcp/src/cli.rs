@@ -1344,7 +1344,7 @@ fn cmd_policy(args: &[String]) -> Result<i32, String> {
                             println!(
                                 "OK {} policy {} v{}: {} rule(s), digest {digest}, {} warning(s); HighAssurance engine starts",
                                 path.shown(),
-                                parsed_policy.id,
+                                parsed_policy.id.shown(),
                                 parsed_policy.version,
                                 parsed_policy.rules.len(),
                                 warnings.len()

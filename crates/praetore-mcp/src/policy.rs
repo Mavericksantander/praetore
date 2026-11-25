@@ -199,7 +199,7 @@ fn cell(value: &str, width: usize) -> String {
 pub fn render_list(policy: &Policy) -> String {
     let mut out = format!(
         "policy {} v{} (semantics v{}), {} rule(s)\n{:<28} {:<16} {:<16} {:<20} CONDITIONS\n",
-        policy.id,
+        crate::proxy::display_safe(&policy.id),
         policy.version,
         policy.semantics_version,
         policy.rules.len(),
@@ -714,7 +714,7 @@ pub fn render_coverage(
 ) -> String {
     let mut out = format!(
         "policy {} v{}, server {:?}: {} tool(s)\n{:<28} {:<17} {:<28} DEPENDS ON ARGUMENT\n",
-        policy.id,
+        crate::proxy::display_safe(&policy.id),
         policy.version,
         crate::proxy::display_safe(server),
         report.len(),
@@ -1251,6 +1251,24 @@ mod tests {
             report[0].outcome,
             report[0].conditional
         );
+    }
+
+    #[test]
+    fn render_list_and_coverage_escape_policy_id() {
+        let mut policy = crate::store::default_policy();
+        policy.id = "pol\x1b[2K\r\n\u{202e}\u{200b}id".to_owned();
+        let listed = render_list(&policy);
+        let covered = render_coverage(&policy, "srv", &[], "praetore-mcp", "");
+        for (label, out) in [("render_list", listed), ("render_coverage", covered)] {
+            for forbidden in ["\x1b", "\r", "\u{202e}", "\u{200b}", "[2K\n"] {
+                assert!(
+                    !out.contains(forbidden),
+                    "raw {forbidden:?} in {label}:\n{out:?}"
+                );
+            }
+            assert!(out.contains("\\u{1b}"), "{label}: {out}");
+            assert!(out.contains("\\u{202e}"), "{label}: {out}");
+        }
     }
 }
 

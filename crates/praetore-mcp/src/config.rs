@@ -154,8 +154,9 @@ fn table_header_error(text: &str) -> Option<String> {
         let line = raw.split('#').next().unwrap_or_default().trim();
         if line.starts_with('[') {
             return Some(format!(
-                "line {}: TOML tables are not accepted ({line}); config.toml only allows `key = value`",
-                index + 1
+                "line {}: TOML tables are not accepted ({}); config.toml only allows `key = value`",
+                index + 1,
+                line.shown()
             ));
         }
     }
@@ -174,7 +175,8 @@ pub fn parse(text: &str) -> (Config, Vec<String>, Vec<String>) {
         let at = index + 1;
         if line.starts_with('[') {
             errors.push(format!(
-                "line {at}: TOML tables are not accepted ({line}); config.toml only allows `key = value`"
+                "line {at}: TOML tables are not accepted ({}); config.toml only allows `key = value`",
+                line.shown()
             ));
             continue;
         }
@@ -296,5 +298,33 @@ mod tests {
         // A key that only starts like it is another key.
         write("approval_ttl_seconds_x = 1\n");
         assert_eq!(approval_ttl_seconds(&home), Ok(None));
+    }
+
+    #[test]
+    fn table_header_errors_escape_control_and_bidi() {
+        let evil = "[tab\x1b[2K\u{202e}\u{200b}]\n";
+        let (_, _, errors) = parse(evil);
+        assert_eq!(errors.len(), 1);
+        for forbidden in ["\x1b", "\u{202e}", "\u{200b}"] {
+            assert!(
+                !errors[0].contains(forbidden),
+                "raw {forbidden:?} in parse error:\n{:?}",
+                errors[0]
+            );
+        }
+        assert!(errors[0].contains("\\u{1b}"), "{}", errors[0]);
+        assert!(errors[0].contains("\\u{202e}"), "{}", errors[0]);
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = Home::new(temp.path().to_path_buf());
+        fs::write(path(&home), format!("{evil}approval_ttl_seconds = 60\n")).unwrap();
+        let err = approval_ttl_seconds(&home).unwrap_err();
+        for forbidden in ["\x1b", "\u{202e}", "\u{200b}"] {
+            assert!(
+                !err.contains(forbidden),
+                "raw {forbidden:?} in ttl error:\n{err:?}"
+            );
+        }
+        assert!(err.contains("\\u{1b}"), "{err}");
     }
 }
