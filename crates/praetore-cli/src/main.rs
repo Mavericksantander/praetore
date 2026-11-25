@@ -1886,6 +1886,12 @@ fn dispatch_approved(
 /// `value` as pretty JSON for the terminal: each line with the invisible
 /// characters JSON leaves (DEL, C1, bidi, zero-width, tags) escaped. JSON
 /// strings never hold a raw newline, so the lines are the JSON's own.
+///
+/// The result is only for a person to read. When the value has no such
+/// characters the text is still RFC 8259 (pretty-printed JSON) and a
+/// script can parse it (`praetore demo`). Once an invisible character is
+/// written as `\u{...}`, the text is no longer RFC 8259 and must not be
+/// parsed as JSON.
 fn json_for_terminal(value: &impl Serialize) -> serde_json::Result<String> {
     Ok(serde_json::to_string_pretty(value)?
         .lines()
@@ -2119,6 +2125,20 @@ mod tests {
         let body = serde_json::json!({"authorization": "allowed", "evidence": {"request_id": "r"}});
         let shown = gateway_body_for_terminal(&body.to_string());
         assert_eq!(shown, serde_json::to_string_pretty(&body).unwrap());
+    }
+
+    /// When an invisible character is written as `\u{...}`, the text is
+    /// for the terminal only: it is no longer RFC 8259 and must not be
+    /// parsed as JSON.
+    #[test]
+    fn json_for_terminal_is_not_rfc8259_when_invisibles_are_escaped() {
+        let value = serde_json::json!({"error": "x\u{202e}y"});
+        let shown = json_for_terminal(&value).unwrap();
+        assert!(shown.contains("\\u{202e}"), "{shown}");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&shown).is_err(),
+            "escaped output is for the terminal, not to be parsed as JSON: {shown}"
+        );
     }
 
     #[test]
