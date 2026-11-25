@@ -10321,15 +10321,15 @@ mod g1_safety {
                 }
             }
             // A session the schedule left inside the hook commits now.
-            for index in 0..2 {
-                if matches!(writers[index].phase, Phase::Inserted) {
-                    writers[index].commands.send(()).unwrap();
-                    writers[index].next_event(&label);
+            for (index, writer) in writers.iter_mut().enumerate() {
+                if matches!(writer.phase, Phase::Inserted) {
+                    writer.commands.send(()).unwrap();
+                    writer.next_event(&label);
                 }
                 assert!(
-                    matches!(writers[index].phase, Phase::Finished(_)),
+                    matches!(writer.phase, Phase::Finished(_)),
                     "{label}: writer {index} did not finish: {:?}",
-                    writers[index].phase
+                    writer.phase
                 );
             }
 
