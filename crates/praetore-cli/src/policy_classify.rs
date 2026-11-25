@@ -3,7 +3,7 @@
 //! document, and prints it. It reads the file and never writes or rewrites
 //! any file.
 
-use praetore_core::{ActionClassProposal, RecordedPolicy};
+use praetore_core::{ActionClassProposal, RecordedPolicy, display::Show};
 use std::{fs, io::Read, path::Path};
 
 const MAX_POLICY_BYTES: u64 = 1024 * 1024;
@@ -40,7 +40,7 @@ pub fn report(text: &str) -> Result<Report, Box<dyn std::error::Error>> {
     }))? + "\n";
     let mut stderr = vec![format!(
         "policy {} v{} is format {} (digest {})",
-        recorded.id(),
+        recorded.id().shown(),
         recorded.version(),
         recorded.format_version(),
         recorded.digest()
@@ -54,7 +54,7 @@ pub fn report(text: &str) -> Result<Report, Box<dyn std::error::Error>> {
         "review every Mission entry: an action the executor runs without waiting for PRÆTORE must be renamed `safety:<name>`, declared Safety and have no rule.".into(),
     );
     for problem in &problems {
-        stderr.push(format!("problem: {problem}"));
+        stderr.push(format!("problem: {}", problem.to_string().shown()));
     }
     Ok(Report {
         stdout,

@@ -64,6 +64,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use praetore_core::display::Show;
 use praetore_core::{
     SafetyNamespaceManifest, VerifiedPublicKey,
     safety_ingest::{
@@ -128,13 +129,13 @@ fn main() {
         }
     };
     if let Err(error) = result {
-        eprintln!("praetore-safety-ingest: {error}");
+        eprintln!("praetore-safety-ingest: {}", error.to_string().shown());
         std::process::exit(1);
     }
 }
 
 fn log(message: impl std::fmt::Display) {
-    eprintln!("praetore-safety-ingest: {message}");
+    eprintln!("praetore-safety-ingest: {}", message.to_string().shown());
 }
 
 // ---------------------------------------------------------------------------
