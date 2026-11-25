@@ -1,4 +1,5 @@
 use praetore_core::approval_delegation::DelegationConfig;
+use praetore_core::display::Show;
 use praetore_core::{
     PraetoreError,
     authority::Authority,
@@ -764,7 +765,7 @@ fn execute(command: Command, verifier_now: OffsetDateTime) -> Result<Summary, Cl
                         &text, &attesters, None, None, None,
                     )
                     .map_err(|error| {
-                        eprintln!("database journal: {error}");
+                        eprintln!("database journal: {}", error.to_string().shown());
                         CliError { code: error.code() }
                     })?;
                     let summary = database_report.summary;
@@ -807,7 +808,7 @@ fn execute(command: Command, verifier_now: OffsetDateTime) -> Result<Summary, Cl
                 )
             }
             .map_err(|error| {
-                eprintln!("journal: {error}");
+                eprintln!("journal: {}", error.to_string().shown());
                 CliError { code: error.code() }
             })?;
             let summary = report.summary;
@@ -936,7 +937,7 @@ fn execute(command: Command, verifier_now: OffsetDateTime) -> Result<Summary, Cl
             }
             for warning in &warnings {
                 if let Some(text) = warning.as_str() {
-                    eprintln!("journal: warning: {text}");
+                    eprintln!("journal: warning: {}", text.to_string().shown());
                 }
             }
             details.insert("warnings".into(), serde_json::Value::Array(warnings));
@@ -974,7 +975,7 @@ fn execute(command: Command, verifier_now: OffsetDateTime) -> Result<Summary, Cl
             let (report, receipts) =
                 verify_journal_receipts(&text, &attesters, expected_head.as_ref()).map_err(
                     |error| {
-                        eprintln!("journal: {error}");
+                        eprintln!("journal: {}", error.to_string().shown());
                         CliError { code: error.code() }
                     },
                 )?;
@@ -1001,7 +1002,7 @@ fn execute(command: Command, verifier_now: OffsetDateTime) -> Result<Summary, Cl
                 },
             )
             .map_err(|error| {
-                eprintln!("outcomes: {error}");
+                eprintln!("outcomes: {}", error.to_string().shown());
                 CliError { code: error.code() }
             })?;
             details.insert(
@@ -1112,7 +1113,7 @@ fn execute(command: Command, verifier_now: OffsetDateTime) -> Result<Summary, Cl
             }
             for warning in &warnings {
                 if let Some(text) = warning.as_str() {
-                    eprintln!("outcomes: warning: {text}");
+                    eprintln!("outcomes: warning: {}", text.to_string().shown());
                 }
             }
             details.insert("warnings".into(), serde_json::Value::Array(warnings));
@@ -1330,7 +1331,7 @@ fn verify_safety_journal(
     }
     for warning in &warnings {
         if let Some(text) = warning.as_str() {
-            eprintln!("safety-journal: warning: {text}");
+            eprintln!("safety-journal: warning: {}", text.to_string().shown());
         }
     }
     details.insert("warnings".into(), serde_json::Value::Array(warnings));
@@ -1472,7 +1473,7 @@ fn read_attester_pins(paths: &[PathBuf]) -> Result<Vec<VerifiedPublicKey>, CliEr
     for path in paths {
         let key = read_attester_pin(path)?;
         if keys.contains(&key) {
-            eprintln!("attester pin {} repeats a key", path.display());
+            eprintln!("attester pin {} repeats a key", path.shown());
             return Err(CliError {
                 code: "TRUST_STORE_FAIL",
             });
@@ -1495,7 +1496,7 @@ fn read_delegation(args: &DelegationArgs) -> Result<LoadedDelegation, CliError> 
     let roots = read_key_pins(&args.root_pins)?;
     let config =
         DelegationConfig::from_json(&read_limited(&args.delegations)?).map_err(|error| {
-            eprintln!("delegations: {error}");
+            eprintln!("delegations: {}", error.to_string().shown());
             CliError { code: error.code() }
         })?;
     // Format 2 only: the option is read from the policy, so it must load.
@@ -1520,7 +1521,7 @@ fn read_key_pins(paths: &[PathBuf]) -> Result<Vec<KeyPin>, CliError> {
             .iter()
             .any(|other| other.key_id == pin.key_id || other.public_key == pin.public_key)
         {
-            eprintln!("pin {} repeats a key or key id", path.display());
+            eprintln!("pin {} repeats a key or key id", path.shown());
             return Err(CliError {
                 code: "TRUST_STORE_FAIL",
             });
