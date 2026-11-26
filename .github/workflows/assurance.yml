@@ -35,6 +35,7 @@ jobs:
       - name: test-hooks of praetore-replay-postgres never reaches a shipped build
         run: |
           scripts/test-check-test-hooks-feature.sh
+          scripts/test-check-test-hooks-feature-lines.sh
           scripts/check-test-hooks-feature.sh
       - name: print-cmd round-trip includes zsh
         run: |
