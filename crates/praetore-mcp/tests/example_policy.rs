@@ -23,18 +23,26 @@ fn example() -> PathBuf {
 }
 
 fn gate_with_example() -> (tempfile::TempDir, Gate) {
+    gate_with_example_in(Mode::Enforce)
+}
+
+fn gate_with_example_in(mode: Mode) -> (tempfile::TempDir, Gate) {
     let temp = tempfile::tempdir().unwrap();
     let home = Home::new(temp.path().join("home"));
     store::init(&home).unwrap();
     fs::copy(example(), home.policy()).unwrap();
-    let gate = Gate::load(&home, Mode::Enforce).unwrap();
+    let gate = Gate::load(&home, mode).unwrap();
     (temp, gate)
 }
 
 /// The outcome and the rules that decided it.
 fn decide(gate: &Gate, tool: &str) -> (DecisionOutcome, Vec<String>) {
-    let params = json!({"name": tool, "arguments": {"path": "/tmp/praetore-example/a.txt"}});
-    let evidence = gate.evaluate_evidence(SERVER, &params).unwrap();
+    decide_on(gate, SERVER, tool, "/tmp/praetore-example/a.txt")
+}
+
+fn decide_on(gate: &Gate, server: &str, tool: &str, path: &str) -> (DecisionOutcome, Vec<String>) {
+    let params = json!({"name": tool, "arguments": {"path": path}});
+    let evidence = gate.evaluate_evidence(server, &params).unwrap();
     let outcome = evidence.decision.outcome;
     let rules = evidence
         .decision
@@ -82,4 +90,70 @@ fn the_example_policy_allows_a_read_and_denies_a_write() {
         decide(&gate, "create_directory"),
         (DecisionOutcome::Deny, vec![])
     );
+}
+
+/// The two conditions examples/claude-code-mcp-policy/README.md states.
+#[test]
+fn the_example_policy_needs_the_server_name_and_sets_no_path_condition() {
+    let (_temp, gate) = gate_with_example();
+    // Under another server name no rule matches: the default deny.
+    assert_eq!(
+        decide_on(
+            &gate,
+            "files",
+            "read_text_file",
+            "/tmp/praetore-example/a.txt"
+        ),
+        (DecisionOutcome::Deny, vec![])
+    );
+    // By tool name only: an allowed tool is allowed on any path.
+    for path in ["/tmp/praetore-example/a.txt", "/home/user/other/b.txt"] {
+        assert_eq!(
+            decide_on(&gate, SERVER, "read_text_file", path),
+            (DecisionOutcome::Allow, vec!["allow-read-text-file".into()]),
+            "{path}"
+        );
+    }
+    let text = fs::read_to_string(example()).unwrap();
+    let policy = Policy::from_json(&text).unwrap();
+    for rule in &policy.rules {
+        assert_eq!(rule.target.as_deref(), Some(SERVER), "{}", rule.id);
+        assert!(
+            rule.parameter_conditions.iter().all(|c| c.key == "tool"),
+            "{}: a condition other than the tool name",
+            rule.id
+        );
+    }
+}
+
+/// What the README says about modes: a write the example denies is blocked
+/// only in enforce mode. In observe (what `install` writes by default) it
+/// is forwarded unchanged, and its receipt records the DENY.
+#[test]
+fn the_example_blocks_a_denied_write_only_in_enforce() {
+    let line = br#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"write_file","arguments":{"path":"/tmp/praetore-example/a.txt","content":"x"}}}
+"#;
+    for mode in [Mode::Enforce, Mode::Observe] {
+        let (_temp, mut gate) = gate_with_example_in(mode);
+        let out = praetore_mcp::proxy::handle_client_line(line, mode, SERVER, &mut gate);
+        match mode {
+            Mode::Enforce => {
+                assert!(out.to_server.is_none(), "enforce forwarded a denied write");
+                let reply: serde_json::Value =
+                    serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
+                assert_eq!(reply["result"]["isError"], true, "{reply}");
+            }
+            Mode::Observe => {
+                assert_eq!(out.to_server.as_deref(), Some(&line[..]));
+                assert!(out.to_client.is_none());
+                assert!(
+                    out.warnings
+                        .iter()
+                        .any(|w| w.contains("would be DENIED by rule deny-write-file")),
+                    "{:?}",
+                    out.warnings
+                );
+            }
+        }
+    }
 }
