@@ -678,8 +678,8 @@ test("the session chip shows OK, UNANCHORED or FAIL from verify's assurance, nev
   assert.equal(base.reports.items[0].header.verify.assurance, undefined);
   assert.equal(base.reports.items[0].header.verify.result, "passed");
   const U = "UNANCHORED", warn = "chip warn";
-  const unanchored = { es: "verify UNANCHORED · no es aprobación", en: "verify UNANCHORED · not an approval",
-    pt: "verify UNANCHORED · não é aprovação" };
+  const unanchored = { es: "verify UNANCHORED · faltan heads, no es OK", en: "verify UNANCHORED · heads missing, not OK",
+    pt: "verify UNANCHORED · faltam heads, não é OK" };
   const cases = [
     [{ result: "passed", assurance: "OK" }, () => ["OK", "chip ok", "verify OK"]],
     [{ result: "passed", assurance: U }, (lang) => [U, warn, unanchored[lang]]],
@@ -710,6 +710,8 @@ test("the session chip shows OK, UNANCHORED or FAIL from verify's assurance, nev
       assert.equal(got.length, 3, `${lang} ${JSON.stringify(verify)}`);
       for (const chip of got) assert.deepEqual(chip, want(lang), `${lang} ${JSON.stringify(verify)}`);
       assert.ok(!p.text("sessions-list").match(/verify (passed|pasó|passou)/), lang);
+      // "Approval" is the human approval on this page; a verify chip never says it.
+      for (const chip of got) assert.ok(!/aprobaci|approv|aprova/i.test(chip[2]), `${lang} ${chip[2]}`);
     }
   }
 });
