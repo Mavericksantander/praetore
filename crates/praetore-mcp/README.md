@@ -430,7 +430,9 @@ head. Move a 0.3.3 journal out of `receipts/` to keep it. The v0.3.3
 `praetore-mcp verify` does not read 0.3.4 receipts: it reads each line as
 a bare evidence document, and a 0.3.4 line is not one. Concurrent
 wrappers serialize appends with a lock file (`receipts/.journal.lock`,
-`flock`, on Linux and macOS). If the last line is incomplete (an
+`flock`, on Linux and macOS). A wrapper waits at most 10 s for that lock;
+after that the receipt is not written, so enforce refuses the call and
+observe warns. If the last line is incomplete (an
 interrupted write), nothing more is appended: enforce refuses calls and
 observe warns until the journal is checked. A daily file that starts at
 `seq` 0 (and has at most 4096 entries) also verifies with `praetore-verify
@@ -789,9 +791,11 @@ Things to know:
   `method` members), invalid UTF-8 and invalid JSON are unparseable. Such a
   line could hide a `tools/call` from the proxy while the server still reads
   it as one. **Enforce does not forward unparseable lines** and answers with
-  JSON-RPC error `-32700` (`id: null`). Observe forwards them unchanged.
+  JSON-RPC error `-32700`, with the line's `id` when it has one complete
+  top-level `id` and `null` otherwise. Observe forwards them unchanged.
 * **Ambiguous lines** are lines that this proxy and the server could split or
-  read differently. Enforce refuses them with `-32700` (`id: null`). Observe
+  read differently. Enforce refuses them with `-32700` (the line's `id` when
+  it can be read, as above, otherwise `null`). Observe
   forwards them unchanged, warns with the SHA-256 and the length of the
   line, and evaluates and records **every**
   `tools/call` reading it can find. Three kinds are detected:

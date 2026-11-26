@@ -536,10 +536,14 @@ pub fn blocked_response(id: &Value, text: &str) -> Value {
     })
 }
 
-fn parse_error_response(message: &str) -> Value {
+/// `-32700` for a client line that was not forwarded. The `id` is the
+/// line's top-level `id` when that value is complete and appears once
+/// ([`extract_top_level_id`]), so the client can match the error to its
+/// request; otherwise null.
+fn parse_error_response(message: &str, raw: &[u8]) -> Value {
     json!({
         "jsonrpc": "2.0",
-        "id": null,
+        "id": extract_top_level_id(raw).unwrap_or(Value::Null),
         "error": {"code": -32700, "message": message}
     })
 }
@@ -822,9 +826,10 @@ fn refuse_safety_unparseable(out: &mut Outcome, mode: Mode, what: &str, reason: 
         fingerprint(raw),
         mode.as_str()
     ));
-    out.to_client = Some(line(&parse_error_response(&format!(
-        "praetore-mcp: {what} message that may name a safety* tool was not forwarded"
-    ))));
+    out.to_client = Some(line(&parse_error_response(
+        &format!("praetore-mcp: {what} message that may name a safety* tool was not forwarded"),
+        raw,
+    )));
 }
 
 fn refuse_unparseable(out: &mut Outcome, what: &str, reason: &str, raw: &[u8]) {
@@ -832,9 +837,10 @@ fn refuse_unparseable(out: &mut Outcome, what: &str, reason: &str, raw: &[u8]) {
         "praetore-mcp: REFUSED {what} client line in enforce mode ({reason}; {}); it could hide a tools/call",
         fingerprint(raw)
     ));
-    out.to_client = Some(line(&parse_error_response(&format!(
-        "praetore-mcp (enforce): {what} message was not forwarded"
-    ))));
+    out.to_client = Some(line(&parse_error_response(
+        &format!("praetore-mcp (enforce): {what} message was not forwarded"),
+        raw,
+    )));
 }
 
 fn batch_refused_error(id: &Value) -> Value {
@@ -913,6 +919,7 @@ pub fn handle_client_line(
                             Some(id) => line(&blocked_response(&id, &text)),
                             None => line(&parse_error_response(
                                 "praetore-mcp: an ambiguous message naming a safety* tool was not forwarded",
+                                raw,
                             )),
                         });
                     }
@@ -1415,6 +1422,32 @@ mod tests {
         assert_eq!(reply["id"], Value::Null);
         assert!(out.warnings[0].contains(&digest), "{:?}", out.warnings);
         assert!(eval.calls.is_empty());
+    }
+
+    /// T-016-B6: the `-32700` for a refused line carries the line's `id`
+    /// when it is complete and appears once, and null otherwise.
+    #[test]
+    fn refused_unparseable_line_names_its_id_when_it_can_be_read() {
+        let cases: [(&[u8], Value); 5] = [
+            (b"{\"id\":7,\"method\":\"tools/call\",\n", json!(7)),
+            (b"{\"id\":\"a\",\"method\":\"tools/call\",\n", json!("a")),
+            (b"{\"method\":\"tools/call\",\n", Value::Null),
+            (
+                b"{\"id\":1,\"id\":2,\"method\":\"tools/call\",\n",
+                Value::Null,
+            ),
+            (b"{\"id\":\"tru", Value::Null),
+        ];
+        for (raw, id) in cases {
+            let label = String::from_utf8_lossy(raw);
+            let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
+            let out = handle_client_line(raw, Mode::Enforce, "s", &mut eval);
+            assert!(out.to_server.is_none(), "{label}");
+            let reply: Value = serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
+            assert_eq!(reply["error"]["code"], -32700, "{label}");
+            assert_eq!(reply["id"], id, "{label}");
+            assert!(eval.calls.is_empty(), "{label}");
+        }
     }
 
     /// Ambiguous client lines in observe: the warning names the raw line by

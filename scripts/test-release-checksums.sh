@@ -7,16 +7,23 @@ script="$(cd "$(dirname "$0")" && pwd)/release-checksums.sh"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 version=v0.0.0-test
-targets=(x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin)
+archives=(
+  "praetore-mcp x86_64-unknown-linux-gnu"
+  "praetore-mcp aarch64-apple-darwin"
+  "praetore-mcp x86_64-apple-darwin"
+  "praetore-verify aarch64-apple-darwin"
+)
 if command -v sha256sum >/dev/null; then sha=(sha256sum); else sha=(shasum -a 256); fi
 
 make_assets() {
   local dir=$1
   mkdir -p "$dir"
-  for target in "${targets[@]}"; do
-    local name="praetore-mcp-${version}-${target}"
+  local entry binary target
+  for entry in "${archives[@]}"; do
+    read -r binary target <<<"$entry"
+    local name="${binary}-${version}-${target}"
     mkdir -p "$work/src/$name"
-    echo "binary for $target" > "$work/src/$name/praetore-mcp"
+    echo "$binary for $target" > "$work/src/$name/$binary"
     echo license > "$work/src/$name/LICENSE"
     echo notice > "$work/src/$name/NOTICE"
     tar -C "$work/src" -czf "$dir/${name}.tar.gz" "$name"
@@ -31,6 +38,7 @@ failures=0
 expect() {
   local want=$1 label=$2 assets=$3
   local out="$work/out-$RANDOM"
+  last_out=$out
   if "$script" "$version" "$assets" "$work/praetore-verify" "$out" >"$work/log" 2>&1; then
     got=pass
   else
@@ -47,15 +55,35 @@ expect() {
     (cd "$out" && "${sha[@]}" -c SHA256SUMS >/dev/null)
     local count
     count=$(wc -l < "$out/SHA256SUMS" | tr -d ' ')
-    if [[ "$count" != 4 ]]; then
-      echo "FAIL: $label: SHA256SUMS has $count lines, expected 4"
+    if [[ "$count" != 5 ]]; then
+      echo "FAIL: $label: SHA256SUMS has $count lines, expected 5"
       failures=$((failures + 1))
     fi
   fi
 }
 
 make_assets "$work/good"
-expect pass "three archives and praetore-verify" "$work/good"
+expect pass "four archives and praetore-verify" "$work/good"
+grep -q " praetore-verify-${version}-aarch64-apple-darwin.tar.gz\$" "$last_out/SHA256SUMS" ||
+  { echo "FAIL: SHA256SUMS does not list the macOS arm64 praetore-verify"; failures=$((failures + 1)); }
+
+cp -R "$work/good" "$work/noverify"
+rm "$work/noverify/praetore-verify-${version}-aarch64-apple-darwin.tar.gz"
+expect fail "missing macOS arm64 praetore-verify archive" "$work/noverify"
+
+cp -R "$work/good" "$work/verifynosum"
+rm "$work/verifynosum/praetore-verify-${version}-aarch64-apple-darwin.tar.gz.sha256"
+expect fail "missing .sha256 of the praetore-verify archive" "$work/verifynosum"
+
+mkdir -p "$work/wrongbin"
+make_assets "$work/wrongbin"
+name="praetore-verify-${version}-aarch64-apple-darwin"
+mkdir -p "$work/src/$name"
+for f in praetore-mcp LICENSE NOTICE; do echo "$f" > "$work/src/$name/$f"; done
+tar -C "$work/src" -czf "$work/wrongbin/${name}.tar.gz" "$name"
+rm -rf "$work/src/$name"
+(cd "$work/wrongbin" && "${sha[@]}" "${name}.tar.gz" > "${name}.tar.gz.sha256")
+expect fail "praetore-verify archive holding praetore-mcp" "$work/wrongbin"
 
 cp -R "$work/good" "$work/missing"
 rm "$work/missing/praetore-mcp-${version}-x86_64-apple-darwin.tar.gz"

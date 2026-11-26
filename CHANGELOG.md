@@ -4,6 +4,14 @@
 
 ### Fixed
 
+- **praetore-mcp: the journal and approval locks wait at most 10 s.** A
+  process that kept `receipts/.journal.lock` or `approvals/.lock` left
+  every call waiting with no reply. After 10 s the wait ends with an error
+  naming the lock: the receipt is not written, so enforce refuses the call
+  and observe warns.
+- **praetore-mcp: the `-32700` for a refused line carries its `id`** when
+  the line has one complete top-level `id`. Otherwise the `id` is `null`,
+  as before.
 - **praetore-mcp: `report` has the level and exit code of `verify`.** It
   printed `verify passed` and exited 0 when `verify` was UNANCHORED; it
   now prints `verify OK`, `verify UNANCHORED` or `verify FAIL` and exits
