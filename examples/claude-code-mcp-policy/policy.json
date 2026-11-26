@@ -1,0 +1,162 @@
+{
+  "format_version": 2,
+  "id": "claude-code-filesystem-read-only",
+  "version": 1,
+  "canonical_version": 1,
+  "semantics_version": 2,
+  "action_classes": {
+    "mcp.tools/call": "Mission"
+  },
+  "rules": [
+    {
+      "id": "allow-read-text-file",
+      "action_type": "mcp.tools/call",
+      "effect": "Allow",
+      "required_capability": "mcp:tools/call",
+      "target": "filesystem",
+      "parameter_conditions": [
+        {
+          "key": "tool",
+          "operator": "Exact",
+          "expected": "read_text_file"
+        }
+      ],
+      "context_conditions": []
+    },
+    {
+      "id": "allow-read-multiple-files",
+      "action_type": "mcp.tools/call",
+      "effect": "Allow",
+      "required_capability": "mcp:tools/call",
+      "target": "filesystem",
+      "parameter_conditions": [
+        {
+          "key": "tool",
+          "operator": "Exact",
+          "expected": "read_multiple_files"
+        }
+      ],
+      "context_conditions": []
+    },
+    {
+      "id": "allow-list-directory",
+      "action_type": "mcp.tools/call",
+      "effect": "Allow",
+      "required_capability": "mcp:tools/call",
+      "target": "filesystem",
+      "parameter_conditions": [
+        {
+          "key": "tool",
+          "operator": "Exact",
+          "expected": "list_directory"
+        }
+      ],
+      "context_conditions": []
+    },
+    {
+      "id": "allow-directory-tree",
+      "action_type": "mcp.tools/call",
+      "effect": "Allow",
+      "required_capability": "mcp:tools/call",
+      "target": "filesystem",
+      "parameter_conditions": [
+        {
+          "key": "tool",
+          "operator": "Exact",
+          "expected": "directory_tree"
+        }
+      ],
+      "context_conditions": []
+    },
+    {
+      "id": "allow-search-files",
+      "action_type": "mcp.tools/call",
+      "effect": "Allow",
+      "required_capability": "mcp:tools/call",
+      "target": "filesystem",
+      "parameter_conditions": [
+        {
+          "key": "tool",
+          "operator": "Exact",
+          "expected": "search_files"
+        }
+      ],
+      "context_conditions": []
+    },
+    {
+      "id": "allow-get-file-info",
+      "action_type": "mcp.tools/call",
+      "effect": "Allow",
+      "required_capability": "mcp:tools/call",
+      "target": "filesystem",
+      "parameter_conditions": [
+        {
+          "key": "tool",
+          "operator": "Exact",
+          "expected": "get_file_info"
+        }
+      ],
+      "context_conditions": []
+    },
+    {
+      "id": "allow-list-allowed-directories",
+      "action_type": "mcp.tools/call",
+      "effect": "Allow",
+      "required_capability": "mcp:tools/call",
+      "target": "filesystem",
+      "parameter_conditions": [
+        {
+          "key": "tool",
+          "operator": "Exact",
+          "expected": "list_allowed_directories"
+        }
+      ],
+      "context_conditions": []
+    },
+    {
+      "id": "deny-write-file",
+      "action_type": "mcp.tools/call",
+      "effect": "Deny",
+      "required_capability": "mcp:tools/call",
+      "target": "filesystem",
+      "parameter_conditions": [
+        {
+          "key": "tool",
+          "operator": "Exact",
+          "expected": "write_file"
+        }
+      ],
+      "context_conditions": []
+    },
+    {
+      "id": "deny-edit-file",
+      "action_type": "mcp.tools/call",
+      "effect": "Deny",
+      "required_capability": "mcp:tools/call",
+      "target": "filesystem",
+      "parameter_conditions": [
+        {
+          "key": "tool",
+          "operator": "Exact",
+          "expected": "edit_file"
+        }
+      ],
+      "context_conditions": []
+    },
+    {
+      "id": "deny-move-file",
+      "action_type": "mcp.tools/call",
+      "effect": "Deny",
+      "required_capability": "mcp:tools/call",
+      "target": "filesystem",
+      "parameter_conditions": [
+        {
+          "key": "tool",
+          "operator": "Exact",
+          "expected": "move_file"
+        }
+      ],
+      "context_conditions": []
+    }
+  ]
+}
