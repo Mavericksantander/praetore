@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-## 0.3.7 - <FECHA-DEL-TAG-v0.3.7>
+## 0.3.7 - 2026-11-26
 
 ### Added
 
@@ -11,7 +11,16 @@
   of the filesystem server by name, denies `write_file`, `edit_file` and
   `move_file`, and leaves every other tool to the default deny; a test
   checks it as `policy check` does and evaluates one allowed and one denied
-  call.
+  call. Its README (#258) states the two conditions (the server must be
+  named `filesystem`; there are no path conditions) and that the denies
+  block only in enforce mode: `install` writes observe by default, where a
+  denied call is forwarded and its receipt records the DENY.
+
+- **praetore-verify for macOS arm64 in the release.** (#257)
+  `praetore-verify-vX.Y.Z-aarch64-apple-darwin.tar.gz` (binary, LICENSE,
+  NOTICE), built and smoke-tested on macOS arm64, listed in `SHA256SUMS`
+  (five lines) and covered by its Sigstore signature. Linux x86_64 still
+  ships the bare `praetore-verify`.
 
 - **praetore-mcp: `install --client claude-code`** (#201) (alias `cc`). Wraps the
   stdio servers of `~/.claude.json` (user scope) and `./.mcp.json`
@@ -415,7 +424,8 @@
   manifest, checked), #249 (local approve/reject test denylist and source
   guard), #253 (receipts written by the packaged praetore-mcp binary,
   without approval, checked by praetore-verify and refused once cut or
-  changed).
+  changed), #259 (the negative receipt checks require praetore-verify
+  exit 1).
 - Docs: #192 (install guide for v0.3.6), #193 (Ed25519 audit), #218
   (ADR-007 proposal), #221 (implementation map), #226 (review of draft
   #131).
