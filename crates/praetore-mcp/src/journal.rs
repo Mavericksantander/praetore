@@ -214,10 +214,16 @@ pub fn journal_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
+/// `; run \`verify\``, the hint `wrap` adds to an error so a person knows
+/// what to run; empty when `verify` itself reports it.
+fn run_hint(verify: Option<&str>) -> String {
+    verify.map_or_else(String::new, |command| format!("; run `{command}`"))
+}
+
 /// Last line of `path` without its newline, `None` for an empty file.
 /// A last line without a newline (interrupted write) is an error: nothing
 /// is appended after it until someone looks at the journal.
-fn last_line(path: &Path, verify: &str) -> Result<Option<String>, String> {
+fn last_line(path: &Path, verify: Option<&str>) -> Result<Option<String>, String> {
     let fail = |e: io::Error| format!("cannot read {}: {e}", path.shown());
     let mut file = fs::File::open(path).map_err(fail)?;
     let len = file.metadata().map_err(fail)?.len();
@@ -230,8 +236,9 @@ fn last_line(path: &Path, verify: &str) -> Result<Option<String>, String> {
     file.read_to_end(&mut tail).map_err(fail)?;
     let Some(body) = tail.strip_suffix(b"\n") else {
         return Err(format!(
-            "{} does not end with a newline (interrupted write?); run `{verify}`",
-            path.shown()
+            "{} does not end with a newline (interrupted write?){}",
+            path.shown(),
+            run_hint(verify)
         ));
     };
     let line = match body.iter().rposition(|&b| b == b'\n') {
@@ -247,11 +254,12 @@ fn last_line(path: &Path, verify: &str) -> Result<Option<String>, String> {
 /// Where the next entry goes: the newest daily file that is not older than
 /// `today` (so file order stays chain order if the clock goes back), and the
 /// position after the last entry of the journal. `verify` is the command
-/// an error tells to run ([`crate::commands::command`]).
+/// an error tells to run ([`crate::commands::command`]); `None` when
+/// `verify` itself is the caller.
 pub fn next_append(
     dir: &Path,
     today: PathBuf,
-    verify: &str,
+    verify: Option<&str>,
 ) -> Result<(PathBuf, Position), String> {
     let files = journal_files(dir)?;
     let path = match files.last() {
@@ -264,8 +272,9 @@ pub fn next_append(
         };
         let entry = parse_line(&text).map_err(|e| {
             format!(
-                "last entry of {} is unreadable ({e}); run `{verify}`",
-                file.shown()
+                "last entry of {} is unreadable ({e}){}",
+                file.shown(),
+                run_hint(verify)
             )
         })?;
         return Ok(match entry.position {
@@ -275,6 +284,74 @@ pub fn next_append(
         });
     }
     Ok((path, Position::FIRST))
+}
+
+/// Where the next entry goes, as [`crate::gate::Journal::record`] finds it
+/// before it writes: `dir` is not a symlink, the last line of the journal
+/// reads back as a chained entry ([`next_append`]), and the daily file it
+/// chooses is not a symlink. `verify` runs this same function: a journal
+/// the writer refuses to append to fails `verify`, instead of passing while
+/// `wrap` writes nothing (a blank line at the end of the daily file, a
+/// whitespace-only later file, or a symlink in place of the directory or
+/// the file all left `verify` at OK before).
+pub fn next_entry(
+    dir: &Path,
+    today: PathBuf,
+    verify: Option<&str>,
+) -> Result<(PathBuf, Position), String> {
+    if is_symlink(dir) {
+        return Err(format!(
+            "{} is a symlink; refusing to follow it",
+            dir.shown()
+        ));
+    }
+    let (path, position) = next_append(dir, today, verify)?;
+    if is_symlink(&path) {
+        return Err(format!("{} is a symlink; refusing to append", path.shown()));
+    }
+    Ok((path, position))
+}
+
+fn is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
+/// Whether the daily file `path` (chosen by [`next_entry`]) takes an append
+/// right now: it exists and opens for append, or it does not exist yet and
+/// `dir` accepts a new file. A missing `dir` is fine: the writer creates it.
+/// Nothing is written. Permissions can change before the next call, so
+/// `verify` reports a failure here as a warning, not as a failed check.
+pub fn append_access(dir: &Path, path: &Path) -> Result<(), String> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    if path.exists() {
+        return crate::journal_io::opens_for_append(path)
+            .map_err(|e| format!("cannot open {} for append: {e}", path.shown()));
+    }
+    dir_accepts_new_file(dir)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn dir_accepts_new_file(dir: &Path) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .map_err(|_| format!("{} contains a NUL byte", dir.shown()))?;
+    // SAFETY: `access` reads a NUL-terminated path this function owns.
+    if unsafe { libc::access(c_path.as_ptr(), libc::W_OK) } == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "cannot create a file in {}: {}",
+            dir.shown(),
+            io::Error::last_os_error()
+        ))
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn dir_accepts_new_file(_dir: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 /// Exclusive lock over the journal while one entry is appended, so that

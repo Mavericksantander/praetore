@@ -4,6 +4,20 @@
 
 ### Fixed
 
+- **praetore-mcp: `verify` fails when `wrap` could not append the next
+  receipt.** A blank line at the end of the daily file, a whitespace-only
+  later `*.jsonl` file, or a symlink in place of `receipts/` or of the
+  daily file made `wrap` refuse to append: observe forwarded every call
+  WITHOUT a receipt and enforce refused every call, while `verify`, with
+  both heads, said OK, because the chain and its head were intact. `verify`
+  now finds the next position with the same function as `wrap`
+  (`journal::next_entry`) and reports
+  `FAIL journal: wrap cannot append the next receipt (...)`, exit 1, with
+  or without the heads. A daily file that exists but does not open for
+  append right now (read-only) is a `WARNING journal:` line after the
+  summary, not a failure, since permissions can change before the next
+  call. The dashboard shows the same failure. Pinned by
+  `crates/praetore-mcp/tests/journal_appendable.rs`.
 - **praetore-mcp: the journal and approval locks wait at most 10 s.** A
   process that kept `receipts/.journal.lock` or `approvals/.lock` left
   every call waiting with no reply. After 10 s the wait ends with an error

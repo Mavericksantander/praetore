@@ -434,7 +434,17 @@ wrappers serialize appends with a lock file (`receipts/.journal.lock`,
 after that the receipt is not written, so enforce refuses the call and
 observe warns. If the last line is incomplete (an
 interrupted write), nothing more is appended: enforce refuses calls and
-observe warns until the journal is checked. A daily file that starts at
+observe warns until the journal is checked. `verify` finds the next
+position with the same function as `wrap`: when `wrap` could not append
+(a blank line at the end of the daily file, a whitespace-only later
+`*.jsonl` file, a symlink in place of `receipts/` or of the daily file,
+an unreadable last line), `verify` reports
+`FAIL journal: wrap cannot append the next receipt` and exits 1, with or
+without the heads, because every call since then ran without a receipt
+(observe) or was refused (enforce) while the chain and its head stayed
+intact. A daily file that exists but does not open for append right now
+(for example read-only) is a `WARNING journal:` line, not a failure:
+permissions can change before the next call. A daily file that starts at
 `seq` 0 (and has at most 4096 entries) also verifies with `praetore-verify
 journal --journal FILE --attester-pin attester-public-key.hex`, with the same
 head. Each `evidence` is a complete

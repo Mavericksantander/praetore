@@ -171,6 +171,9 @@ pub struct VerifyReport {
     pub lines: Vec<LineVerdict>,
     /// Which journals were compared with a head given by the caller.
     pub anchors: Anchors,
+    /// States that do not fail a check but that the person should see: the
+    /// daily file or directory does not take an append right now.
+    pub warnings: Vec<String>,
 }
 
 /// Which journals `verify` compared with a state kept by the caller: a
@@ -642,6 +645,19 @@ pub fn verify_journal_with(
                 "FAIL journal has no verifiable head; expected {expected}"
             )),
         }
+    }
+    // The writer's own view of the journal: `wrap` finds the next position
+    // with the same function, and refuses to append when it fails. A journal
+    // the writer refuses leaves every later call without a receipt (observe
+    // forwards it, enforce refuses it), so `verify` must not pass on it.
+    match crate::gate::Journal::new(home).check_appendable() {
+        Ok(None) => {}
+        Ok(Some(warning)) => report.warnings.push(format!(
+            "WARNING journal: the next receipt cannot be appended right now ({warning}); until it can, wrap forwards calls WITHOUT a receipt in observe and refuses them in enforce"
+        )),
+        Err(error) => report.failures.push(format!(
+            "FAIL journal: wrap cannot append the next receipt ({error}); every call is forwarded WITHOUT a receipt in observe and refused in enforce until the journal is repaired"
+        )),
     }
     let approvals = crate::approvals::verify(home, &parsed_evidence)?;
     report.failures.extend(approvals.failures);

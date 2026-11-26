@@ -316,8 +316,14 @@ fn tampered_journal_line_fails_verify() {
     let verify = verify_cli(&home);
     let report = String::from_utf8_lossy(&verify.stdout);
     assert_eq!(verify.status.code(), Some(1), "{report}");
-    assert!(report.contains("1 verified, 1 failed"), "{report}");
+    // The line fails, and, as it is the last one, `wrap` could not append
+    // after it either: `verify` reports both.
+    assert!(report.contains("1 verified, 2 failed"), "{report}");
     assert!(report.contains(":2:"), "{report}");
+    assert!(
+        report.contains("FAIL journal: wrap cannot append the next receipt"),
+        "{report}"
+    );
 }
 
 #[test]

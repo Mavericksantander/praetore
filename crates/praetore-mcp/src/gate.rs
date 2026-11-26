@@ -1357,21 +1357,29 @@ impl Journal {
         // Held until the entry is on disk: the position read below must
         // still be the end of the journal when the line is written.
         let _lock = crate::journal::JournalLock::acquire(&self.dir).map_err(unavailable)?;
-        let (path, position) = crate::journal::next_append(
+        let (path, position) = crate::journal::next_entry(
             &self.dir,
             self.path_for(OffsetDateTime::now_utc()),
-            &self.verify,
+            Some(&self.verify),
         )
         .map_err(unavailable)?;
-        if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
-            return Err(unavailable(format!(
-                "{} is a symlink; refusing to append",
-                path.shown()
-            )));
-        }
         let line = VerifiedLine::new(&position, evidence).map_err(JournalError::Unverifiable)?;
         Self::append(&path, &line).map_err(unavailable)?;
         Ok(path)
+    }
+
+    /// What `verify` says about the next append, without the lock and
+    /// without writing. `Err` is the state [`Journal::record`] refuses
+    /// ([`crate::journal::next_entry`]): a failed check, because every call
+    /// is then forwarded without a receipt (observe) or refused (enforce)
+    /// until someone fixes the journal. `Ok(Some(warning))` is a daily file
+    /// or directory that does not take an append right now
+    /// ([`crate::journal::append_access`]), which can change before the
+    /// next call.
+    pub fn check_appendable(&self) -> Result<Option<String>, String> {
+        let (path, _) =
+            crate::journal::next_entry(&self.dir, self.path_for(OffsetDateTime::now_utc()), None)?;
+        Ok(crate::journal::append_access(&self.dir, &path).err())
     }
 
     /// Appends one line. The journal lock keeps concurrent wrappers (one
@@ -2826,7 +2834,7 @@ mod tests {
         let path = gate.journal.record(&evidence).unwrap();
         assert_eq!(fs::read(&path).unwrap(), line.as_bytes());
         let (_, position) =
-            crate::journal::next_append(&home.receipts_dir(), path.clone(), "verify").unwrap();
+            crate::journal::next_append(&home.receipts_dir(), path.clone(), None).unwrap();
         assert_eq!(position, *line.next());
     }
 

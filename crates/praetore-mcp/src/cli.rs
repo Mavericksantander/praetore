@@ -935,6 +935,9 @@ fn cmd_verify(args: &[String]) -> Result<i32, String> {
         join(&by_mode),
         join(&report.by_decision)
     );
+    for warning in &report.warnings {
+        println!("{warning}");
+    }
     println!(
         "checked: integrity hash, attester signature ({}), agent intent signature, authority signature against {} at decision time, praetore.mode binding, journal order (seq and hash link)",
         home.attester_pin().shown(),
