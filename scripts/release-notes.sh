@@ -5,7 +5,10 @@
 #
 # <tag> is vX.Y.Z (or vX.Y.Z-suffix). The section is the text after the line
 # `## X.Y.Z` or `## X.Y.Z - <date>` up to the next `## ` heading. A missing or
-# empty section fails, so a tag cannot be released without its notes.
+# empty section fails, so a tag cannot be released without its notes. The
+# heading of a released section must be exactly `## X.Y.Z - YYYY-MM-DD`: no
+# date, a placeholder (anything with `<`) or another date form fails, so a
+# release cannot publish a placeholder date.
 set -euo pipefail
 
 if [[ $# -lt 1 || $# -gt 2 ]]; then
@@ -30,6 +33,15 @@ notes=$(awk -v version="$version" '
 
 if ! grep -q '[^[:space:]]' <<<"$notes"; then
   echo "error: no CHANGELOG section for $version in $changelog" >&2
+  exit 1
+fi
+heading=$(awk -v version="$version" '
+  /^## / && $2 == version && (NF == 2 || $3 == "-") { print; exit }
+' "$changelog")
+date_re='[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])'
+# Exactly one date after the version: a placeholder (`<...>`) never matches.
+if [[ "$heading" != "## $version - "* || ! "${heading#"## $version - "}" =~ ^${date_re}$ ]]; then
+  echo "error: the heading of $version must be '## $version - YYYY-MM-DD', got: $heading" >&2
   exit 1
 fi
 printf '%s\n' "$notes"
