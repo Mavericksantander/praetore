@@ -133,7 +133,7 @@ fn wrap_observe(home: &Home, calls: &[Value]) -> (Vec<Value>, String) {
     (replies, stderr)
 }
 
-fn by_id<'a>(replies: &'a [Value], id: i64) -> &'a Value {
+fn by_id(replies: &[Value], id: i64) -> &Value {
     replies
         .iter()
         .find(|reply| reply["id"] == json!(id))
