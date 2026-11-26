@@ -909,7 +909,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
-      - run: cargo build --release --locked --package praetore-verify --target ${{ matrix.target }}
+      # --target before --package: scripts/test-check-test-hooks-feature.sh
+      # edits the release build line of release-integrity by its exact text,
+      # which must stay unique. check-test-hooks-feature.sh still reads this
+      # line like every other --release build.
+      - run: cargo build --release --locked --target ${{ matrix.target }} --package praetore-verify
       - name: Package binary with its checksum
         shell: bash
         run: |
