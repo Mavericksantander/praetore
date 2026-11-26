@@ -1159,6 +1159,36 @@ pub fn regenerate(
     )
 }
 
+/// `praetore-mcp report` once its options are read: writes the new pair,
+/// prints both paths and the level of `verify`, and returns the exit code
+/// of `verify` for it ([`Assurance::exit_code`]). `Err` is a usage error or
+/// a report that could not be written (exit 2).
+pub fn command(
+    home: &Home,
+    selector: &Selector,
+    expected: ExpectedHeads<'_>,
+) -> Result<i32, String> {
+    // A malformed head is a usage error, as for `verify`, not a report that
+    // says FAIL.
+    expected.check()?;
+    let generated = regenerate(home, selector, expected)?;
+    println!("{}", generated.json.shown());
+    println!("{}", generated.pdf.shown());
+    let detail = match &generated.assurance {
+        Assurance::Anchored => String::new(),
+        Assurance::Unanchored { missing } => format!(
+            ": no check failed, but {} not given; not a pass",
+            missing.join(" and ")
+        ),
+        Assurance::Failed => ": the report says so on its first page".to_owned(),
+    };
+    println!("verify {}{detail}", generated.assurance.label());
+    if let Some(summary) = &generated.verify_summary {
+        eprintln!("praetore-mcp: {summary}");
+    }
+    Ok(generated.assurance.exit_code())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

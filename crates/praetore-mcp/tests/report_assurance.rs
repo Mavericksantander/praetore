@@ -5,7 +5,7 @@
 
 use praetore_mcp::{
     gate::{Gate, Journal, Mode},
-    receipts,
+    receipts::{self, ExpectedHeads},
     report::{self, SessionMeta, Source},
     store::{self, Home},
 };
@@ -75,14 +75,21 @@ fn home_with_a_report_of(gone: &[&str]) -> (tempfile::TempDir, Home) {
     (temp, home)
 }
 
-fn report_exit(home: &Home, extra: &[&str]) -> i32 {
-    let mut args = vec![
-        "report".to_owned(),
-        "--dir".to_owned(),
-        home.root.to_str().unwrap().to_owned(),
-    ];
-    args.extend(extra.iter().map(|arg| (*arg).to_owned()));
-    praetore_mcp::cli::run(&args)
+/// The exit code of `praetore-mcp report --last` with `--expected-head`
+/// and `--expected-approval-head` as given; `Err` exits 2, as in the CLI.
+fn report_exit(home: &Home, receipts: Option<&str>, approvals: Option<&str>) -> i32 {
+    report::command(
+        home,
+        &report::Selector::Last,
+        ExpectedHeads {
+            receipts,
+            approvals,
+        },
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("praetore-mcp: {error}");
+        2
+    })
 }
 
 fn receipts_head(home: &Home) -> String {
@@ -111,7 +118,7 @@ fn last_header(home: &Home) -> Value {
 #[test]
 fn report_without_heads_is_unanchored_with_the_exit_code_of_verify() {
     let (_temp, home) = home_with_a_report();
-    assert_eq!(report_exit(&home, &[]), receipts::UNANCHORED_EXIT);
+    assert_eq!(report_exit(&home, None, None), receipts::UNANCHORED_EXIT);
     assert_eq!(last_header(&home)["verify"]["assurance"], "UNANCHORED");
 }
 
@@ -120,7 +127,7 @@ fn report_without_heads_is_unanchored_with_the_exit_code_of_verify() {
 #[test]
 fn report_verify_command_names_no_approval_journal() {
     let (_temp, home) = home_with_a_report();
-    report_exit(&home, &[]);
+    report_exit(&home, None, None);
     let command = last_header(&home)["verify_command"]
         .as_str()
         .unwrap()
@@ -137,24 +144,12 @@ fn report_verify_command_names_no_approval_journal() {
 fn report_with_both_heads_is_ok_and_with_a_wrong_head_fails() {
     let (_temp, home) = home_with_a_report();
     let head = receipts_head(&home);
-    let ok = [
-        "--expected-head",
-        head.as_str(),
-        "--expected-approval-head",
-        "none",
-    ];
-    assert_eq!(report_exit(&home, &ok), 0);
+    assert_eq!(report_exit(&home, Some(&head), Some("none")), 0);
     assert_eq!(last_header(&home)["verify"]["assurance"], "OK");
     // Regenerated file names carry the second: keep the two apart.
     std::thread::sleep(std::time::Duration::from_millis(1100));
     let wrong = "0".repeat(64);
-    let failed = [
-        "--expected-head",
-        wrong.as_str(),
-        "--expected-approval-head",
-        "none",
-    ];
-    assert_eq!(report_exit(&home, &failed), 1);
+    assert_eq!(report_exit(&home, Some(&wrong), Some("none")), 1);
     assert_eq!(last_header(&home)["verify"]["assurance"], "FAIL");
 }
 
@@ -164,7 +159,7 @@ fn report_with_both_heads_is_ok_and_with_a_wrong_head_fails() {
 fn report_with_a_malformed_head_is_a_usage_error() {
     let (_temp, home) = home_with_a_report();
     let before = fs::read_dir(report::reports_dir(&home)).unwrap().count();
-    assert_eq!(report_exit(&home, &["--expected-head", "not-hex"]), 2);
+    assert_eq!(report_exit(&home, Some("not-hex"), None), 2);
     assert_eq!(
         fs::read_dir(report::reports_dir(&home)).unwrap().count(),
         before
@@ -177,12 +172,6 @@ fn report_with_a_malformed_head_is_a_usage_error() {
 fn report_with_a_session_receipt_gone_fails_even_with_both_heads() {
     let (_temp, home) = home_with_a_report_of(&["00000000-0000-4000-8000-000000000000"]);
     let head = receipts_head(&home);
-    let args = [
-        "--expected-head",
-        head.as_str(),
-        "--expected-approval-head",
-        "none",
-    ];
-    assert_eq!(report_exit(&home, &args), 1);
+    assert_eq!(report_exit(&home, Some(&head), Some("none")), 1);
     assert_eq!(last_header(&home)["verify"]["assurance"], "FAIL");
 }

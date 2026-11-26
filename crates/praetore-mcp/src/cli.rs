@@ -1050,29 +1050,14 @@ fn cmd_report(args: &[String]) -> Result<i32, String> {
         }
         (None, _) => Selector::Last,
     };
-    let expected = receipts::ExpectedHeads {
-        receipts: parsed.value("--expected-head"),
-        approvals: parsed.value("--expected-approval-head"),
-    };
-    // A malformed head is a usage error (exit 2), as for `verify`, not a
-    // report that says FAIL.
-    expected.check()?;
-    let generated = report::regenerate(&parsed.home()?, &selector, expected)?;
-    println!("{}", generated.json.shown());
-    println!("{}", generated.pdf.shown());
-    let detail = match &generated.assurance {
-        receipts::Assurance::Anchored => String::new(),
-        receipts::Assurance::Unanchored { missing } => format!(
-            ": no check failed, but {} not given; not a pass",
-            missing.join(" and ")
-        ),
-        receipts::Assurance::Failed => ": the report says so on its first page".to_owned(),
-    };
-    println!("verify {}{detail}", generated.assurance.label());
-    if let Some(summary) = &generated.verify_summary {
-        eprintln!("praetore-mcp: {summary}");
-    }
-    Ok(generated.assurance.exit_code())
+    report::command(
+        &parsed.home()?,
+        &selector,
+        receipts::ExpectedHeads {
+            receipts: parsed.value("--expected-head"),
+            approvals: parsed.value("--expected-approval-head"),
+        },
+    )
 }
 
 fn cmd_approvals(args: &[String]) -> Result<i32, String> {
