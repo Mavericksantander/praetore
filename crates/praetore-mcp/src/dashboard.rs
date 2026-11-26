@@ -1014,6 +1014,7 @@ fn header_summary(header: &Value) -> Value {
         "summary": header["summary"],
         "verify": {
             "result": header["verify"]["result"],
+            "assurance": header["verify"]["assurance"],
             "session_receipts": header["verify"]["session_receipts"],
             "session_verified": header["verify"]["session_verified"],
         },
@@ -1359,5 +1360,63 @@ fn policy_view(home: &Home, enforce_receipts: usize) -> Value {
             "path": home.policy().display().to_string(),
             "error": error,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{APP_JS, header_summary};
+    use crate::receipts::Assurance;
+    use serde_json::json;
+
+    /// Every level of `verify`. The match fails to compile when a level is
+    /// added, so the page's table below cannot fall behind it.
+    fn every_level() -> [Assurance; 3] {
+        let levels = [
+            Assurance::Anchored,
+            Assurance::Unanchored {
+                missing: vec!["--expected-head"],
+            },
+            Assurance::Failed,
+        ];
+        for level in &levels {
+            match level {
+                Assurance::Anchored | Assurance::Unanchored { .. } | Assurance::Failed => {}
+            }
+        }
+        levels
+    }
+
+    #[test]
+    fn the_sessions_header_carries_the_assurance_level_the_page_knows() {
+        let table = APP_JS
+            .split("const ASSURANCE_CHIP = {")
+            .nth(1)
+            .and_then(|rest| rest.split("};").next())
+            .expect("app.js has the ASSURANCE_CHIP table");
+        let keys: Vec<&str> = table
+            .lines()
+            .filter_map(|line| line.trim().split_once(':').map(|(key, _)| key))
+            .collect();
+        let labels: Vec<&str> = every_level().iter().map(Assurance::label).collect();
+        assert_eq!(
+            keys, labels,
+            "app.js ASSURANCE_CHIP and receipts::Assurance"
+        );
+        // Only OK is drawn green.
+        for line in table.lines() {
+            assert_eq!(
+                line.contains("chip ok"),
+                line.trim().starts_with("OK:"),
+                "{line}"
+            );
+        }
+        for level in every_level() {
+            let header = json!({ "verify": { "result": "passed", "assurance": level.label() } });
+            assert_eq!(
+                header_summary(&header)["verify"]["assurance"],
+                level.label()
+            );
+        }
     }
 }
