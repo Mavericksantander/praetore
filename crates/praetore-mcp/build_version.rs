@@ -1,10 +1,10 @@
 //! The version written in the header of the session reports, worked out
 //! at build time. Used by `build.rs` and by `tests/build_version.rs`.
 //!
-//! * Release build: the crate version, `0.3.6`. Only when the checked out
+//! * Release build: the crate version, `0.3.7`. Only when the checked out
 //!   commit of this repository carries the exact tag `v<crate version>`, or
 //!   when `PRAETORE_MCP_RELEASE=1` is set.
-//! * Any other build: `0.3.6-dev+<short commit>` or `0.3.6-dev`. The commit
+//! * Any other build: `0.3.7-dev+<short commit>` or `0.3.7-dev`. The commit
 //!   comes from git only when the repository git finds is this one (its top
 //!   level holds `crates/praetore-mcp/build.rs`). Otherwise (no `.git`, a
 //!   build inside some other repository, no `git` on `PATH`) it is

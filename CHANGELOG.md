@@ -2,9 +2,16 @@
 
 ## Unreleased
 
-## 0.3.7 - 2026-11-26
+## 0.3.7 - <FECHA-DEL-TAG-v0.3.7>
 
 ### Added
+
+- **Example policy for the filesystem MCP server in Claude Code.** (#254)
+  `examples/claude-code-mcp-policy/policy.json` allows the read-only tools
+  of the filesystem server by name, denies `write_file`, `edit_file` and
+  `move_file`, and leaves every other tool to the default deny; a test
+  checks it as `policy check` does and evaluates one allowed and one denied
+  call.
 
 - **praetore-mcp: `install --client claude-code`** (#201) (alias `cc`). Wraps the
   stdio servers of `~/.claude.json` (user scope) and `./.mcp.json`
@@ -79,6 +86,20 @@
   a source of higher priority is valid.
 
 ### Breaking
+
+- **praetore-mcp: `report` has the level and exit code of `verify`; without
+  heads it exits 3.** (#255) It printed `verify passed` and exited 0 when
+  `verify` was UNANCHORED; it now prints `verify OK`, `verify UNANCHORED` or
+  `verify FAIL` and exits 0, 3 or 1, as `verify`. `report` takes
+  `--expected-head` and `--expected-approval-head`. The verify command
+  printed in a report of a home with no approval journal now ends with
+  `--expected-approval-head none`, so it can reach OK. The JSON header adds
+  `verify.assurance` and `verify.exit_code`; `verify.result` stays, but
+  `result: passed` only means that no check failed: the level is in
+  `verify.assurance`. The dashboard Sessions chip shows that level (OK,
+  UNANCHORED, FAIL); a report written without it is never shown as OK.
+  **A script that runs `report` without the heads and expects exit 0 now
+  gets 3.**
 
 - **`TrustedClockError` is `#[non_exhaustive]` and gains `Regressed`.** (#246) A
   source returns `Regressed` when it reads a time earlier than one it
@@ -156,6 +177,14 @@
 
 ### Fixed
 
+- **praetore-mcp: the journal and approval locks wait at most 10 s.** (#252)
+  A process that kept `receipts/.journal.lock` or `approvals/.lock` left
+  every call waiting with no reply. After 10 s the wait ends with an error
+  naming the lock: the receipt is not written, so enforce refuses the call
+  and observe warns.
+- **praetore-mcp: the `-32700` for a refused line carries its `id`** (#252)
+  when the line has one complete top-level `id`. Otherwise the `id` is
+  `null`, as before.
 - **praetore-mcp: `report` lists a duplicated missing id once.** (#234)
   Two copies of the same gone receipt in the close report's `receipts`
   array were both copied into `missing_evidence_ids`, and the summary
@@ -384,7 +413,9 @@
 - CI: #198 and #223 (HighAssurance hook tests read from
   `cargo test --list` and exit codes), #203 (one `rust-version` in every
   manifest, checked), #249 (local approve/reject test denylist and source
-  guard).
+  guard), #253 (receipts written by the packaged praetore-mcp binary,
+  without approval, checked by praetore-verify and refused once cut or
+  changed).
 - Docs: #192 (install guide for v0.3.6), #193 (Ed25519 audit), #218
   (ADR-007 proposal), #221 (implementation map), #226 (review of draft
   #131).
