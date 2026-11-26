@@ -446,7 +446,7 @@ fn report_never_replaces_the_report_written_at_close() {
 
     let out = run(&["report", "--dir", dir(&home), "--last"], "");
     assert_eq!(out.status.code(), Some(1), "{out:?}");
-    assert!(String::from_utf8_lossy(&out.stdout).contains("verify FAILED"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("verify FAIL"));
 
     // The report written at close is untouched, with its original line.
     assert_eq!(sha256(&json_path), json_sha);
@@ -573,7 +573,7 @@ fn an_empty_journal_is_said_plainly_in_the_report() {
     assert_eq!(out.status.code(), Some(1), "{out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(stdout.contains("verify FAILED"), "{stdout}");
+    assert!(stdout.contains("verify FAIL"), "{stdout}");
     assert!(
         err.contains(EMPTY_JOURNAL_SUMMARY),
         "stderr should carry the summary: {err}"
@@ -714,7 +714,8 @@ fn report_regenerates_a_session_by_id_and_rejects_unknown_ones() {
     fs::remove_file(&pdf).unwrap();
 
     let out = run(&["report", "--dir", dir(&home), "--session", id], "");
-    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    // No heads given: UNANCHORED, the exit code of `verify`.
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
     // A missing close PDF is not written again: the new pair is beside it.
     assert!(!pdf.exists());
     let regen = regen_reports(&home);
@@ -1319,7 +1320,8 @@ fn an_unreadable_expiry_is_expired_in_the_report_and_the_dashboard() {
     fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
 
     let out = run(&["report", "--dir", dir(&home), "--last"], "");
-    assert!(out.status.success(), "{out:?}");
+    // No heads given: UNANCHORED, the exit code of `verify`.
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
     let regen = document(regen_reports(&home).last().unwrap());
     assert_eq!(
         regen["header"]["summary"]["pending"], 0,
@@ -1448,9 +1450,9 @@ fn regenerating_after_a_mid_session_journal_wipe_still_reports_the_missing_recei
     assert_eq!(
         out.status.code(),
         Some(1),
-        "report must exit 1 on verify failed; stdout={stdout}; stderr={stderr}"
+        "report must exit 1 (FAIL) on verify failed; stdout={stdout}; stderr={stderr}"
     );
-    assert!(stdout.contains("verify FAILED"), "stdout={stdout}");
+    assert!(stdout.contains("verify FAIL"), "stdout={stdout}");
 
     let regen = regen_reports(&home);
     assert_eq!(regen.len(), 1, "{regen:?}");
@@ -1494,9 +1496,9 @@ fn regenerating_after_a_mid_session_wipe_and_a_later_receipt_keeps_the_earlier_m
     assert_eq!(
         out.status.code(),
         Some(1),
-        "report must exit 1 on verify failed; stdout={stdout}; stderr={stderr}"
+        "report must exit 1 (FAIL) on verify failed; stdout={stdout}; stderr={stderr}"
     );
-    assert!(stdout.contains("verify FAILED"), "stdout={stdout}");
+    assert!(stdout.contains("verify FAIL"), "stdout={stdout}");
 
     let regen = regen_reports(&home);
     assert_eq!(regen.len(), 1, "{regen:?}");
@@ -1679,7 +1681,7 @@ fn a_partial_restore_keeps_only_the_id_still_absent() {
         Some(1),
         "stdout={stdout}; stderr={stderr}"
     );
-    assert!(stdout.contains("verify FAILED"), "{stdout}");
+    assert!(stdout.contains("verify FAIL"), "{stdout}");
     let regen = document(regen_reports(&home).last().unwrap());
     assert_eq!(regen["header"]["verify"]["result"], "failed");
     assert_eq!(missing_ids(&regen), vec![gone_id]);

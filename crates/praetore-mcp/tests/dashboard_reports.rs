@@ -103,7 +103,8 @@ fn home_with_reports() -> (tempfile::TempDir, Home) {
     std::thread::sleep(std::time::Duration::from_millis(1100));
     wrap_one_call(dir, "two");
     let out = run(&["report", "--dir", dir, "--last"], "");
-    assert!(out.status.success(), "{out:?}");
+    // No heads given: UNANCHORED, the exit code of `verify`.
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
     (temp, Home::new(root))
 }
 

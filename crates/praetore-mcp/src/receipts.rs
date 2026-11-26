@@ -463,6 +463,51 @@ pub struct ExpectedHeads<'a> {
     pub approvals: Option<&'a str>,
 }
 
+impl<'a> ExpectedHeads<'a> {
+    /// The usage error of `verify` for a malformed head, before any journal
+    /// is read. `report` checks it first so both exit 2 on it.
+    pub fn check(&self) -> Result<(), String> {
+        self.parse().map(|_| ())
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn parse(
+        &self,
+    ) -> Result<
+        (
+            Option<Expected<praetore_core::journal_chain::ChainLink>>,
+            Option<Expected<&'a str>>,
+        ),
+        String,
+    > {
+        let expected_approval_head = self
+            .approvals
+            .map(|text| {
+                if text == NO_JOURNAL {
+                    return Ok(Expected::Nothing);
+                }
+                (text.len() == 64 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+                    .then_some(Expected::Head(text))
+                    .ok_or(
+                        "--expected-approval-head must be 64 lowercase hex characters, or `none`",
+                    )
+            })
+            .transpose()?;
+        let expected_head = self
+            .receipts
+            .map(|text| {
+                if text == NO_JOURNAL {
+                    return Ok(Expected::Nothing);
+                }
+                praetore_core::journal_chain::ChainLink::from_hex(text)
+                    .map(Expected::Head)
+                    .ok_or("--expected-head must be 64 lowercase hex characters, or `none`")
+            })
+            .transpose()?;
+        Ok((expected_head, expected_approval_head))
+    }
+}
+
 /// [`verify_journal_with`] with only the receipts head.
 pub fn verify_journal(home: &Home, expected_head: Option<&str>) -> Result<VerifyReport, String> {
     verify_journal_with(
@@ -483,28 +528,7 @@ pub fn verify_journal_with(
     home: &Home,
     expected: ExpectedHeads<'_>,
 ) -> Result<VerifyReport, String> {
-    let expected_approval_head = expected
-        .approvals
-        .map(|text| {
-            if text == NO_JOURNAL {
-                return Ok(Expected::Nothing);
-            }
-            (text.len() == 64 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
-                .then_some(Expected::Head(text))
-                .ok_or("--expected-approval-head must be 64 lowercase hex characters, or `none`")
-        })
-        .transpose()?;
-    let expected_head = expected
-        .receipts
-        .map(|text| {
-            if text == NO_JOURNAL {
-                return Ok(Expected::Nothing);
-            }
-            praetore_core::journal_chain::ChainLink::from_hex(text)
-                .map(Expected::Head)
-                .ok_or("--expected-head must be 64 lowercase hex characters, or `none`")
-        })
-        .transpose()?;
+    let (expected_head, expected_approval_head) = expected.parse()?;
     let attester = store::read_attester_pin(&home.attester_pin())?;
     let pins = store::read_issuer_pins(&home.issuer_pins())?;
     let mut report = VerifyReport::default();
