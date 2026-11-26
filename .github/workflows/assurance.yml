@@ -891,11 +891,13 @@ jobs:
         run: python3 -I scripts/mcp-smoke.py "$MCP_BINARY"
       # The receipts of an allow and a deny (no approval) written by the
       # packaged binary, checked by praetore-verify built from this commit,
-      # and refused once cut or changed.
+      # and refused once cut or changed. A debug build: it is a checker
+      # here, not a shipped artifact, and the release build command of
+      # praetore-verify stays the single line the test-hooks mutants edit.
       - name: Build praetore-verify for the receipt check
-        run: cargo build --release --locked --package praetore-verify
+        run: cargo build --locked --package praetore-verify
       - name: Receipts of the packaged binary verified by praetore-verify
-        run: python3 -I scripts/mcp-receipt-e2e.py "$MCP_BINARY" target/release/praetore-verify
+        run: python3 -I scripts/mcp-receipt-e2e.py "$MCP_BINARY" target/debug/praetore-verify
 
   release-integrity:
     name: Release checksums
