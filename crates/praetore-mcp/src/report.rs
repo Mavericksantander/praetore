@@ -474,10 +474,17 @@ fn row_of(line: &SessionLine, executed: &BTreeMap<&str, &Value>) -> Row {
         Some("RequireApproval") => Label::WouldAsk,
         _ => Label::Unreadable,
     };
-    let tool = match &evidence["action"]["parameters"]["tool"] {
-        Value::String(tool) => tool.clone(),
-        Value::Null => "(omitted)".into(),
-        other => other.to_string(),
+    let unparsed = crate::unparsed::reader_label(
+        evidence["action"]["action_type"]
+            .as_str()
+            .unwrap_or_default(),
+        &evidence["action"]["parameters"],
+    );
+    let tool = match (unparsed, &evidence["action"]["parameters"]["tool"]) {
+        (Some(label), _) => label,
+        (None, Value::String(tool)) => tool.clone(),
+        (None, Value::Null) => "(omitted)".into(),
+        (None, other) => other.to_string(),
     };
     // A short reason for the table; the full text is in the JSON file.
     let mut reason = match evidence["decision"]["decided_by"]["kind"].as_str() {

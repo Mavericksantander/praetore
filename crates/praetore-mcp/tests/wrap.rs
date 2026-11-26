@@ -348,6 +348,16 @@ fn enforce_refuses_unparseable_lines_but_relays_other_traffic() {
             .starts_with("praetore-mcp")
     }));
     assert!(!stderr.contains("EXECUTED"), "{stderr}");
+    // Each refused unparseable line has its receipt (T-016-B4).
+    let receipts = journal(&home);
+    assert_eq!(receipts.len(), 2, "{stderr}");
+    assert!(
+        receipts
+            .iter()
+            .all(|e| e.action.action_type == "mcp.unparsed_line"
+                && e.action.parameters["mode"] == "enforce"),
+        "{receipts:?}"
+    );
 }
 
 fn assert_refused_without_receipts(home: &Home, mode: &str) {
@@ -1359,8 +1369,19 @@ fn observe_warns_on_unparseable_lines_and_refuses_unparseable_safety_calls() {
         })
         .count();
     assert_eq!(refusals, 2, "{responses:?}");
-    // No reading was evaluated, so no receipt.
-    assert!(journal(&home).is_empty());
+    // No reading was evaluated. Each of the three forwarded lines has its
+    // mcp.unparsed_line receipt (T-016-B4); the two safety lines have none.
+    let receipts = journal(&home);
+    assert_eq!(receipts.len(), 3, "{stderr}");
+    assert!(
+        receipts
+            .iter()
+            .all(|e| e.action.action_type == "mcp.unparsed_line"
+                && e.decision.outcome == praetore_core::DecisionOutcome::Deny),
+        "{receipts:?}"
+    );
+    let report = receipts::verify_journal(&home, None).unwrap();
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
 }
 
 /// Three observe calls: a journal of three chained entries in one file.
