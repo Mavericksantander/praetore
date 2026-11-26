@@ -1708,19 +1708,7 @@ impl ApprovalLock {
         let file = options
             .open(&path)
             .map_err(|e| format!("cannot open {}: {e}", path.shown()))?;
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        {
-            use std::os::fd::AsRawFd;
-            // SAFETY: flock on a descriptor this function owns.
-            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-            if rc != 0 {
-                return Err(format!(
-                    "cannot lock {}: {}",
-                    path.shown(),
-                    std::io::Error::last_os_error()
-                ));
-            }
-        }
+        crate::journal::lock_exclusive(&file, &path, crate::journal::LOCK_TIMEOUT)?;
         Ok(Self { _file: file })
     }
 }
