@@ -386,22 +386,18 @@ fn decide(
                 "PRÆTORE refused this tool call because the policy does not classify it: {error}"
             ))
         }
-        Err(error) => match mode {
-            Mode::Enforce => {
-                warnings.push(format!(
-                    "praetore-mcp: ERROR evaluating {server_shown}/{tool}: {error}; call REFUSED (enforce, fail closed)"
-                ));
-                CallDecision::Block(format!(
-                    "PRÆTORE could not evaluate this tool call, so it was refused (fail closed): {error}"
-                ))
-            }
-            Mode::Observe => {
-                warnings.push(format!(
-                    "praetore-mcp: WARNING evaluating {server_shown}/{tool} failed: {error}; call forwarded WITHOUT a receipt (observe mode)"
-                ));
-                CallDecision::Forward
-            }
-        },
+        // A call that could not be evaluated has no decision and no receipt.
+        // It is refused in both modes: observe records decisions, and a call
+        // forwarded without one would run with nothing to record.
+        Err(error) => {
+            warnings.push(format!(
+                "praetore-mcp: ERROR evaluating {server_shown}/{tool}: {error}; call REFUSED ({}, fail closed: no receipt could be recorded)",
+                mode.as_str()
+            ));
+            CallDecision::Block(format!(
+                "PRÆTORE could not evaluate this tool call, so no receipt could be recorded and it was refused (fail closed): {error}"
+            ))
+        }
         Ok(verdict) => decide_verdict(mode, &server_shown, &tool, &verdict, warnings),
     }
 }
@@ -431,21 +427,20 @@ fn decide_verdict(
                 verdict.evidence_id
             ));
         }
-        match mode {
-            Mode::Enforce => {
-                warnings.push(format!(
-                    "praetore-mcp: ERROR receipt for {server}/{tool} could not be written: {error}; call REFUSED (enforce)"
-                ));
-                return CallDecision::Block(format!(
-                    "PRÆTORE could not record a receipt for this tool call, so it was refused (fail closed). Evidence id: {}",
-                    verdict.evidence_id
-                ));
-            }
-            Mode::Observe => warnings.push(format!(
-                "praetore-mcp: WARNING !!! receipt for {server}/{tool} (evidence {}) could NOT be written: {error}; call forwarded anyway (observe mode) !!!",
-                verdict.evidence_id
-            )),
-        }
+        // The journal could not take the receipt (a cut or blank last line,
+        // a symlink, a read-only file, a held lock, a full disk). The call
+        // is refused in both modes: a call forwarded without its receipt
+        // leaves nothing for `verify` to check, and an observe journal that
+        // still verifies would then say nothing about it.
+        warnings.push(format!(
+            "praetore-mcp: ERROR receipt for {server}/{tool} (evidence {}) could not be written: {error}; call REFUSED ({}, fail closed: no receipt could be recorded)",
+            verdict.evidence_id,
+            mode.as_str()
+        ));
+        return CallDecision::Block(format!(
+            "PRÆTORE could not record a receipt for this tool call, so it was refused (fail closed). Evidence id: {}",
+            verdict.evidence_id
+        ));
     }
     let rules = if verdict.rule_ids.is_empty() {
         "none (default deny)".to_owned()
@@ -1348,15 +1343,31 @@ mod tests {
         assert_eq!(out.to_server.as_deref(), Some(CALL));
     }
 
+    /// A call the gate could not evaluate has no receipt: it is refused in
+    /// both modes, with a reply the client can read and a stderr line that
+    /// names the mode.
     #[test]
-    fn evaluation_errors_fail_closed_only_in_enforce() {
-        let mut eval = Fixed::new(Err("KEY_LOAD".into()));
-        let out = handle_client_line(CALL, Mode::Enforce, "fs", &mut eval);
-        assert!(out.to_server.is_none());
-        assert!(out.to_client.is_some());
-        let out = handle_client_line(CALL, Mode::Observe, "fs", &mut eval);
-        assert_eq!(out.to_server.as_deref(), Some(CALL));
-        assert!(out.warnings[0].contains("WITHOUT a receipt"));
+    fn evaluation_errors_fail_closed_in_both_modes() {
+        for mode in [Mode::Enforce, Mode::Observe] {
+            let mut eval = Fixed::new(Err("KEY_LOAD".into()));
+            let out = handle_client_line(CALL, mode, "fs", &mut eval);
+            assert!(out.to_server.is_none(), "{mode:?}");
+            let reply: Value = serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
+            assert_eq!(reply["result"]["isError"], true, "{mode:?}");
+            assert!(
+                reply["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no receipt could be recorded"),
+                "{reply}"
+            );
+            let warning = &out.warnings[0];
+            assert!(
+                warning.contains("REFUSED") && warning.contains(mode.as_str()),
+                "{warning}"
+            );
+            assert!(!warning.contains("forwarded"), "{warning}");
+        }
     }
 
     /// A receipt that would not verify when read back: the call is not
@@ -1385,16 +1396,32 @@ mod tests {
         }
     }
 
+    /// A receipt the journal could not take (`Unavailable`): the call is
+    /// refused in both modes and the reply carries the evidence id, so the
+    /// client can quote what was decided but not recorded.
     #[test]
-    fn journal_failure_refuses_in_enforce_and_warns_in_observe() {
-        let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
-        eval.journal_error = Some(JournalError::Unavailable("disk full".into()));
-        let out = handle_client_line(CALL, Mode::Enforce, "fs", &mut eval);
-        assert!(out.to_server.is_none());
-        assert!(out.to_client.is_some());
-        let out = handle_client_line(CALL, Mode::Observe, "fs", &mut eval);
-        assert_eq!(out.to_server.as_deref(), Some(CALL));
-        assert!(out.warnings[0].contains("could NOT be written"));
+    fn journal_failure_refuses_the_call_in_both_modes() {
+        for mode in [Mode::Enforce, Mode::Observe] {
+            let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
+            eval.journal_error = Some(JournalError::Unavailable("disk full".into()));
+            let out = handle_client_line(CALL, mode, "fs", &mut eval);
+            assert!(out.to_server.is_none(), "{mode:?}");
+            let reply: Value = serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
+            assert_eq!(reply["result"]["isError"], true, "{mode:?}");
+            let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.contains("could not record a receipt") && text.contains("Evidence id: "),
+                "{text}"
+            );
+            let warning = &out.warnings[0];
+            assert!(
+                warning.contains("could not be written")
+                    && warning.contains("REFUSED")
+                    && warning.contains(mode.as_str()),
+                "{warning}"
+            );
+            assert!(!warning.contains("forwarded"), "{warning}");
+        }
     }
 
     /// Unparseable client lines: observe forwards an unparseable line, but never silently:

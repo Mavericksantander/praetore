@@ -301,7 +301,7 @@ fn observe_never_runs_a_call_without_a_receipt_because_of_a_number() {
         session.stderr
     );
     assert!(
-        !session.stderr.contains("could NOT be written"),
+        !session.stderr.contains("could not be written"),
         "{}",
         session.stderr
     );
@@ -371,7 +371,7 @@ proptest! {
         );
         prop_assert!(session.executed >= 1, "{} {:?}: the last call did not run\n{}", mode, literals, session.stderr);
         prop_assert!(
-            !session.stderr.contains("is unreadable") && !session.stderr.contains("could NOT be written"),
+            !session.stderr.contains("is unreadable") && !session.stderr.contains("could not be written"),
             "{} {:?}\n{}",
             mode,
             literals,

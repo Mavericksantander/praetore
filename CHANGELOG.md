@@ -4,11 +4,26 @@
 
 ### Fixed
 
+- **praetore-mcp: observe refuses a call it cannot record, like enforce.**
+  When the receipts journal could not take the receipt (a blank or cut last
+  line, a whitespace-only later daily file, `receipts/` or the daily file
+  replaced by a symlink, a read-only daily file, `.journal.lock` held by
+  another process for more than 10 s, a full disk), observe forwarded the
+  `tools/call` with a stderr warning and no receipt. The journal still read
+  back intact, so `verify --expected-head` with the head kept earlier said
+  OK and nothing showed that calls had run. The same happened when a call
+  could not be evaluated after startup (clock, replay guard). Both cases now
+  refuse the call in observe as in enforce: the client gets an MCP tool
+  error saying that no receipt could be recorded (with the evidence id when
+  there is one) and stderr says `REFUSED (observe, ...)`. Trade-off: a home
+  that cannot record stops calls in observe too, so a full disk or a held
+  lock is now visible to the client instead of only on stderr. Unparseable
+  and ambiguous client lines in observe are unchanged.
 - **praetore-mcp: the journal and approval locks wait at most 10 s.** A
   process that kept `receipts/.journal.lock` or `approvals/.lock` left
   every call waiting with no reply. After 10 s the wait ends with an error
-  naming the lock: the receipt is not written, so enforce refuses the call
-  and observe warns.
+  naming the lock: the receipt is not written, so the call is refused
+  (in both modes, see the entry above).
 - **praetore-mcp: the `-32700` for a refused line carries its `id`** when
   the line has one complete top-level `id`. Otherwise the `id` is `null`,
   as before.
