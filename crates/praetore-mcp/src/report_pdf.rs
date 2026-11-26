@@ -9,6 +9,7 @@
 //! All coordinates below are in points from the top-left corner of an A4
 //! page; [`Canvas`] converts them to PDF space.
 
+use crate::receipts::Assurance;
 use crate::report::{
     ApprovalRow, ApprovalStatus, EMPTY_JOURNAL_SUMMARY_JOURNAL, EMPTY_JOURNAL_SUMMARY_RECEIPTS,
     Label, Report, Row, STATEMENT,
@@ -348,7 +349,7 @@ fn label_color(label: Label) -> Rgb {
 /// The integrity ring: one segment per session receipt, red where `verify`
 /// did not count the receipt as verified.
 fn ring(canvas: &mut Canvas, report: &Report, cx: f32, cy: f32) {
-    let passed = report.verify.passed;
+    let passed = report.verify.passed();
     let tone = if passed { ACCENT } else { RED };
     let mut tick = 0.0;
     while tick < 360.0 {
@@ -423,7 +424,7 @@ fn block(canvas: &mut Canvas, y: f32, label: &str, value: &str) {
 
 fn cover(report: &Report) -> Canvas {
     let mut c = Canvas::new();
-    let failed = !report.verify.passed;
+    let failed = !report.verify.passed();
 
     c.rect(INK, 0.0, 0.0, PAGE_W, 96.0);
     c.logo(true, LEFT - 14.0, 20.0, 56.0);
@@ -706,16 +707,22 @@ fn cover(report: &Report) -> Canvas {
     let (checked, checked_utc) = local_and_utc(report.verify.checked_at);
     c.label(tone, LEFT, y, "VERIFY");
     y += 13.0;
-    let verdict = if report.verify.passed {
-        format!(
-            "Verify passed: {} of {} receipts in the journal verified; approval journal: {} decision(s), {} execution(s).",
-            report.verify.journal_verified,
-            report.verify.journal_receipts,
-            report.verify.approval_decisions,
-            report.verify.approval_executions
-        )
-    } else {
-        "Verify failed: see the problems listed above and in the JSON file.".to_owned()
+    let counts = format!(
+        "{} of {} receipts in the journal verified; approval journal: {} decision(s), {} execution(s).",
+        report.verify.journal_verified,
+        report.verify.journal_receipts,
+        report.verify.approval_decisions,
+        report.verify.approval_executions
+    );
+    let verdict = match &report.verify.assurance {
+        Assurance::Anchored => format!("Verify OK against the heads given: {counts}"),
+        Assurance::Unanchored { missing } => format!(
+            "Verify UNANCHORED (not a pass): no check failed, but {} not given. {counts}",
+            missing.join(" and ")
+        ),
+        Assurance::Failed => {
+            "Verify failed: see the problems listed above and in the JSON file.".to_owned()
+        }
     };
     c.text(
         if failed { Font::SansBold } else { Font::Sans },
@@ -1233,7 +1240,11 @@ mod tests {
             seq: None,
             close_heads: Heads::default(),
             verify: VerifyOutcome {
-                passed,
+                assurance: if passed {
+                    Assurance::Anchored
+                } else {
+                    Assurance::Failed
+                },
                 checked_at: at,
                 journal_receipts: rows,
                 journal_verified: if passed { rows } else { 0 },
@@ -1265,6 +1276,23 @@ mod tests {
             assert_eq!(count(&pdf, format!("(tool_{index})").as_bytes()), 1);
         }
         assert_eq!(count(&pdf, b"VERIFY FAILED"), 0);
+    }
+
+    /// A report whose checks all passed without both heads says
+    /// UNANCHORED, not passed; with both heads it says OK.
+    #[test]
+    fn the_pdf_verdict_names_the_level_of_verify() {
+        let mut report = sample(2, true);
+        report.verify.assurance = Assurance::Unanchored {
+            missing: vec!["--expected-head"],
+        };
+        let pdf = render(&report);
+        assert_eq!(count(&pdf, b"(Verify UNANCHORED"), 1);
+        assert_eq!(count(&pdf, b"Verify OK"), 0);
+        report.verify.assurance = Assurance::Anchored;
+        let pdf = render(&report);
+        assert_eq!(count(&pdf, b"(Verify OK"), 1);
+        assert_eq!(count(&pdf, b"UNANCHORED"), 0);
     }
 
     #[test]

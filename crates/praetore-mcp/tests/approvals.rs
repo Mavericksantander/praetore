@@ -1324,7 +1324,8 @@ fn approvals_prints_no_commands_for_an_id_already_decided() {
                 ],
                 "",
             );
-            assert!(out.status.success(), "{word}: {out:?}");
+            // No heads given: UNANCHORED, the exit code of `verify`.
+            assert_eq!(out.status.code(), Some(3), "{word}: {out:?}");
         }
         let decided_key = if word == "reject" {
             "rejected"

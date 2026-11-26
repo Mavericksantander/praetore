@@ -103,7 +103,8 @@ fn home_with_reports() -> (tempfile::TempDir, Home) {
     std::thread::sleep(std::time::Duration::from_millis(1100));
     wrap_one_call(dir, "two");
     let out = run(&["report", "--dir", dir, "--last"], "");
-    assert!(out.status.success(), "{out:?}");
+    // No heads given: UNANCHORED, the exit code of `verify`.
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
     (temp, Home::new(root))
 }
 
@@ -427,11 +428,14 @@ fn the_state_lists_close_reports_with_regenerations_grouped_apart() {
         assert_eq!(header["server"], "fake");
         assert_eq!(header["mode"], "enforce");
         assert_eq!(header["verify"]["result"], "passed");
+        // The level the Sessions chip shows: no heads at close.
+        assert_eq!(header["verify"]["assurance"], "UNANCHORED");
         assert_eq!(header["summary"]["allow"], 1);
         assert!(header["agent"].is_string() && header["started_at"].is_string());
         assert!(header["ended_at"].is_string());
     }
     assert_eq!(regens[0]["header"]["verify"]["result"], "passed");
+    assert_eq!(regens[0]["header"]["verify"]["assurance"], "UNANCHORED");
     // A second request reads only what changed; the answer is the same.
     let again = dashboard::respond_with(raw, &home, Default::default(), 8787, &mut cache);
     let again: Value = serde_json::from_slice(&again.body).unwrap();

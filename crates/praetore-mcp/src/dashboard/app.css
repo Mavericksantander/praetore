@@ -86,6 +86,9 @@ h1, h2, h3 { font-weight: 400; }
 .chip.ok { color: var(--ink-2); }
 .chip.ok::before { background: var(--ok); border-color: var(--ok); }
 .chip.bad { color: var(--accent); }
+/* UNANCHORED: nothing failed, but no heads were given; not a pass. */
+.chip.warn { color: var(--ink-2); }
+.chip.warn::before { border-color: var(--ask); }
 .chip.bad::before { background: var(--accent); border-color: var(--accent); }
 a.chip { text-decoration: none; }
 .why p { margin: 0 0 6px; }

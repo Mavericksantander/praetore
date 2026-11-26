@@ -22,7 +22,7 @@
 use crate::shown::Show;
 use crate::{
     approvals,
-    receipts::{self, VerifyReport},
+    receipts::{self, Assurance, ExpectedHeads, VerifyReport},
     store::{self, Home},
 };
 use serde_json::{Value, json};
@@ -170,9 +170,10 @@ impl Heads {
         if let Some((_, head)) = &self.receipt {
             lines.push(format!("  --expected-head {head}"));
         }
-        if let Some(head) = &self.approval {
-            lines.push(format!("  --expected-approval-head {head}"));
-        }
+        // No approval journal is a state too: `none` says so, and without
+        // it `verify` stays UNANCHORED (exit 3) on this command.
+        let approval = self.approval.as_deref().unwrap_or(receipts::NO_JOURNAL);
+        lines.push(format!("  --expected-approval-head {approval}"));
         lines
     }
 
@@ -297,7 +298,11 @@ pub struct Summary {
 
 #[derive(Debug, Clone)]
 pub struct VerifyOutcome {
-    pub passed: bool,
+    /// The level of `verify` for this report, with its exit code: OK only
+    /// against both heads given to `report`, UNANCHORED when no check
+    /// failed but a head was not given, FAIL otherwise (also when a session
+    /// receipt is missing or did not verify).
+    pub assurance: Assurance,
     pub checked_at: OffsetDateTime,
     pub journal_receipts: usize,
     pub journal_verified: usize,
@@ -314,6 +319,12 @@ pub struct VerifyOutcome {
 }
 
 impl VerifyOutcome {
+    /// No check failed (OK or UNANCHORED). Not a pass by itself: see
+    /// [`VerifyOutcome::assurance`].
+    pub fn passed(&self) -> bool {
+        self.assurance != Assurance::Failed
+    }
+
     /// The live journal has no receipts and every evidence id the session
     /// recorded is absent. `failures_total == 0` keeps this distinct from
     /// "verify could not run", which also sets `journal_receipts` to 0.
@@ -327,7 +338,7 @@ impl VerifyOutcome {
     /// Cover headline, JSON `verify.summary` and the CLI summary when
     /// verify failed. `None` when it passed.
     pub fn failure_summary(&self) -> Option<String> {
-        if self.passed {
+        if self.passed() {
             return None;
         }
         Some(if self.empty_journal_with_all_session_receipts_gone() {
@@ -373,7 +384,8 @@ pub struct Report {
 pub struct Generated {
     pub json: PathBuf,
     pub pdf: PathBuf,
-    pub verify_passed: bool,
+    /// Exit code of `report`: [`Assurance::exit_code`], as `verify`.
+    pub assurance: Assurance,
     /// When verify failed, the same wording as the PDF headline and
     /// `header.verify.summary`.
     pub verify_summary: Option<String>,
@@ -636,7 +648,9 @@ fn header_json(report: &Report) -> Value {
         "approval_journal_head": close_approval,
         "verify_command": report.close_heads.verify_command(),
         "verify": {
-            "result": if report.verify.passed { "passed" } else { "failed" },
+            "result": if report.verify.passed() { "passed" } else { "failed" },
+            "assurance": report.verify.assurance.label(),
+            "exit_code": report.verify.assurance.exit_code(),
             "checked_at": rfc3339(report.verify.checked_at),
             "journal_receipts": report.verify.journal_receipts,
             "journal_verified": report.verify.journal_verified,
@@ -761,13 +775,23 @@ fn ensure_reports_dir(dir: &Path) -> Result<(), String> {
 
 /// Builds and writes both files of one session.
 pub fn generate(home: &Home, source: Source) -> Result<Generated, String> {
+    generate_with(home, source, ExpectedHeads::default())
+}
+
+/// [`generate`], verifying the journals against `expected` (the heads
+/// given to `report`); without them the report is at best UNANCHORED.
+pub fn generate_with(
+    home: &Home,
+    source: Source,
+    expected: ExpectedHeads<'_>,
+) -> Result<Generated, String> {
     let now = OffsetDateTime::now_utc();
     let ids: BTreeSet<&str> = source.evidence_ids.iter().map(String::as_str).collect();
 
     // `verify` reads the whole journal; its lines are the ones copied. If it
     // cannot run at all, the journal is read directly and the report says
     // that verify failed.
-    let verified = receipts::verify_journal(home, None);
+    let verified = receipts::verify_journal_with(home, expected);
     let mut journal_lines: Vec<(String, bool)> = match &verified {
         Ok(report) => report
             .lines
@@ -840,9 +864,11 @@ pub fn generate(home: &Home, source: Source) -> Result<Generated, String> {
     let session_verified = rows.iter().filter(|row| row.verified).count();
     let verify = match &verified {
         Ok(report) => VerifyOutcome {
-            passed: report.failures.is_empty()
-                && missing.is_empty()
-                && session_verified == rows.len(),
+            assurance: if missing.is_empty() && session_verified == rows.len() {
+                report.assurance()
+            } else {
+                Assurance::Failed
+            },
             checked_at: now,
             journal_receipts: report.total,
             journal_verified: report.ok,
@@ -861,7 +887,7 @@ pub fn generate(home: &Home, source: Source) -> Result<Generated, String> {
             approval_executions: report.approval_executions,
         },
         Err(error) => VerifyOutcome {
-            passed: false,
+            assurance: Assurance::Failed,
             checked_at: now,
             journal_receipts: 0,
             journal_verified: 0,
@@ -927,7 +953,7 @@ pub fn generate(home: &Home, source: Source) -> Result<Generated, String> {
     Ok(Generated {
         json,
         pdf,
-        verify_passed: report.verify.passed,
+        assurance: report.verify.assurance.clone(),
         verify_summary: report.verify.failure_summary(),
     })
 }
@@ -1056,7 +1082,11 @@ fn last_closed(files: &[PathBuf]) -> Option<&PathBuf> {
 /// `Last` is the session that closed last. The heads recorded at close are
 /// kept; `verify` runs again. The new pair is written next to the close
 /// report, which is never replaced.
-pub fn regenerate(home: &Home, selector: &Selector) -> Result<Generated, String> {
+pub fn regenerate(
+    home: &Home,
+    selector: &Selector,
+    expected: ExpectedHeads<'_>,
+) -> Result<Generated, String> {
     let files = session_files(home)?;
     let path = match selector {
         Selector::Last => last_closed(&files),
@@ -1123,7 +1153,7 @@ pub fn regenerate(home: &Home, selector: &Selector) -> Result<Generated, String>
             .map(|(seq, head)| (seq, head.to_owned())),
         approval: header["approval_journal_head"].as_str().map(str::to_owned),
     };
-    generate(
+    generate_with(
         home,
         Source {
             meta,
@@ -1132,7 +1162,38 @@ pub fn regenerate(home: &Home, selector: &Selector) -> Result<Generated, String>
             agent: header["agent"].as_str().map(str::to_owned),
             regenerated_from: path.file_name().and_then(|n| n.to_str()).map(str::to_owned),
         },
+        expected,
     )
+}
+
+/// `praetore-mcp report` once its options are read: writes the new pair,
+/// prints both paths and the level of `verify`, and returns the exit code
+/// of `verify` for it ([`Assurance::exit_code`]). `Err` is a usage error or
+/// a report that could not be written (exit 2).
+pub fn command(
+    home: &Home,
+    selector: &Selector,
+    expected: ExpectedHeads<'_>,
+) -> Result<i32, String> {
+    // A malformed head is a usage error, as for `verify`, not a report that
+    // says FAIL.
+    expected.check()?;
+    let generated = regenerate(home, selector, expected)?;
+    println!("{}", generated.json.shown());
+    println!("{}", generated.pdf.shown());
+    let detail = match &generated.assurance {
+        Assurance::Anchored => String::new(),
+        Assurance::Unanchored { missing } => format!(
+            ": no check failed, but {} not given; not a pass",
+            missing.join(" and ")
+        ),
+        Assurance::Failed => ": the report says so on its first page".to_owned(),
+    };
+    println!("verify {}{detail}", generated.assurance.label());
+    if let Some(summary) = &generated.verify_summary {
+        eprintln!("praetore-mcp: {summary}");
+    }
+    Ok(generated.assurance.exit_code())
 }
 
 #[cfg(test)]
@@ -1170,7 +1231,11 @@ mod tests {
         missing: &[&str],
     ) -> VerifyOutcome {
         VerifyOutcome {
-            passed,
+            assurance: if passed {
+                Assurance::Anchored
+            } else {
+                Assurance::Failed
+            },
             checked_at: OffsetDateTime::from_unix_timestamp(1_794_000_000).unwrap(),
             journal_receipts,
             journal_verified,
