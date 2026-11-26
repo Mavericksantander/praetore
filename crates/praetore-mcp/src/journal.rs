@@ -24,6 +24,7 @@ use std::{
     fs,
     io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 
@@ -286,6 +287,11 @@ pub struct JournalLock {
 
 impl JournalLock {
     pub fn acquire(dir: &Path) -> Result<Self, String> {
+        Self::acquire_within(dir, LOCK_TIMEOUT)
+    }
+
+    /// [`JournalLock::acquire`] with its own bound on the wait.
+    fn acquire_within(dir: &Path, timeout: Duration) -> Result<Self, String> {
         let path = dir.join(LOCK_FILE);
         let mut options = fs::OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
@@ -297,22 +303,52 @@ impl JournalLock {
         let file = options
             .open(&path)
             .map_err(|e| format!("cannot open lock {}: {e}", path.shown()))?;
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        {
-            use std::os::fd::AsRawFd;
-            // SAFETY: `flock` on a descriptor this function owns; no memory
-            // is passed to the kernel.
-            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-            if rc != 0 {
-                return Err(format!(
-                    "cannot lock {}: {}",
-                    path.shown(),
-                    io::Error::last_os_error()
-                ));
-            }
-        }
+        lock_exclusive(&file, &path, timeout)?;
         Ok(Self { _file: file })
     }
+}
+
+/// Longest wait for the journal or approval lock. A holder that never lets
+/// go (a stopped process that still has the descriptor) ends the wait with
+/// an error, and the caller refuses what needed the lock.
+pub const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Pause between two non-blocking `flock` attempts: `flock` has no wait
+/// with a deadline.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const LOCK_RETRY: Duration = Duration::from_millis(10);
+
+/// Takes an exclusive `flock` on `file`, waiting at most `timeout`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn lock_exclusive(file: &fs::File, path: &Path, timeout: Duration) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    let deadline = Instant::now() + timeout;
+    loop {
+        // SAFETY: `flock` on a descriptor the caller owns; no memory is
+        // passed to the kernel.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::WouldBlock {
+            return Err(format!("cannot lock {}: {error}", path.shown()));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "cannot lock {}: still held by another process after {} s",
+                path.shown(),
+                timeout.as_secs_f64()
+            ));
+        }
+        std::thread::sleep(LOCK_RETRY);
+    }
+}
+
+/// Other targets have no `flock` here; the lock file is still opened.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn lock_exclusive(_file: &fs::File, _path: &Path, _timeout: Duration) -> Result<(), String> {
+    Ok(())
 }
 
 /// `O_NOFOLLOW` where `libc` is available: opening a symlink fails.
@@ -543,5 +579,42 @@ impl Chain {
             });
         }
         chain
+    }
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod lock_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// Runs `acquire_within` on another thread. A wait that does not end
+    /// within `bound` is a failure of the test, not a hang.
+    fn acquire_on_thread(dir: &Path, timeout: Duration, bound: Duration) -> Result<(), String> {
+        let (send, receive) = mpsc::channel();
+        let dir = dir.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = send.send(JournalLock::acquire_within(&dir, timeout).map(drop));
+        });
+        receive
+            .recv_timeout(bound)
+            .unwrap_or_else(|_| panic!("the lock wait did not end within {bound:?}"))
+    }
+
+    /// T-016-B6: a lock held by another open file description ends the
+    /// wait with an error naming the lock; once released, it is taken.
+    #[test]
+    fn a_held_journal_lock_ends_the_wait_with_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let holder = JournalLock::acquire(temp.path()).unwrap();
+        let error = acquire_on_thread(
+            temp.path(),
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(error.contains("still held by another process"), "{error}");
+        assert!(error.contains(LOCK_FILE), "{error}");
+        drop(holder);
+        acquire_on_thread(temp.path(), Duration::from_secs(1), Duration::from_secs(5)).unwrap();
     }
 }
