@@ -1,24 +1,31 @@
 #!/usr/bin/env bash
 # Assemble checksummed release assets from the CI-built archives.
 #
-# Usage: scripts/release-checksums.sh <version> <mcp-assets-dir> <praetore-verify-binary> <out-dir>
+# Usage: scripts/release-checksums.sh <version> <assets-dir> <praetore-verify-binary> <out-dir>
 #
-# <mcp-assets-dir> holds praetore-mcp-<version>-<target>.tar.gz and the
-# .sha256 written by the runner that built it. For each expected target the
-# script checks that the archive and its .sha256 exist, that the .sha256
-# matches, and that the archive holds exactly <name>/praetore-mcp, LICENSE
-# and NOTICE. It then copies the archives and praetore-verify (built on the
-# Linux x86_64 runner) into <out-dir>, writes SHA256SUMS there and checks it.
+# <assets-dir> holds <binary>-<version>-<target>.tar.gz and the .sha256
+# written by the runner that built it, for each expected archive:
+# praetore-mcp for every target in mcp_targets, praetore-verify for every
+# target in verify_targets. For each one the script checks that the archive
+# and its .sha256 exist, that the .sha256 matches, and that the archive
+# holds exactly <name>/<binary>, LICENSE and NOTICE. It then copies the
+# archives and the bare praetore-verify (built on the Linux x86_64 runner)
+# into <out-dir>, writes SHA256SUMS there and checks it.
 # Any missing, extra or mismatching file fails the run; <out-dir> must not
 # exist yet.
 set -euo pipefail
 
 if [[ $# -ne 4 ]]; then
-  echo "usage: $0 <version> <mcp-assets-dir> <praetore-verify-binary> <out-dir>" >&2
+  echo "usage: $0 <version> <assets-dir> <praetore-verify-binary> <out-dir>" >&2
   exit 2
 fi
 version=$1 assets=$2 verify_bin=$3 out=$4
-targets=(x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin)
+mcp_targets=(x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin)
+# Linux x86_64 ships as the bare praetore-verify below.
+verify_targets=(aarch64-apple-darwin)
+archives=()
+for target in "${mcp_targets[@]}"; do archives+=("praetore-mcp $target"); done
+for target in "${verify_targets[@]}"; do archives+=("praetore-verify $target"); done
 
 if command -v sha256sum >/dev/null; then sha=(sha256sum); else sha=(shasum -a 256); fi
 
@@ -29,15 +36,16 @@ fi
 mkdir -p "$out"
 
 expected=()
-for target in "${targets[@]}"; do
-  name="praetore-mcp-${version}-${target}"
+for entry in "${archives[@]}"; do
+  read -r binary target <<<"$entry"
+  name="${binary}-${version}-${target}"
   archive="${name}.tar.gz"
   for file in "$archive" "${archive}.sha256"; do
     [[ -f "$assets/$file" ]] || { echo "error: missing $assets/$file" >&2; exit 1; }
   done
   (cd "$assets" && "${sha[@]}" -c "${archive}.sha256")
   listing=$(tar -tzf "$assets/$archive" | sed 's#/$##' | LC_ALL=C sort)
-  want=$(printf '%s\n' "$name" "$name/LICENSE" "$name/NOTICE" "$name/praetore-mcp" | LC_ALL=C sort)
+  want=$(printf '%s\n' "$name" "$name/LICENSE" "$name/NOTICE" "$name/$binary" | LC_ALL=C sort)
   if [[ "$listing" != "$want" ]]; then
     echo "error: unexpected contents in $archive:" >&2
     echo "$listing" >&2

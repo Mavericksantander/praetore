@@ -537,7 +537,12 @@ fn enforce_refuses_line_split_and_case_fold_differentials() {
         .filter(|r| r["error"]["code"] == -32700)
         .collect();
     assert_eq!(refused.len(), 2, "{responses:?}");
-    assert!(responses.iter().all(|r| r["id"] != 8), "{responses:?}");
+    // The case-fold line is never answered by the server: the only reply
+    // with its id is the -32700 that refuses it (T-016-B6, id recovered).
+    let eight: Vec<_> = responses.iter().filter(|r| r["id"] == 8).collect();
+    assert_eq!(eight.len(), 1, "{responses:?}");
+    assert_eq!(eight[0]["error"]["code"], -32700, "{responses:?}");
+    assert!(eight[0].get("result").is_none(), "{responses:?}");
     // The CRLF-terminated line is still relayed normally.
     assert_eq!(
         by_id(&responses, &json!(9))["result"]["tools"][0]["name"],

@@ -895,10 +895,84 @@ jobs:
       # and refused once cut or changed. A debug build: it is a checker
       # here, not a shipped artifact, and the release build command of
       # praetore-verify stays the single line the test-hooks mutants edit.
+      # A negative check passes only on exit 1 (refused), not on a crash.
+      - name: Self-test of the receipt check's negative checks
+        run: python3 -I scripts/test-mcp-receipt-e2e.py
       - name: Build praetore-verify for the receipt check
         run: cargo build --locked --package praetore-verify
       - name: Receipts of the packaged binary verified by praetore-verify
         run: python3 -I scripts/mcp-receipt-e2e.py "$MCP_BINARY" target/debug/praetore-verify
+
+  verify-binaries:
+    name: praetore-verify ${{ matrix.target }} build, package and smoke
+    # praetore-verify for the platforms the release does not cover with the
+    # Linux x86_64 binary that release-integrity builds. A client on Apple
+    # silicon checks receipts with this archive.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: ${{ matrix.target }}
+      # --target before --package: scripts/test-check-test-hooks-feature.sh
+      # edits the release build line of release-integrity by its exact text,
+      # which must stay unique. check-test-hooks-feature.sh still reads this
+      # line like every other --release build.
+      - run: cargo build --release --locked --target ${{ matrix.target }} --package praetore-verify
+      - name: Package binary with its checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_REF}" != refs/tags/v* ]]; then version="${GITHUB_SHA::12}"; fi
+          name="praetore-verify-${version}-${{ matrix.target }}"
+          mkdir -p "verify-assets/${name}"
+          cp target/${{ matrix.target }}/release/praetore-verify "verify-assets/${name}/"
+          cp LICENSE NOTICE "verify-assets/${name}/"
+          # No AppleDouble ._ entries from macOS extended attributes.
+          COPYFILE_DISABLE=1 tar -C verify-assets -czf "verify-assets/${name}.tar.gz" "${name}"
+          rm -rf "verify-assets/${name}"
+          cd verify-assets
+          shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          cat "${name}.tar.gz.sha256"
+          echo "VERIFY_ARCHIVE=${name}" >> "$GITHUB_ENV"
+      # The packaged binary, not the build tree: checksum, unpack, check the
+      # architecture, then verify the committed fixture and refuse a changed
+      # copy of it.
+      - name: Smoke test of the packaged binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd verify-assets && shasum -a 256 -c "${VERIFY_ARCHIVE}.tar.gz.sha256")
+          work="$RUNNER_TEMP/verify-smoke"
+          mkdir -p "$work"
+          tar -C "$work" -xzf "verify-assets/${VERIFY_ARCHIVE}.tar.gz"
+          bin="$work/${VERIFY_ARCHIVE}/praetore-verify"
+          file "$bin"
+          [[ "$(lipo -archs "$bin")" == "arm64" ]] || { echo "::error::$bin is not arm64 only"; exit 1; }
+          pins=(--attester-pin examples/verify/attester-public-key.hex --issuer-pins examples/verify/issuer-pins.jsonl --require-intent)
+          "$bin" evidence --evidence examples/verify/evidence.json "${pins[@]}" --format json
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["request_id"]+="-changed"; json.dump(d, open(sys.argv[2], "w"))' \
+            examples/verify/evidence.json "$work/changed.json"
+          if "$bin" evidence --evidence "$work/changed.json" "${pins[@]}" --format json; then
+            echo "::error::a changed receipt verified"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: verify-${{ matrix.target }}
+          path: |
+            verify-assets/*.tar.gz
+            verify-assets/*.tar.gz.sha256
+          if-no-files-found: error
 
   release-integrity:
     name: Release checksums
@@ -907,6 +981,7 @@ jobs:
     needs:
       - mcp-binaries
       - mcp-smoke
+      - verify-binaries
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -930,6 +1005,11 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: mcp-*
+          path: mcp-assets
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: verify-*
           path: mcp-assets
           merge-multiple: true
       - name: Prepare checksummed release assets
