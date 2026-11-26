@@ -61,13 +61,55 @@ dir=$(copy crate-feature)
 edit "$dir/crates/praetore-gateway-service/Cargo.toml" '[dependencies]' $'[features]\nhooks = ["praetore-replay-postgres/test-hooks"]\n\n[dependencies]'
 check "a shipping crate's feature enables test-hooks" 1 "$dir" 'praetore-gateway-service feature hooks enables praetore-replay-postgres/test-hooks'
 
-dir=$(copy release-features)
-edit "$dir/.github/workflows/assurance.yml" 'cargo build --release --locked --package praetore-verify' 'cargo build --release --locked --package praetore-verify --features praetore-replay-postgres/test-hooks'
-check "a release build enables test-hooks" 1 "$dir" 'release build enables test hooks or all features'
+# Release builds: every whole line of the workflow that is a
+# `cargo build ... --release ...` command, whatever the order of its flags,
+# gets each forbidden addition in its own copy, and the check must refuse
+# it. Lines are picked and replaced by number, never by a piece of text, so
+# a reformatted line or a second line that starts the same way is covered
+# too. No such line at all is a failure: the case would test nothing.
+release_lines() {
+  python3 - "$1" <<'PY'
+import sys
+for number, line in enumerate(open(sys.argv[1]).read().split("\n"), 1):
+    tokens = line.split()
+    if "cargo" in tokens:
+        rest = tokens[tokens.index("cargo") + 1:]
+        if rest[:1] == ["build"] and "--release" in rest:
+            print(number)
+PY
+}
 
-dir=$(copy release-all-features)
-edit "$dir/.github/workflows/assurance.yml" 'cargo build --release --locked --package praetore-verify' 'cargo build --release --locked --package praetore-verify --all-features'
-check "a release build uses --all-features" 1 "$dir" 'release build enables test hooks or all features'
+# edit_line PATH NUMBER ADDITION: appends ADDITION to that whole line
+# (before a trailing backslash continuation).
+edit_line() {
+  python3 - "$@" <<'PY'
+import sys
+path, number, addition = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+lines = open(path).read().split("\n")
+line = lines[number - 1]
+if line.endswith("\\"):
+    lines[number - 1] = line[:-1].rstrip() + " " + addition + " \\"
+else:
+    lines[number - 1] = line + " " + addition
+open(path, "w").write("\n".join(lines))
+PY
+}
+
+workflow=.github/workflows/assurance.yml
+mapfile -t numbers < <(release_lines "$here/$workflow")
+if [ "${#numbers[@]}" = 0 ]; then
+  echo "FAIL: no cargo build --release line in $workflow"
+  failures=$((failures + 1))
+fi
+for number in "${numbers[@]}"; do
+  line=$(sed -n "${number}p" "$here/$workflow" | sed 's/^ *//')
+  dir=$(copy "release-features-$number")
+  edit_line "$dir/$workflow" "$number" '--features praetore-replay-postgres/test-hooks'
+  check "a release build enables test-hooks ($workflow:$number: $line)" 1 "$dir" 'release build enables test hooks or all features'
+  dir=$(copy "release-all-features-$number")
+  edit_line "$dir/$workflow" "$number" '--all-features'
+  check "a release build uses --all-features ($workflow:$number: $line)" 1 "$dir" 'release build enables test hooks or all features'
+done
 
 [ "$failures" = 0 ] || { echo "$failures case(s) failed"; exit 1; }
 echo "all cases passed"
