@@ -39,11 +39,15 @@ expect() {
   local want=$1 label=$2 assets=$3
   local out="$work/out-$RANDOM"
   last_out=$out
-  if "$script" "$version" "$assets" "$work/praetore-verify" "$out" >"$work/log" 2>&1; then
-    got=pass
-  else
-    got=fail
-  fi
+  # A refusal is exit 1 exactly; any other status (a crash, a signal, the
+  # usage exit 2) is not the check the case is about.
+  local status=0
+  "$script" "$version" "$assets" "$work/praetore-verify" "$out" >"$work/log" 2>&1 || status=$?
+  case $status in
+    0) got=pass ;;
+    1) got=fail ;;
+    *) got="exit $status" ;;
+  esac
   if [[ "$got" == "$want" ]]; then
     echo "PASS: $label ($got)"
   else
@@ -111,11 +115,13 @@ tar -C "$work/src" -czf "$work/contents/${name}.tar.gz" "$name"
 expect fail "archive with an extra file inside" "$work/contents"
 
 mkdir "$work/exists"
-if "$script" "$version" "$work/good" "$work/praetore-verify" "$work/exists" >/dev/null 2>&1; then
-  echo "FAIL: existing output directory was reused"
+status=0
+"$script" "$version" "$work/good" "$work/praetore-verify" "$work/exists" >/dev/null 2>&1 || status=$?
+if [[ $status -ne 1 ]]; then
+  echo "FAIL: existing output directory: expected exit 1, got exit $status"
   failures=$((failures + 1))
 else
-  echo "PASS: existing output directory is refused (fail)"
+  echo "PASS: existing output directory is refused (exit 1)"
 fi
 
 if [[ $failures -ne 0 ]]; then

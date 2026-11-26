@@ -58,14 +58,25 @@ def verify_cli(verifier, *args):
 
 
 # praetore-verify exits 1 when a check refuses its input. Any other non-zero
-# status (a panic is 101, a signal is negative, a usage path that changes its
-# code) is not a refusal and must not pass a negative check.
+# status (a panic is 101, a signal is negative) is not a refusal and must not
+# pass a negative check. A usage error also exits 1, so the JSON summary
+# (`--format json`) must name a refusal: `ok` false and a code that is not
+# USAGE (a flag the verifier did not take) or INTERNAL.
 REFUSED_EXIT = 1
+NOT_A_REFUSAL = ("USAGE", "INTERNAL")
 
 
 def refused(result):
-    """True only when praetore-verify refused the input (exit 1 exactly)."""
-    return result.returncode == REFUSED_EXIT
+    """True only when praetore-verify refused the input: exit 1 exactly and a
+    JSON summary with `ok` false and a code other than USAGE or INTERNAL."""
+    if result.returncode != REFUSED_EXIT:
+        return False
+    try:
+        summary = json.loads(result.stdout)
+    except ValueError:
+        return False
+    return (isinstance(summary, dict) and summary.get("ok") is False
+            and isinstance(summary.get("code"), str) and summary["code"] not in NOT_A_REFUSAL)
 
 
 def evidence_bytes(line):
@@ -179,7 +190,7 @@ def main():
     with open(cut, "w", encoding="utf-8") as handle:
         handle.write(lines[0] + "\n")
     out = verify_cli(verifier, "journal", "--journal", cut, "--expected-head", head,
-                     "--require-anchored", *pins)
+                     "--require-anchored", "--format", "json", *pins)
     check("praetore-verify refuses the journal without its last line (exit 1)", refused(out),
           f"exit {out.returncode}: {out.stdout}{out.stderr}")
 
@@ -190,7 +201,8 @@ def main():
     with open(tampered, "w", encoding="utf-8") as handle:
         handle.write(changed)
     out = verify_cli(verifier, "evidence", "--evidence", tampered,
-                     "--issuer-pins", os.path.join(home, "issuer-pins.jsonl"), "--strict", *pins)
+                     "--issuer-pins", os.path.join(home, "issuer-pins.jsonl"), "--strict",
+                     "--format", "json", *pins)
     check("praetore-verify refuses a changed receipt (exit 1)", refused(out),
           f"exit {out.returncode}: {out.stdout}{out.stderr}")
 

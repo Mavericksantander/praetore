@@ -961,8 +961,14 @@ jobs:
           "$bin" evidence --evidence examples/verify/evidence.json "${pins[@]}" --format json
           python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["request_id"]+="-changed"; json.dump(d, open(sys.argv[2], "w"))' \
             examples/verify/evidence.json "$work/changed.json"
-          if "$bin" evidence --evidence "$work/changed.json" "${pins[@]}" --format json; then
-            echo "::error::a changed receipt verified"
+          # A refusal is exit 1 with a JSON code that is not USAGE or INTERNAL
+          # (a usage error also exits 1).
+          status=0
+          "$bin" evidence --evidence "$work/changed.json" "${pins[@]}" --format json > "$work/changed.out" || status=$?
+          cat "$work/changed.out"
+          code=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("code","") if d.get("ok") is False else "")' "$work/changed.out" || true)
+          if [[ $status -ne 1 || -z "$code" || "$code" == USAGE || "$code" == INTERNAL ]]; then
+            echo "::error::a changed receipt was not refused (exit $status, code ${code:-none})"
             exit 1
           fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
