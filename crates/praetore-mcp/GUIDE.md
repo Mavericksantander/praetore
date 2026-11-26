@@ -576,6 +576,18 @@ kept, so a receipt that was missing then is still missing in the new
 report and `verify` fails. `--last` and `--session` only look at reports
 written at close.
 
+`report` has the level of `verify` and its exit code: `OK` (0) only with
+`--expected-head` and `--expected-approval-head` given and matched,
+`UNANCHORED` (3, not a pass) when no check failed but a head was not
+given, `FAIL` (1) otherwise, and 2 when it could not be written. The JSON
+header names it in `verify.assurance` and `verify.exit_code`.
+`verify.result` is still `passed` whenever no check failed, UNANCHORED
+included: it does not mean OK. Read `verify.assurance`.
+
+```sh
+praetore-mcp report --expected-head <HEAD> --expected-approval-head none
+```
+
 SIGINT and SIGTERM on macOS and Linux: with reports on, `wrap` waits up to
 300 ms for the server to end, forwards the signal to it, waits up to 2 s
 more, kills it if it is still running, writes the report, and then ends by

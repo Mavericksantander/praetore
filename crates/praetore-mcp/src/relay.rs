@@ -672,7 +672,7 @@ fn write_report(options: &WrapOptions, started_at: OffsetDateTime, log: &Session
             eprintln!(
                 "praetore-mcp: session report: {}{}",
                 generated.pdf.shown(),
-                if generated.verify_passed {
+                if generated.assurance != crate::receipts::Assurance::Failed {
                     ""
                 } else {
                     " (verify FAILED; see the report)"

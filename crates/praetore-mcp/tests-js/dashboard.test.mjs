@@ -657,11 +657,63 @@ test("the sessions view lists each close report with its regenerations grouped a
   // Agent, server, mode, open and close in local time and UTC, verify.
   const h = withRegen.header;
   for (const text of [h.agent, h.server, h.mode, `${h.started_at.slice(0, 19).replace("T", " ")} UTC`,
-    `${h.ended_at.slice(0, 19).replace("T", " ")} UTC`, "verify pasó", h.praetore_mcp_version]) {
+    `${h.ended_at.slice(0, 19).replace("T", " ")} UTC`, "verify UNANCHORED", h.praetore_mcp_version]) {
     assert.ok(card.textContent.includes(text), text);
   }
   // What a report is, said once on the view.
   assert.ok(p.text("sessions-list").includes("no firma nada y no prueba que una persona lo revisó"));
+});
+
+// The chip of each report, read from verify.assurance (the label of
+// receipts::Assurance that the report records), in every language.
+function chips(p) {
+  return p.byId.get("sessions-list").all().filter((n) => n.getAttribute("data-assurance") !== null)
+    .map((n) => [n.getAttribute("data-assurance"), n.className, n.textContent]);
+}
+
+test("the session chip shows OK, UNANCHORED or FAIL from verify's assurance, never 'passed'", async () => {
+  const base = fixture("sessions");
+  // A report from before the level existed: "passed" alone may have had no
+  // heads, so it is not OK.
+  assert.equal(base.reports.items[0].header.verify.assurance, undefined);
+  assert.equal(base.reports.items[0].header.verify.result, "passed");
+  const U = "UNANCHORED", warn = "chip warn";
+  const unanchored = { es: "verify UNANCHORED · faltan heads, no es OK", en: "verify UNANCHORED · heads missing, not OK",
+    pt: "verify UNANCHORED · faltam heads, não é OK" };
+  const cases = [
+    [{ result: "passed", assurance: "OK" }, () => ["OK", "chip ok", "verify OK"]],
+    [{ result: "passed", assurance: U }, (lang) => [U, warn, unanchored[lang]]],
+    [{ result: "failed", assurance: "FAIL" }, () => ["FAIL", "chip bad", "verify FAIL"]],
+    // Without the level: never OK.
+    [{ result: "passed" }, (lang) => [U, warn, unanchored[lang]]],
+    [{ result: "something else" }, (lang) => [U, warn, unanchored[lang]]],
+    [{ result: "failed" }, () => ["FAIL", "chip bad", "verify FAIL"]],
+    // A value the page does not know is not a pass.
+    [{ result: "passed", assurance: "ok" }, () => ["FAIL", "chip bad", "verify FAIL"]],
+    [{ result: "passed", assurance: "toString" }, () => ["FAIL", "chip bad", "verify FAIL"]],
+    [{ result: "passed", assurance: true }, () => ["FAIL", "chip bad", "verify FAIL"]],
+  ];
+  for (const lang of ["es", "en", "pt"]) {
+    for (const [verify, want] of cases) {
+      const state = structuredClone(base);
+      for (const item of state.reports.items) {
+        item.header.verify = { ...item.header.verify, ...verify };
+        if (!("assurance" in verify)) delete item.header.verify.assurance;
+        for (const regen of item.regenerations) regen.header.verify = structuredClone(item.header.verify);
+      }
+      const p = page({ hash: "#/sessions" });
+      p.run(`localStorage.setItem("praetore-mcp-dashboard-lang", ${JSON.stringify(lang)})`);
+      await p.start(state);
+      assert.equal(p.run("document.documentElement.lang"), lang);
+      const got = chips(p);
+      // Two close reports and one regeneration, each with its chip.
+      assert.equal(got.length, 3, `${lang} ${JSON.stringify(verify)}`);
+      for (const chip of got) assert.deepEqual(chip, want(lang), `${lang} ${JSON.stringify(verify)}`);
+      assert.ok(!p.text("sessions-list").match(/verify (passed|pasó|passou)/), lang);
+      // "Approval" is the human approval on this page; a verify chip never says it.
+      for (const chip of got) assert.ok(!/aprobaci|approv|aprova/i.test(chip[2]), `${lang} ${chip[2]}`);
+    }
+  }
 });
 
 test("decisions and approval statuses are two rows on fixed columns, zeros shown", async () => {

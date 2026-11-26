@@ -12,6 +12,17 @@
 - **praetore-mcp: the `-32700` for a refused line carries its `id`** when
   the line has one complete top-level `id`. Otherwise the `id` is `null`,
   as before.
+- **praetore-mcp: `report` has the level and exit code of `verify`.** It
+  printed `verify passed` and exited 0 when `verify` was UNANCHORED; it
+  now prints `verify OK`, `verify UNANCHORED` or `verify FAIL` and exits
+  0, 3 or 1, as `verify`. `report` takes `--expected-head` and
+  `--expected-approval-head`. The verify command printed in a report of a
+  home with no approval journal now ends with
+  `--expected-approval-head none`, so it can reach OK. The JSON header
+  adds `verify.assurance` and `verify.exit_code`; `verify.result` stays,
+  but `result: passed` only means that no check failed: the level is in
+  `verify.assurance`. The dashboard Sessions chip shows that level (OK,
+  UNANCHORED, FAIL); a report written without it is never shown as OK.
 
 ### Added
 
