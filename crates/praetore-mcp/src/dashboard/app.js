@@ -120,7 +120,7 @@ const I18N = {
     s_statuses: "Estado de las aprobaciones (de las llamadas retenidas; no son más llamadas)",
     d_allow: "ALLOW", d_deny: "DENY", d_held: "HELD", d_forwarded: "FORWARDED", d_would_ask: "WOULD ASK",
     a_approved: "APPROVED", a_rejected: "REJECTED", a_pending: "PENDING", a_expired: "EXPIRED",
-    s_verify: (level) => `verify ${level}`, s_no_header: "sin cabecera legible",
+    s_verify_ok: "verify OK", s_verify_unanchored: "verify UNANCHORED · no es aprobación", s_verify_fail: "verify FAIL", s_no_header: "sin cabecera legible",
     s_dl_pdf: "Descargar PDF", s_dl_json: "Descargar JSON", s_sha: "SHA-256 del JSON",
     s_no_pdf: "PDF no encontrado", s_no_json: "JSON no encontrado",
     s_regens: (n) => n === 1 ? "1 regeneración (praetore-mcp report), aparte del original" : `${n} regeneraciones (praetore-mcp report), aparte del original`,
@@ -290,7 +290,7 @@ const I18N = {
     s_statuses: "Approval status (of the held calls; not more calls)",
     d_allow: "ALLOW", d_deny: "DENY", d_held: "HELD", d_forwarded: "FORWARDED", d_would_ask: "WOULD ASK",
     a_approved: "APPROVED", a_rejected: "REJECTED", a_pending: "PENDING", a_expired: "EXPIRED",
-    s_verify: (level) => `verify ${level}`, s_no_header: "no readable header",
+    s_verify_ok: "verify OK", s_verify_unanchored: "verify UNANCHORED · not an approval", s_verify_fail: "verify FAIL", s_no_header: "no readable header",
     s_dl_pdf: "Download PDF", s_dl_json: "Download JSON", s_sha: "SHA-256 of the JSON",
     s_no_pdf: "PDF not found", s_no_json: "JSON not found",
     s_regens: (n) => n === 1 ? "1 regeneration (praetore-mcp report), apart from the original" : `${n} regenerations (praetore-mcp report), apart from the original`,
@@ -460,7 +460,7 @@ const I18N = {
     s_statuses: "Estado das aprovações (das chamadas retidas; não são mais chamadas)",
     d_allow: "ALLOW", d_deny: "DENY", d_held: "HELD", d_forwarded: "FORWARDED", d_would_ask: "WOULD ASK",
     a_approved: "APPROVED", a_rejected: "REJECTED", a_pending: "PENDING", a_expired: "EXPIRED",
-    s_verify: (level) => `verify ${level}`, s_no_header: "sem cabeçalho legível",
+    s_verify_ok: "verify OK", s_verify_unanchored: "verify UNANCHORED · não é aprovação", s_verify_fail: "verify FAIL", s_no_header: "sem cabeçalho legível",
     s_dl_pdf: "Baixar PDF", s_dl_json: "Baixar JSON", s_sha: "SHA-256 do JSON",
     s_no_pdf: "PDF não encontrado", s_no_json: "JSON não encontrado",
     s_regens: (n) => n === 1 ? "1 regeneração (praetore-mcp report), à parte do original" : `${n} regenerações (praetore-mcp report), à parte do original`,
@@ -2187,29 +2187,32 @@ function bothTimes(iso) {
   return iso ? `${localText(iso)} · ${utcText(iso)}` : "-";
 }
 
-// The chip of a report: verify's assurance level as the report recorded it
-// (`verify.assurance`, the label of `receipts::Assurance`), never "passed"
-// alone. Only OK is green. A report written before the level existed says
-// only "passed" or "failed": a pass there may have had no heads, so it is
-// shown as UNANCHORED. Any other value is FAIL.
+// The chip of a report: verify's assurance level (`verify.assurance`, the
+// label of `receipts::Assurance`), never "passed" alone. `/api/state`
+// already fills the level for a report written before it existed
+// (dashboard.rs `header_assurance`); the page applies the same rule again:
+// without the level, "failed" is FAIL and anything else is UNANCHORED, never
+// OK. Any value the page does not know is FAIL. Only OK is green.
 const ASSURANCE_CHIP = {
-  OK: "chip ok",
-  UNANCHORED: "chip",
-  FAIL: "chip bad",
+  OK: { cls: "chip ok", key: "s_verify_ok" },
+  UNANCHORED: { cls: "chip warn", key: "s_verify_unanchored" },
+  FAIL: { cls: "chip bad", key: "s_verify_fail" },
 };
 
 function assuranceOf(verify) {
   if (!verify) return "FAIL";
   if (verify.assurance === undefined || verify.assurance === null) {
-    return verify.result === "passed" ? "UNANCHORED" : "FAIL";
+    return verify.result === "failed" ? "FAIL" : "UNANCHORED";
   }
-  return Object.hasOwn(ASSURANCE_CHIP, verify.assurance) ? verify.assurance : "FAIL";
+  return typeof verify.assurance === "string" && Object.hasOwn(ASSURANCE_CHIP, verify.assurance)
+    ? verify.assurance : "FAIL";
 }
 
 function verifyChip(header) {
   if (!header) return el("span", { class: "chip bad" }, t("s_no_header"));
   const level = assuranceOf(header.verify);
-  return el("span", { class: ASSURANCE_CHIP[level], "data-assurance": level }, t("s_verify", level));
+  const chip = ASSURANCE_CHIP[level];
+  return el("span", { class: chip.cls, "data-assurance": level }, t(chip.key));
 }
 
 function downloads(entry) {

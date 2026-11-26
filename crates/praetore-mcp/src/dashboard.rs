@@ -18,7 +18,7 @@
 use crate::{
     gate::PATH_CHECK_CONTEXT_KEY,
     journal,
-    receipts::{self, Check, ExpectedHeads, LineVerdict, VerifyReport},
+    receipts::{self, Assurance, Check, ExpectedHeads, LineVerdict, VerifyReport},
     report,
     store::{self, Home},
 };
@@ -1000,6 +1000,30 @@ struct ReportGroup {
 /// A file name in `DIR/reports/` and what [`load_report`] read of it.
 type Listed = (String, ReportFile);
 
+/// The assurance level a report header records, for the Sessions chip.
+/// [`Assurance::Anchored`] comes only from a header whose
+/// `verify.assurance` is exactly its label. A report written before the
+/// level existed has no `assurance`: its "passed" may have had no heads, so
+/// it is UNANCHORED, and any other result is FAIL. A value this version does
+/// not know is FAIL.
+fn header_assurance(verify: &Value) -> Assurance {
+    let unanchored = || Assurance::Unanchored {
+        missing: Vec::new(),
+    };
+    match verify.get("assurance") {
+        None | Some(Value::Null) => {
+            if verify["result"] == "failed" {
+                Assurance::Failed
+            } else {
+                unanchored()
+            }
+        }
+        Some(Value::String(label)) if label == Assurance::Anchored.label() => Assurance::Anchored,
+        Some(Value::String(label)) if label == unanchored().label() => unanchored(),
+        Some(_) => Assurance::Failed,
+    }
+}
+
 /// The fields of a report header the Sessions view shows.
 fn header_summary(header: &Value) -> Value {
     json!({
@@ -1014,7 +1038,7 @@ fn header_summary(header: &Value) -> Value {
         "summary": header["summary"],
         "verify": {
             "result": header["verify"]["result"],
-            "assurance": header["verify"]["assurance"],
+            "assurance": header_assurance(&header["verify"]).label(),
             "session_receipts": header["verify"]["session_receipts"],
             "session_verified": header["verify"]["session_verified"],
         },
@@ -1365,7 +1389,7 @@ fn policy_view(home: &Home, enforce_receipts: usize) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{APP_JS, header_summary};
+    use super::{APP_JS, header_assurance, header_summary};
     use crate::receipts::Assurance;
     use serde_json::json;
 
@@ -1406,7 +1430,7 @@ mod tests {
         // Only OK is drawn green.
         for line in table.lines() {
             assert_eq!(
-                line.contains("chip ok"),
+                line.contains("\"chip ok\""),
                 line.trim().starts_with("OK:"),
                 "{line}"
             );
@@ -1418,5 +1442,41 @@ mod tests {
                 level.label()
             );
         }
+    }
+
+    #[test]
+    fn a_report_without_the_level_is_never_ok() {
+        let level = |verify: serde_json::Value| header_assurance(&verify).label();
+        // Reports written before `assurance` existed.
+        assert_eq!(level(json!({ "result": "passed" })), "UNANCHORED");
+        assert_eq!(
+            level(json!({ "result": "passed", "assurance": null })),
+            "UNANCHORED"
+        );
+        assert_eq!(level(json!({ "result": "failed" })), "FAIL");
+        assert_eq!(level(json!({})), "UNANCHORED");
+        assert_eq!(level(json!(null)), "UNANCHORED");
+        // Only the exact label is OK; anything else this version does not
+        // know is FAIL.
+        assert_eq!(
+            level(json!({ "result": "passed", "assurance": "OK" })),
+            "OK"
+        );
+        for other in [
+            json!("ok"),
+            json!("passed"),
+            json!(true),
+            json!(0),
+            json!(["OK"]),
+        ] {
+            assert_eq!(
+                level(json!({ "result": "passed", "assurance": other })),
+                "FAIL",
+                "{other}"
+            );
+        }
+        // What /api/state sends for a header without the level.
+        let header = json!({ "verify": { "result": "passed", "session_receipts": 1 } });
+        assert_eq!(header_summary(&header)["verify"]["assurance"], "UNANCHORED");
     }
 }

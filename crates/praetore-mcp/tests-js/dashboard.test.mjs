@@ -677,15 +677,21 @@ test("the session chip shows OK, UNANCHORED or FAIL from verify's assurance, nev
   // heads, so it is not OK.
   assert.equal(base.reports.items[0].header.verify.assurance, undefined);
   assert.equal(base.reports.items[0].header.verify.result, "passed");
+  const U = "UNANCHORED", warn = "chip warn";
+  const unanchored = { es: "verify UNANCHORED · no es aprobación", en: "verify UNANCHORED · not an approval",
+    pt: "verify UNANCHORED · não é aprovação" };
   const cases = [
-    [{ result: "passed", assurance: "OK" }, ["OK", "chip ok", "verify OK"]],
-    [{ result: "passed", assurance: "UNANCHORED" }, ["UNANCHORED", "chip", "verify UNANCHORED"]],
-    [{ result: "failed", assurance: "FAIL" }, ["FAIL", "chip bad", "verify FAIL"]],
-    [{ result: "passed" }, ["UNANCHORED", "chip", "verify UNANCHORED"]],
-    [{ result: "failed" }, ["FAIL", "chip bad", "verify FAIL"]],
+    [{ result: "passed", assurance: "OK" }, () => ["OK", "chip ok", "verify OK"]],
+    [{ result: "passed", assurance: U }, (lang) => [U, warn, unanchored[lang]]],
+    [{ result: "failed", assurance: "FAIL" }, () => ["FAIL", "chip bad", "verify FAIL"]],
+    // Without the level: never OK.
+    [{ result: "passed" }, (lang) => [U, warn, unanchored[lang]]],
+    [{ result: "something else" }, (lang) => [U, warn, unanchored[lang]]],
+    [{ result: "failed" }, () => ["FAIL", "chip bad", "verify FAIL"]],
     // A value the page does not know is not a pass.
-    [{ result: "passed", assurance: "ok" }, ["FAIL", "chip bad", "verify FAIL"]],
-    [{ result: "passed", assurance: "toString" }, ["FAIL", "chip bad", "verify FAIL"]],
+    [{ result: "passed", assurance: "ok" }, () => ["FAIL", "chip bad", "verify FAIL"]],
+    [{ result: "passed", assurance: "toString" }, () => ["FAIL", "chip bad", "verify FAIL"]],
+    [{ result: "passed", assurance: true }, () => ["FAIL", "chip bad", "verify FAIL"]],
   ];
   for (const lang of ["es", "en", "pt"]) {
     for (const [verify, want] of cases) {
@@ -702,7 +708,7 @@ test("the session chip shows OK, UNANCHORED or FAIL from verify's assurance, nev
       const got = chips(p);
       // Two close reports and one regeneration, each with its chip.
       assert.equal(got.length, 3, `${lang} ${JSON.stringify(verify)}`);
-      for (const chip of got) assert.deepEqual(chip, want, `${lang} ${JSON.stringify(verify)}`);
+      for (const chip of got) assert.deepEqual(chip, want(lang), `${lang} ${JSON.stringify(verify)}`);
       assert.ok(!p.text("sessions-list").match(/verify (passed|pasó|passou)/), lang);
     }
   }
