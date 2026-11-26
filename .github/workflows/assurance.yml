@@ -889,6 +889,13 @@ jobs:
       # A real tools/call allowed and one denied, then `verify`.
       - name: End-to-end smoke test of the packaged binary
         run: python3 -I scripts/mcp-smoke.py "$MCP_BINARY"
+      # The receipts of an allow and a deny (no approval) written by the
+      # packaged binary, checked by praetore-verify built from this commit,
+      # and refused once cut or changed.
+      - name: Build praetore-verify for the receipt check
+        run: cargo build --release --locked --package praetore-verify
+      - name: Receipts of the packaged binary verified by praetore-verify
+        run: python3 -I scripts/mcp-receipt-e2e.py "$MCP_BINARY" target/release/praetore-verify
 
   release-integrity:
     name: Release checksums
