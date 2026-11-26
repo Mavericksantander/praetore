@@ -57,6 +57,17 @@ def verify_cli(verifier, *args):
     return result
 
 
+# praetore-verify exits 1 when a check refuses its input. Any other non-zero
+# status (a panic is 101, a signal is negative, a usage path that changes its
+# code) is not a refusal and must not pass a negative check.
+REFUSED_EXIT = 1
+
+
+def refused(result):
+    """True only when praetore-verify refused the input (exit 1 exactly)."""
+    return result.returncode == REFUSED_EXIT
+
+
 def evidence_bytes(line):
     """The `evidence` member of a journal line, byte for byte as signed."""
     key = '"evidence":'
@@ -169,8 +180,8 @@ def main():
         handle.write(lines[0] + "\n")
     out = verify_cli(verifier, "journal", "--journal", cut, "--expected-head", head,
                      "--require-anchored", *pins)
-    check("praetore-verify refuses the journal without its last line", out.returncode != 0,
-          out.stdout + out.stderr)
+    check("praetore-verify refuses the journal without its last line (exit 1)", refused(out),
+          f"exit {out.returncode}: {out.stdout}{out.stderr}")
 
     text = evidence_bytes(lines[0])
     changed = text.replace("read_text_file", "read_text_filf", 1)
@@ -180,7 +191,8 @@ def main():
         handle.write(changed)
     out = verify_cli(verifier, "evidence", "--evidence", tampered,
                      "--issuer-pins", os.path.join(home, "issuer-pins.jsonl"), "--strict", *pins)
-    check("praetore-verify refuses a changed receipt", out.returncode != 0, out.stdout + out.stderr)
+    check("praetore-verify refuses a changed receipt (exit 1)", refused(out),
+          f"exit {out.returncode}: {out.stdout}{out.stderr}")
 
     print(f"\n{len(failures)} check(s) failed" if failures else "\nall checks passed")
     sys.exit(1 if failures else 0)
