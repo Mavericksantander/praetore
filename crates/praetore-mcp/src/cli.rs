@@ -313,9 +313,14 @@ A session can be regenerated only if it wrote a report (not after
   --dir DIR      home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)
   --session ID   session id
   --last         the most recent session (default)
+  --expected-head SEQ:HASH | none
+  --expected-approval-head HASH | none
+                 heads kept outside this machine, as for verify
 
-Exit code: 0 if the report was written and verify passed, 1 if it was
-written and says verify failed, 2 if it could not be written.";
+The report has the level of verify and its exit code: 0 OK (both heads
+given and matched), 3 UNANCHORED (no check failed, but a head was not
+given; not a pass), 1 FAIL (the report says so on its first page), 2 if it
+could not be written.";
 
 const POLICY_HELP: &str = "Usage:
   praetore-mcp policy list   [--dir DIR]
@@ -1024,7 +1029,17 @@ fn cmd_dashboard(args: &[String]) -> Result<i32, String> {
 
 fn cmd_report(args: &[String]) -> Result<i32, String> {
     use crate::report::{self, Selector};
-    let parsed = parse(args, &["--dir", "--session"], &["--last"], false)?;
+    let parsed = parse(
+        args,
+        &[
+            "--dir",
+            "--session",
+            "--expected-head",
+            "--expected-approval-head",
+        ],
+        &["--last"],
+        false,
+    )?;
     let selector = match (parsed.value("--session"), parsed.flag("--last")) {
         (Some(_), true) => return Err("--session and --last cannot be used together".into()),
         (Some(id), false) if report::valid_session_id(id) => Selector::Session(id.to_owned()),
@@ -1035,19 +1050,14 @@ fn cmd_report(args: &[String]) -> Result<i32, String> {
         }
         (None, _) => Selector::Last,
     };
-    let generated = report::regenerate(&parsed.home()?, &selector)?;
-    println!("{}", generated.json.shown());
-    println!("{}", generated.pdf.shown());
-    if generated.verify_passed {
-        println!("verify passed");
-        Ok(0)
-    } else {
-        println!("verify FAILED: the report says so on its first page");
-        if let Some(summary) = &generated.verify_summary {
-            eprintln!("praetore-mcp: {summary}");
-        }
-        Ok(1)
-    }
+    report::command(
+        &parsed.home()?,
+        &selector,
+        receipts::ExpectedHeads {
+            receipts: parsed.value("--expected-head"),
+            approvals: parsed.value("--expected-approval-head"),
+        },
+    )
 }
 
 fn cmd_approvals(args: &[String]) -> Result<i32, String> {

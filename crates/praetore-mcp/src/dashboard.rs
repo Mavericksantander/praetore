@@ -18,7 +18,7 @@
 use crate::{
     gate::PATH_CHECK_CONTEXT_KEY,
     journal,
-    receipts::{self, Check, ExpectedHeads, LineVerdict, VerifyReport},
+    receipts::{self, Assurance, Check, ExpectedHeads, LineVerdict, VerifyReport},
     report,
     store::{self, Home},
 };
@@ -1000,6 +1000,30 @@ struct ReportGroup {
 /// A file name in `DIR/reports/` and what [`load_report`] read of it.
 type Listed = (String, ReportFile);
 
+/// The assurance level a report header records, for the Sessions chip.
+/// [`Assurance::Anchored`] comes only from a header whose
+/// `verify.assurance` is exactly its label. A report written before the
+/// level existed has no `assurance`: its "passed" may have had no heads, so
+/// it is UNANCHORED, and any other result is FAIL. A value this version does
+/// not know is FAIL.
+fn header_assurance(verify: &Value) -> Assurance {
+    let unanchored = || Assurance::Unanchored {
+        missing: Vec::new(),
+    };
+    match verify.get("assurance") {
+        None | Some(Value::Null) => {
+            if verify["result"] == "failed" {
+                Assurance::Failed
+            } else {
+                unanchored()
+            }
+        }
+        Some(Value::String(label)) if label == Assurance::Anchored.label() => Assurance::Anchored,
+        Some(Value::String(label)) if label == unanchored().label() => unanchored(),
+        Some(_) => Assurance::Failed,
+    }
+}
+
 /// The fields of a report header the Sessions view shows.
 fn header_summary(header: &Value) -> Value {
     json!({
@@ -1014,6 +1038,7 @@ fn header_summary(header: &Value) -> Value {
         "summary": header["summary"],
         "verify": {
             "result": header["verify"]["result"],
+            "assurance": header_assurance(&header["verify"]).label(),
             "session_receipts": header["verify"]["session_receipts"],
             "session_verified": header["verify"]["session_verified"],
         },
@@ -1359,5 +1384,99 @@ fn policy_view(home: &Home, enforce_receipts: usize) -> Value {
             "path": home.policy().display().to_string(),
             "error": error,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{APP_JS, header_assurance, header_summary};
+    use crate::receipts::Assurance;
+    use serde_json::json;
+
+    /// Every level of `verify`. The match fails to compile when a level is
+    /// added, so the page's table below cannot fall behind it.
+    fn every_level() -> [Assurance; 3] {
+        let levels = [
+            Assurance::Anchored,
+            Assurance::Unanchored {
+                missing: vec!["--expected-head"],
+            },
+            Assurance::Failed,
+        ];
+        for level in &levels {
+            match level {
+                Assurance::Anchored | Assurance::Unanchored { .. } | Assurance::Failed => {}
+            }
+        }
+        levels
+    }
+
+    #[test]
+    fn the_sessions_header_carries_the_assurance_level_the_page_knows() {
+        let table = APP_JS
+            .split("const ASSURANCE_CHIP = {")
+            .nth(1)
+            .and_then(|rest| rest.split("};").next())
+            .expect("app.js has the ASSURANCE_CHIP table");
+        let keys: Vec<&str> = table
+            .lines()
+            .filter_map(|line| line.trim().split_once(':').map(|(key, _)| key))
+            .collect();
+        let labels: Vec<&str> = every_level().iter().map(Assurance::label).collect();
+        assert_eq!(
+            keys, labels,
+            "app.js ASSURANCE_CHIP and receipts::Assurance"
+        );
+        // Only OK is drawn green.
+        for line in table.lines() {
+            assert_eq!(
+                line.contains("\"chip ok\""),
+                line.trim().starts_with("OK:"),
+                "{line}"
+            );
+        }
+        for level in every_level() {
+            let header = json!({ "verify": { "result": "passed", "assurance": level.label() } });
+            assert_eq!(
+                header_summary(&header)["verify"]["assurance"],
+                level.label()
+            );
+        }
+    }
+
+    #[test]
+    fn a_report_without_the_level_is_never_ok() {
+        let level = |verify: serde_json::Value| header_assurance(&verify).label();
+        // Reports written before `assurance` existed.
+        assert_eq!(level(json!({ "result": "passed" })), "UNANCHORED");
+        assert_eq!(
+            level(json!({ "result": "passed", "assurance": null })),
+            "UNANCHORED"
+        );
+        assert_eq!(level(json!({ "result": "failed" })), "FAIL");
+        assert_eq!(level(json!({})), "UNANCHORED");
+        assert_eq!(level(json!(null)), "UNANCHORED");
+        // Only the exact label is OK; anything else this version does not
+        // know is FAIL.
+        assert_eq!(
+            level(json!({ "result": "passed", "assurance": "OK" })),
+            "OK"
+        );
+        for other in [
+            json!("ok"),
+            json!("passed"),
+            json!(true),
+            json!(0),
+            json!(["OK"]),
+        ] {
+            assert_eq!(
+                level(json!({ "result": "passed", "assurance": other })),
+                "FAIL",
+                "{other}"
+            );
+        }
+        // What /api/state sends for a header without the level.
+        let header = json!({ "verify": { "result": "passed", "session_receipts": 1 } });
+        assert_eq!(header_summary(&header)["verify"]["assurance"], "UNANCHORED");
     }
 }

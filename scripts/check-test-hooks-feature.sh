@@ -79,13 +79,17 @@ done
 
 # 4: release build commands.
 found=0
+# The feature is looked for in the line's text only, after `file:number:`,
+# so a file whose name contains it is not a finding by its name.
 while IFS= read -r line; do
-  echo "::error::release build enables test hooks or all features: $line"
-  found=1
+  text=${line#*:*:}
+  if grep -qE -- "$feature|--all-features" <<<"$text"; then
+    echo "::error::release build enables test hooks or all features: $line"
+    found=1
+  fi
 done < <(grep -rnE -- '--release' .github/workflows scripts examples deploy Dockerfile* 2>/dev/null \
   | grep -v '^scripts/check-test-hooks-feature.sh:' \
-  | grep -v '^scripts/test-check-test-hooks-feature.sh:' \
-  | grep -E -- "$feature|--all-features" || true)
+  | grep -v '^scripts/test-check-test-hooks-feature.sh:' || true)
 [ "$found" = 0 ] || exit 1
 
 echo "$crate/$feature: absent from default features, from every shipping crate ($users) and from release builds"
