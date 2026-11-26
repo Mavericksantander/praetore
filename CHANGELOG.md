@@ -419,13 +419,16 @@
 
 - Tests: #162, #191, #195, #196, #231, #234, #237, #238, #241, #242, #243,
   #248.
-- CI: #198 and #223 (HighAssurance hook tests read from
-  `cargo test --list` and exit codes), #203 (one `rust-version` in every
-  manifest, checked), #249 (local approve/reject test denylist and source
-  guard), #253 (receipts written by the packaged praetore-mcp binary,
-  without approval, checked by praetore-verify and refused once cut or
-  changed), #259 (the negative receipt checks require praetore-verify
-  exit 1).
+- CI: #198 and #223 (HighAssurance hook tests read from `cargo test --list`
+  and exit codes), #203 (one `rust-version` in every manifest, checked),
+  #249 (local approve/reject test denylist and source guard), #253 (receipts
+  written by the packaged praetore-mcp binary, without approval, checked by
+  praetore-verify and refused once cut or changed), #259 (the negative
+  receipt checks of the e2e went from any nonzero exit to exit 1; #261 then
+  also requires a refusal code), #260 (the test-hooks self-test checks every
+  whole `--release` build line of the workflow), #261 (the negative
+  praetore-verify and release-checksums checks require exit 1 and, for
+  praetore-verify, a JSON refusal code that is not USAGE or INTERNAL).
 - Docs: #192 (install guide for v0.3.6), #193 (Ed25519 audit), #218
   (ADR-007 proposal), #221 (implementation map), #226 (review of draft
   #131).
