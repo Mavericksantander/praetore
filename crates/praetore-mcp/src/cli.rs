@@ -1290,7 +1290,7 @@ fn save_policy(home: &Home, original: &str, updated: &str) -> Result<(), String>
     Ok(())
 }
 
-fn cmd_policy(args: &[String]) -> Result<i32, String> {
+pub(crate) fn cmd_policy(args: &[String]) -> Result<i32, String> {
     use crate::policy::{self, ArgOperator, RuleSpec};
     let Some((sub, rest)) = args.split_first() else {
         return Err(format!("policy needs a subcommand\n\n{USAGE}"));

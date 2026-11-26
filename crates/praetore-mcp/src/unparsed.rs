@@ -4,8 +4,8 @@
 //! [`UNPARSED_LINE_ACTION_TYPE`], in both modes, written before the line is
 //! forwarded (observe) or refused with `-32700` (enforce, and in both modes
 //! a line that may name a `safety*` tool, signed `may_name_safety: true`).
-//! The policy never declares that type, so the engine refuses it with its
-//! unclassified-action guard: the receipt is a signed DENY and never says
+//! No policy may declare that type ([`refuse_reserved_type`]), so the
+//! engine refuses it with its unclassified-action guard: the receipt is a signed DENY and never says
 //! "allow". What happens to the line depends on the mode and on
 //! `may_name_safety_tool` only; nothing in this record decides it, and a
 //! receipt that cannot be written changes nothing but the notice.
@@ -14,12 +14,24 @@ use crate::gate::Mode;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-/// Action type of the receipt of an unparseable client line. Not declared
-/// in any policy `praetore-mcp` writes; a policy that declares it gets no
-/// receipt for such lines (the engine refuses to treat a declared type as
-/// unclassified), which observe reports as a receipt that could not be
-/// written.
+/// Action type of the receipt of an unparseable client line. Reserved: a
+/// policy that declares it in `action_classes` is refused by `policy check`,
+/// by loading the home (`wrap`, `Gate::load`) and by the `policy` edits
+/// ([`refuse_reserved_type`]).
 pub const UNPARSED_LINE_ACTION_TYPE: &str = "mcp.unparsed_line";
+
+/// Refuses a policy that declares [`UNPARSED_LINE_ACTION_TYPE`]. Declared,
+/// the engine would not treat it as unclassified and every unparseable line
+/// would lose its receipt. (As Safety the core already refuses it: a Safety
+/// type is `safety:` followed by a name.)
+pub fn refuse_reserved_type(policy: &praetore_core::Policy) -> Result<(), String> {
+    match policy.action_classes.get(UNPARSED_LINE_ACTION_TYPE) {
+        None => Ok(()),
+        Some(class) => Err(format!(
+            "action_classes declares {UNPARSED_LINE_ACTION_TYPE:?} ({class:?}): praetore-mcp reserves that action type for the signed receipt of a client line it cannot parse; remove it from action_classes"
+        )),
+    }
+}
 
 /// At most this many tool names read by the tolerant reader are recorded.
 pub const MAX_TOLERANT_TOOLS: usize = 8;
@@ -408,11 +420,11 @@ fn is_number(token: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::{
-        gate::{Evaluator, Gate},
+        gate::Gate,
         proxy::{Classified, classify, handle_client_line},
         store::{self, Home},
     };
-    use praetore_core::{DecisionOutcome, Evidence};
+    use praetore_core::{ActionClass, DecisionOutcome, Evidence};
     use std::fs;
 
     /// Rows 1, 4, 5, 6 and 7 of the research note 22 corpus, as client
@@ -734,24 +746,54 @@ mod tests {
         }
     }
 
-    /// A policy that declares the type Mission, with a rule that would
-    /// allow it, still never gets an ALLOW receipt: the engine refuses to
-    /// take a declared type as unclassified, so there is no receipt at all,
-    /// and the line goes where the mode sends it.
+    /// The type is reserved. A policy that declares it as Mission (valid
+    /// for the core) is refused by `policy check` (exit 1), by loading the
+    /// home (`Gate::load`, what `wrap` does) and by the `policy` edits, which
+    /// leave the file as it was. As Safety, the core already refuses it.
     #[test]
-    fn a_policy_that_declares_the_unparsed_type_gets_no_allow_receipt() {
+    fn a_policy_that_declares_the_unparsed_type_is_refused_by_check_load_and_edits() {
+        let declared = |class| {
+            let mut policy = store::default_policy();
+            policy.id = "b4-declared".into();
+            policy
+                .action_classes
+                .insert(UNPARSED_LINE_ACTION_TYPE.to_owned(), class);
+            policy
+        };
+        let as_safety = serde_json::to_string(&declared(ActionClass::Safety)).unwrap();
+        assert!(praetore_core::Policy::from_json(&as_safety).is_err());
         let (_temp, home) = home("b4-declared");
-        let mut policy = store::default_policy().with_mission_actions([UNPARSED_LINE_ACTION_TYPE]);
-        policy.id = "b4-declared".into();
-        fs::write(home.policy(), serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
-        let mut gate = Gate::load(&home, Mode::Observe).unwrap();
-        let raw = b"this is not json\n";
-        let receipt = gate.record_unparsed("fs", &UnparsedLine::of(raw, &reason(raw)));
-        assert!(receipt.is_err(), "{:?}", receipt.map(|v| v.outcome));
-        let out = handle_client_line(raw, Mode::Observe, "fs", &mut gate);
-        assert_eq!(out.to_server.as_deref(), Some(&raw[..]));
-        assert!(out.warnings[0].contains("could NOT be written"));
-        assert!(receipts(&home).is_empty());
+        let policy = declared(ActionClass::Mission);
+        assert!(praetore_core::Policy::from_json(&serde_json::to_string(&policy).unwrap()).is_ok());
+        let text = serde_json::to_vec_pretty(&policy).unwrap();
+        fs::write(home.policy(), &text).unwrap();
+        let refused =
+            |error: &str| error.contains(UNPARSED_LINE_ACTION_TYPE) && error.contains("reserves");
+
+        let error = refuse_reserved_type(&policy).unwrap_err();
+        assert!(refused(&error), "{error}");
+        for mode in [Mode::Observe, Mode::Enforce] {
+            let error = Gate::load(&home, mode).err().expect("Gate::load refused");
+            assert!(refused(&error), "{error}");
+        }
+        let error = crate::policy::render_validated(&policy).unwrap_err();
+        assert!(refused(&error), "{error}");
+
+        let dir = home.root.to_str().unwrap().to_owned();
+        // `policy` subcommands only (never the whole CLI dispatch).
+        let cli = |args: &[&str]| {
+            crate::cli::cmd_policy(&args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>())
+        };
+        assert_eq!(cli(&["check", "--dir", &dir]), Ok(1));
+        let edit = cli(&[
+            "allow", "--id", "b4-allow", "--server", "fs", "--tool", "read", "--dir", &dir,
+        ]);
+        assert!(edit.as_ref().is_err_and(|e| refused(e)), "{edit:?}");
+        assert_eq!(fs::read(home.policy()).unwrap(), text);
+
+        let clean = serde_json::to_vec_pretty(&store::default_policy()).unwrap();
+        fs::write(home.policy(), clean).unwrap();
+        assert_eq!(cli(&["check", "--dir", &dir]), Ok(0), "clean policy");
     }
 
     /// Readers show the receipt as `UNPARSED <sha256 prefix>`: the
