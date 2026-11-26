@@ -28,6 +28,10 @@ jobs:
         run: |
           scripts/test-check-rust-version.sh
           scripts/check-rust-version.sh
+      - name: No release placeholder (tag commit, artifact SHA-256, tag date) in a tracked file
+        run: |
+          scripts/test-check-release-placeholders.sh
+          scripts/check-release-placeholders.sh
       - name: Install zsh so the print-cmd round-trip is not skipped
         run: sudo apt-get update && sudo apt-get install -y zsh
       - run: cargo test --workspace --locked
