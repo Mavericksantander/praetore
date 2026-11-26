@@ -33,8 +33,12 @@ fn gate_with_example() -> (tempfile::TempDir, Gate) {
 
 /// The outcome and the rules that decided it.
 fn decide(gate: &Gate, tool: &str) -> (DecisionOutcome, Vec<String>) {
-    let params = json!({"name": tool, "arguments": {"path": "/tmp/praetore-example/a.txt"}});
-    let evidence = gate.evaluate_evidence(SERVER, &params).unwrap();
+    decide_on(gate, SERVER, tool, "/tmp/praetore-example/a.txt")
+}
+
+fn decide_on(gate: &Gate, server: &str, tool: &str, path: &str) -> (DecisionOutcome, Vec<String>) {
+    let params = json!({"name": tool, "arguments": {"path": path}});
+    let evidence = gate.evaluate_evidence(server, &params).unwrap();
     let outcome = evidence.decision.outcome;
     let rules = evidence
         .decision
@@ -82,4 +86,38 @@ fn the_example_policy_allows_a_read_and_denies_a_write() {
         decide(&gate, "create_directory"),
         (DecisionOutcome::Deny, vec![])
     );
+}
+
+/// The two conditions examples/claude-code-mcp-policy/README.md states.
+#[test]
+fn the_example_policy_needs_the_server_name_and_sets_no_path_condition() {
+    let (_temp, gate) = gate_with_example();
+    // Under another server name no rule matches: the default deny.
+    assert_eq!(
+        decide_on(
+            &gate,
+            "files",
+            "read_text_file",
+            "/tmp/praetore-example/a.txt"
+        ),
+        (DecisionOutcome::Deny, vec![])
+    );
+    // By tool name only: an allowed tool is allowed on any path.
+    for path in ["/tmp/praetore-example/a.txt", "/home/user/other/b.txt"] {
+        assert_eq!(
+            decide_on(&gate, SERVER, "read_text_file", path),
+            (DecisionOutcome::Allow, vec!["allow-read-text-file".into()]),
+            "{path}"
+        );
+    }
+    let text = fs::read_to_string(example()).unwrap();
+    let policy = Policy::from_json(&text).unwrap();
+    for rule in &policy.rules {
+        assert_eq!(rule.target.as_deref(), Some(SERVER), "{}", rule.id);
+        assert!(
+            rule.parameter_conditions.iter().all(|c| c.key == "tool"),
+            "{}: a condition other than the tool name",
+            rule.id
+        );
+    }
 }
