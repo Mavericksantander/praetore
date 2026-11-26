@@ -894,6 +894,9 @@ jobs:
       # and refused once cut or changed. A debug build: it is a checker
       # here, not a shipped artifact, and the release build command of
       # praetore-verify stays the single line the test-hooks mutants edit.
+      # A negative check passes only on exit 1 (refused), not on a crash.
+      - name: Self-test of the receipt check's negative checks
+        run: python3 -I scripts/test-mcp-receipt-e2e.py
       - name: Build praetore-verify for the receipt check
         run: cargo build --locked --package praetore-verify
       - name: Receipts of the packaged binary verified by praetore-verify
