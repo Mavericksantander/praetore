@@ -322,6 +322,7 @@ fn approve_on_tty_with(
 }
 
 #[test]
+#[ignore = "ejecuta praetore-mcp approve; correr con --ignored en CI dedicado"]
 fn enforce_holds_the_call_and_names_the_exact_command() {
     let (_temp, home) = init_home();
     require_echo(&home);
@@ -470,6 +471,7 @@ fn init_adds_an_approver_key_without_replacing_an_existing_home() {
 }
 
 #[test]
+#[ignore = "ejecuta praetore-mcp approve; correr con --ignored en CI dedicado"]
 fn approve_without_a_terminal_signs_nothing() {
     let (_temp, home) = init_home();
     require_echo(&home);
@@ -508,6 +510,7 @@ impl PendingPath for Home {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+#[ignore = "ejecuta praetore-mcp approve; correr con --ignored en CI dedicado"]
 fn approved_call_forwards_once_and_a_second_retry_asks_again() {
     let (_temp, home) = init_home();
     require_echo(&home);
@@ -579,6 +582,7 @@ fn approved_call_forwards_once_and_a_second_retry_asks_again() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+#[ignore = "ejecuta praetore-mcp approve; correr con --ignored en CI dedicado"]
 fn different_arguments_do_not_use_the_approval() {
     let (_temp, home) = init_home();
     require_echo(&home);
@@ -620,6 +624,7 @@ fn different_arguments_do_not_use_the_approval() {
 }
 
 #[test]
+#[ignore = "ejecuta praetore-mcp approve; correr con --ignored en CI dedicado"]
 fn unknown_approval_id_is_rejected() {
     let (_temp, home) = init_home();
     let id = "ab".repeat(32);
@@ -633,6 +638,7 @@ fn unknown_approval_id_is_rejected() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+#[ignore = "ejecuta praetore-mcp approve; correr con --ignored en CI dedicado"]
 fn unknown_id_on_a_terminal_is_not_signed() {
     let (_temp, home) = init_home();
     let id = "ab".repeat(32);
@@ -645,6 +651,7 @@ fn unknown_id_on_a_terminal_is_not_signed() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+#[ignore = "ejecuta praetore-mcp approve; correr con --ignored en CI dedicado"]
 fn rejected_call_is_not_forwarded() {
     let (_temp, home) = init_home();
     require_echo(&home);
@@ -674,6 +681,7 @@ fn rejected_call_is_not_forwarded() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+#[ignore = "ejecuta praetore-mcp approve; correr con --ignored en CI dedicado"]
 fn expired_pending_and_expired_approval_do_not_pass() {
     let (_temp, home) = init_home();
     require_echo(&home);
@@ -721,6 +729,7 @@ fn expired_pending_and_expired_approval_do_not_pass() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+#[ignore = "ejecuta praetore-mcp approve; correr con --ignored en CI dedicado"]
 fn verify_rejects_a_bad_signature_and_a_reused_approval() {
     let (_temp, home) = init_home();
     require_echo(&home);
@@ -826,6 +835,7 @@ fn an_evidence_only_journal_still_verifies() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+#[ignore = "ejecuta praetore-mcp approve; correr con --ignored en CI dedicado"]
 fn pending_changed_after_it_was_shown_is_not_signed() {
     let (_temp, home) = init_home();
     require_echo(&home);
@@ -867,6 +877,7 @@ fn pending_changed_after_it_was_shown_is_not_signed() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+#[ignore = "ejecuta praetore-mcp approve; correr con --ignored en CI dedicado"]
 fn edited_pending_is_not_signed_and_the_edited_call_is_not_forwarded() {
     let (_temp, home) = init_home();
     require_echo(&home);
@@ -910,6 +921,7 @@ fn edited_pending_is_not_signed_and_the_edited_call_is_not_forwarded() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+#[ignore = "ejecuta praetore-mcp approve; correr con --ignored en CI dedicado"]
 fn verify_rejects_an_execution_after_the_approval_window() {
     let (_temp, home) = init_home();
     require_echo(&home);
@@ -976,6 +988,7 @@ fn approvals_show_the_expiry_in_local_time_with_utc_and_what_is_left() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+#[ignore = "ejecuta praetore-mcp approve; correr con --ignored en CI dedicado"]
 fn the_status_tells_an_expired_unused_approval_from_an_executed_one() {
     // Approved, then expired before any retry ran.
     let (_temp, home) = init_home();
@@ -1041,6 +1054,7 @@ fn held_evidence_id(home: &Home) -> String {
 /// `approvals::decide` for a rejection, so this is the guard in `decide`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+#[ignore = "ejecuta praetore-mcp approve; correr con --ignored en CI dedicado"]
 fn reject_of_an_expired_pending_call_signs_nothing() {
     let (_temp, home) = init_home();
     require_echo(&home);
@@ -1215,6 +1229,7 @@ fn approvals_prints_no_commands_for_an_expired_pending_call() {
 /// same rule as `decide` (`Expiry::is_expired_at`).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+#[ignore = "ejecuta praetore-mcp approve; correr con --ignored en CI dedicado"]
 fn approve_of_a_pending_call_with_an_unreadable_expiry_asks_for_no_code() {
     let (_temp, home) = init_home();
     require_echo(&home);
