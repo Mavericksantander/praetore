@@ -23,11 +23,15 @@ fn example() -> PathBuf {
 }
 
 fn gate_with_example() -> (tempfile::TempDir, Gate) {
+    gate_with_example_in(Mode::Enforce)
+}
+
+fn gate_with_example_in(mode: Mode) -> (tempfile::TempDir, Gate) {
     let temp = tempfile::tempdir().unwrap();
     let home = Home::new(temp.path().join("home"));
     store::init(&home).unwrap();
     fs::copy(example(), home.policy()).unwrap();
-    let gate = Gate::load(&home, Mode::Enforce).unwrap();
+    let gate = Gate::load(&home, mode).unwrap();
     (temp, gate)
 }
 
@@ -119,5 +123,37 @@ fn the_example_policy_needs_the_server_name_and_sets_no_path_condition() {
             "{}: a condition other than the tool name",
             rule.id
         );
+    }
+}
+
+/// What the README says about modes: a write the example denies is blocked
+/// only in enforce mode. In observe (what `install` writes by default) it
+/// is forwarded unchanged, and its receipt records the DENY.
+#[test]
+fn the_example_blocks_a_denied_write_only_in_enforce() {
+    let line = br#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"write_file","arguments":{"path":"/tmp/praetore-example/a.txt","content":"x"}}}
+"#;
+    for mode in [Mode::Enforce, Mode::Observe] {
+        let (_temp, mut gate) = gate_with_example_in(mode);
+        let out = praetore_mcp::proxy::handle_client_line(line, mode, SERVER, &mut gate);
+        match mode {
+            Mode::Enforce => {
+                assert!(out.to_server.is_none(), "enforce forwarded a denied write");
+                let reply: serde_json::Value =
+                    serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
+                assert_eq!(reply["result"]["isError"], true, "{reply}");
+            }
+            Mode::Observe => {
+                assert_eq!(out.to_server.as_deref(), Some(&line[..]));
+                assert!(out.to_client.is_none());
+                assert!(
+                    out.warnings
+                        .iter()
+                        .any(|w| w.contains("would be DENIED by rule deny-write-file")),
+                    "{:?}",
+                    out.warnings
+                );
+            }
+        }
     }
 }
