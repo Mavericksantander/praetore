@@ -1,12 +1,14 @@
 //! The signed receipt of a client line this proxy cannot parse (T-016-B4).
 //!
-//! Every `Unparseable` line that is not refused as a possible `safety*`
-//! call gets one receipt of action type [`UNPARSED_LINE_ACTION_TYPE`], in
-//! both modes, written before the line is forwarded (observe) or refused
-//! with `-32700` (enforce). The policy never declares that type, so the
-//! engine refuses it with its unclassified-action guard: the receipt is a
-//! signed DENY and never says "allow". What happens to the line depends on
-//! the mode only; nothing in this record decides it.
+//! Every `Unparseable` line gets one receipt of action type
+//! [`UNPARSED_LINE_ACTION_TYPE`], in both modes, written before the line is
+//! forwarded (observe) or refused with `-32700` (enforce, and in both modes
+//! a line that may name a `safety*` tool, signed `may_name_safety: true`).
+//! The policy never declares that type, so the engine refuses it with its
+//! unclassified-action guard: the receipt is a signed DENY and never says
+//! "allow". What happens to the line depends on the mode and on
+//! `may_name_safety_tool` only; nothing in this record decides it, and a
+//! receipt that cannot be written changes nothing but the notice.
 
 use crate::gate::Mode;
 use serde_json::{Value, json};
@@ -21,7 +23,9 @@ pub const UNPARSED_LINE_ACTION_TYPE: &str = "mcp.unparsed_line";
 
 /// At most this many tool names read by the tolerant reader are recorded.
 pub const MAX_TOLERANT_TOOLS: usize = 8;
-/// Each recorded tool name is escaped and cut to this many characters.
+/// Of each recorded tool name, the first this many characters are kept,
+/// then escaped (an escape is longer than its character), with `…` added
+/// when the name was cut ([`crate::shown::bounded`]).
 pub const MAX_TOLERANT_TOOL_CHARS: usize = 128;
 
 /// Why the strict parser rejected a line: a closed set, not the parser's
@@ -81,6 +85,10 @@ pub struct UnparsedLine {
     /// Tool names a tolerant reader sees in a `tools/call` ([`tolerant_tools`]).
     /// Recorded only.
     pub tolerant_tools: Vec<String>,
+    /// [`crate::proxy::may_name_safety_tool`]: the line is refused in both
+    /// modes (G7). Signed so the receipt says why an observe line was not
+    /// forwarded.
+    pub may_name_safety: bool,
 }
 
 impl UnparsedLine {
@@ -90,6 +98,7 @@ impl UnparsedLine {
             line_len: raw.len(),
             parse_error: ParseErrorClass::of(raw, reason),
             tolerant_tools: tolerant_tools(raw),
+            may_name_safety: crate::proxy::may_name_safety_tool(raw),
         }
     }
 
@@ -102,6 +111,7 @@ impl UnparsedLine {
             "line_len": self.line_len,
             "parse_error": self.parse_error.as_str(),
             "tolerant_tools": self.tolerant_tools,
+            "may_name_safety": self.may_name_safety,
         })
     }
 }
@@ -492,6 +502,11 @@ mod tests {
         assert_eq!(parameters["line_len"], raw.len(), "{label}");
         assert_eq!(parameters["mode"], mode.as_str(), "{label}");
         assert_eq!(parameters["server"], "fs", "{label}");
+        assert_eq!(
+            parameters["may_name_safety"],
+            crate::proxy::may_name_safety_tool(raw),
+            "{label}"
+        );
         assert_eq!(evidence.decision.outcome, DecisionOutcome::Deny, "{label}");
         assert_eq!(
             evidence.decision.decided_by(),
@@ -611,19 +626,79 @@ mod tests {
         assert_eq!(all[0].action.parameters["parse_error"], "syntax");
     }
 
-    /// G7 does not change: a malformed line that may name a `safety*` tool
-    /// is refused in observe, with no receipt of the new type.
+    /// Lines that may name a `safety*` tool (G7, #220): the JSON5 line
+    /// naming `safety_x` and the duplicate-key line naming `safety:halt`.
+    const SAFETY_NAMED: [&[u8]; 2] = [
+        b"{jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'safety_x',arguments:{}},}\n",
+        br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"safety:halt","name":"x"}}
+"#,
+    ];
+
+    /// A line that may name a `safety*` tool is still refused in both modes,
+    /// and now with one `mcp.unparsed_line` receipt signed with
+    /// `may_name_safety: true`, written before the `-32700`. The journal
+    /// verifies.
     #[test]
-    fn safety_named_unparseable_is_still_refused_in_observe() {
-        let (_temp, home) = home("b4-safety");
-        let mut gate = Gate::load(&home, Mode::Observe).unwrap();
-        let raw = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"safety:halt","name":"x"}}
-"#;
-        let out = handle_client_line(raw, Mode::Observe, "fs", &mut gate);
-        assert!(out.to_server.is_none());
-        let reply: Value = serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
-        assert_eq!(reply["error"]["code"], -32700);
-        assert!(receipts(&home).is_empty());
+    fn safety_named_unparseable_is_refused_with_a_receipt_in_both_modes() {
+        for mode in [Mode::Observe, Mode::Enforce] {
+            for raw in SAFETY_NAMED {
+                let label = format!("{} {}", mode.as_str(), String::from_utf8_lossy(raw));
+                let (_temp, home) = home(&format!("b4-safety-{}", mode.as_str()));
+                let mut gate = Gate::load(&home, mode).unwrap();
+                assert!(crate::proxy::may_name_safety_tool(raw), "{label}");
+                let out = handle_client_line(raw, mode, "fs", &mut gate);
+                assert!(out.to_server.is_none(), "{label}");
+                let reply: Value =
+                    serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
+                assert_eq!(reply["error"]["code"], -32700, "{label}");
+                assert_eq!(out.warnings.len(), 1, "{label}: {:?}", out.warnings);
+                assert!(
+                    out.warnings[0].contains("may name a safety* tool")
+                        && out.warnings[0].contains("signed receipt mcp.unparsed_line"),
+                    "{label}: {:?}",
+                    out.warnings
+                );
+                let written = receipts(&home);
+                assert_eq!(written.len(), 1, "{label}");
+                assert_unparsed_receipt(&written[0], raw, mode, &label);
+                assert_eq!(
+                    written[0].action.parameters["may_name_safety"], true,
+                    "{label}"
+                );
+                assert_journal_verifies(&home);
+            }
+        }
+    }
+
+    /// The refusal of a line that may name a `safety*` tool does not depend
+    /// on its receipt: with the journal down it is refused all the same, in
+    /// both modes, and the notice says the receipt could NOT be written.
+    #[test]
+    fn safety_named_unparseable_is_refused_even_when_its_receipt_cannot_be_written() {
+        for mode in [Mode::Observe, Mode::Enforce] {
+            for raw in SAFETY_NAMED {
+                let label = format!("{} {}", mode.as_str(), String::from_utf8_lossy(raw));
+                let (_temp, home) = home(&format!("b4-safety-down-{}", mode.as_str()));
+                let receipts_dir = home.receipts_dir();
+                let _ = fs::remove_dir_all(&receipts_dir);
+                fs::write(&receipts_dir, b"down\n").unwrap();
+                let mut gate = Gate::load(&home, mode).unwrap();
+                let out = handle_client_line(raw, mode, "fs", &mut gate);
+                assert!(out.to_server.is_none(), "{label}");
+                let reply: Value =
+                    serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
+                assert_eq!(reply["error"]["code"], -32700, "{label}");
+                assert_eq!(out.warnings.len(), 1, "{label}: {:?}", out.warnings);
+                assert!(
+                    out.warnings[0].contains("may name a safety* tool")
+                        && out.warnings[0].contains("receipt mcp.unparsed_line")
+                        && out.warnings[0].contains("could NOT be written"),
+                    "{label}: {:?}",
+                    out.warnings
+                );
+                assert_eq!(fs::read(&receipts_dir).unwrap(), b"down\n", "{label}");
+            }
+        }
     }
 
     /// The journal is down (`receipts` is a file). Observe follows the rule

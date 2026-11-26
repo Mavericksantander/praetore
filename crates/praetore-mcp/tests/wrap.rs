@@ -1324,8 +1324,9 @@ fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
 
 /// Unparseable client lines, end to end in observe: lines the proxy cannot parse are
 /// never forwarded silently. An ordinary tool call with a duplicate key is
-/// forwarded with a warning; an undeclared `safety:halt` with a duplicate
-/// key is refused and never reaches the server.
+/// forwarded with a warning; a `safety:*` call with a duplicate key is
+/// refused and never reaches the server, declared or not. All five get a
+/// receipt.
 #[test]
 fn observe_warns_on_unparseable_lines_and_refuses_unparseable_safety_calls() {
     let (_temp, home) = init_home();
@@ -1369,15 +1370,25 @@ fn observe_warns_on_unparseable_lines_and_refuses_unparseable_safety_calls() {
         })
         .count();
     assert_eq!(refusals, 2, "{responses:?}");
-    // No reading was evaluated. Each of the three forwarded lines has its
-    // mcp.unparsed_line receipt (T-016-B4); the two safety lines have none.
+    // No reading was evaluated. Each of the five lines has its
+    // mcp.unparsed_line receipt (T-016-B4): the three forwarded ones with
+    // may_name_safety false, the two refused safety lines with true.
     let receipts = journal(&home);
-    assert_eq!(receipts.len(), 3, "{stderr}");
+    assert_eq!(receipts.len(), 5, "{stderr}");
     assert!(
         receipts
             .iter()
             .all(|e| e.action.action_type == "mcp.unparsed_line"
                 && e.decision.outcome == praetore_core::DecisionOutcome::Deny),
+        "{receipts:?}"
+    );
+    let flags: Vec<_> = receipts
+        .iter()
+        .map(|e| e.action.parameters["may_name_safety"].clone())
+        .collect();
+    assert_eq!(
+        flags,
+        [false, false, false, true, true].map(serde_json::Value::from),
         "{receipts:?}"
     );
     let report = receipts::verify_journal(&home, None).unwrap();

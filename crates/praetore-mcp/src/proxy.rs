@@ -886,18 +886,22 @@ pub fn handle_client_line(
     let mut out = Outcome::default();
     match classify(raw) {
         Classified::Passthrough => out.to_server = Some(forward_unchanged(raw)),
-        // A line this proxy cannot parse is never forwarded silently: it is
-        // refused if it may name a safety* tool (G7), refused in enforce,
-        // and forwarded in observe with a warning that identifies it.
-        Classified::Unparseable(reason) if may_name_safety_tool(raw) => {
-            refuse_safety_unparseable(&mut out, mode, "an unparseable", &reason, raw);
-        }
-        // Any other unparseable line gets its signed receipt first, in both
-        // modes (T-016-B4). Then the mode alone decides: observe forwards,
-        // enforce refuses, whatever the receipt or its write did.
+        // A line this proxy cannot parse is never forwarded silently. It
+        // gets its signed receipt first, in both modes (T-016-B4). Then the
+        // line alone decides, whatever the receipt or its write did: refused
+        // if it may name a safety* tool (G7, the receipt signs
+        // `may_name_safety: true`), refused in enforce, and forwarded in
+        // observe with a warning that identifies it.
         Classified::Unparseable(reason) => {
             let receipt = evaluator.record_unparsed(server, &UnparsedLine::of(raw, &reason));
             let receipt = unparsed_receipt_note(&receipt);
+            if may_name_safety_tool(raw) {
+                refuse_safety_unparseable(&mut out, mode, "an unparseable", &reason, raw);
+                if let Some(warning) = out.warnings.last_mut() {
+                    warning.push_str(&format!("; {receipt}"));
+                }
+                return out;
+            }
             match mode {
                 Mode::Observe => {
                     out.warnings.push(format!(
