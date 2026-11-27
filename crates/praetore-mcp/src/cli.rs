@@ -49,9 +49,9 @@ Keys created by `init` are LOCAL/DEV keys, including a separate approver
 key. The policy written by `init` has no rules: in enforce mode every
 tools/call is denied until a `policy allow` rule allows it. Observe mode
 records a DENY and forwards the call; it still refuses unclassified calls,
-unparseable lines that may name a safety* tool, lines over 32 MiB and
-batches with a refused call, and, when the home cannot be loaded, every
-tools/call. Enforce mode blocks DENY. A REQUIRE_APPROVAL call is not
+calls whose receipt cannot be written, unparseable lines that may name a
+safety* tool, lines over 32 MiB and batches with a refused call, and, when
+the home cannot be loaded, every tools/call. Enforce mode blocks DENY. A REQUIRE_APPROVAL call is not
 forwarded until someone runs `approve` for that exact call. `approve`
 reads a confirmation from an interactive terminal; that check is
 cooperative (a process that can act as this user can still approve). If
@@ -82,10 +82,12 @@ With no rules, every tools/call is denied by default in enforce mode. Only
 tools/call is evaluated: initialize, tools/list and the rest of the MCP
 traffic pass, so a client can start the server and list its tools. Observe
 mode records a DENY and forwards the call, but it still refuses a tools/call
-the policy does not classify, a client line it cannot parse that may name a
-safety* tool, a client line over 32 MiB, and a whole batch when a tools/call
-in it is refused. When the home cannot be loaded (before init, for example),
-every tools/call and every client line that cannot be parsed is refused.
+the policy does not classify, a tools/call whose receipt cannot be written
+(or that cannot be evaluated): what it cannot record, it does not run. It
+also refuses a client line it cannot parse that may name a safety* tool, a
+client line over 32 MiB, and a whole batch when a tools/call in it is
+refused. When the home cannot be loaded (before init, for example), every
+tools/call and every client line that cannot be parsed is refused.
 Allow tools with
 `praetore-mcp policy allow --id ID --server NAME --tool NAME`.
 
@@ -108,8 +110,9 @@ passed to the server unchanged (including any --help).
   --name SERVER server name used in policy rules and receipts
                 (default: the command's file name)
   --mode MODE   observe (default): record the decision and forward the call;
-                unclassified calls and client lines that cannot be checked
-                are still refused (see `praetore-mcp init --help`)
+                unclassified calls, calls whose receipt cannot be written
+                and client lines that cannot be checked are still refused
+                (see `praetore-mcp init --help`)
                 enforce: block DENY. REQUIRE_APPROVAL is not forwarded until
                 `praetore-mcp approve <id>` for that exact call
   --no-report   do not write the session report (same as `report = false`
@@ -540,8 +543,8 @@ fn cmd_init(args: &[String]) -> Result<i32, String> {
                 "  In enforce mode every tools/call is denied unless a rule allows it. Observe"
             );
             println!("  mode records a DENY and forwards the call, but it still refuses calls the");
-            println!("  policy does not classify and client lines it cannot check (see");
-            println!("  `init --help`). To allow a tool:");
+            println!("  policy does not classify, calls whose receipt cannot be written and");
+            println!("  client lines it cannot check (see `init --help`). To allow a tool:");
             let program = crate::commands::program();
             let dir = dir_suffix(&home);
             println!("    {program} policy allow --id ID --server NAME --tool NAME{dir}");
@@ -1472,4 +1475,36 @@ pub(crate) fn cmd_policy(args: &[String]) -> Result<i32, String> {
     };
     println!("{}", policy::RESTART_REMINDER);
     Ok(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every help text that lists what observe still refuses names a call
+    /// whose receipt cannot be written: observe does not run what it cannot
+    /// record (CHANGELOG, Breaking). Only reads the constants.
+    #[test]
+    fn the_help_lists_an_unrecordable_call_among_what_observe_refuses() {
+        let words = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        for (name, text, phrase) in [
+            (
+                "USAGE",
+                USAGE,
+                "it still refuses unclassified calls, calls whose receipt cannot be written,",
+            ),
+            (
+                "INIT_HELP",
+                INIT_HELP,
+                "a tools/call whose receipt cannot be written (or that cannot be evaluated): what it cannot record, it does not run.",
+            ),
+            (
+                "WRAP_HELP",
+                WRAP_HELP,
+                "unclassified calls, calls whose receipt cannot be written and client lines that cannot be checked are still refused",
+            ),
+        ] {
+            assert!(words(text).contains(phrase), "{name}: {}", words(text));
+        }
+    }
 }
