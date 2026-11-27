@@ -6,8 +6,10 @@
 //! intact, only shorter than the calls that ran. Each test here puts the
 //! journal in a state that stops the next append while every read of it
 //! still works, runs an observe session, and checks that the call did not
-//! run and that the client was told why. The seeded head still verifies:
-//! these tests pin what the proxy does, not what `verify` sees.
+//! run and that the client was told why. The journal still ends at the
+//! seeded head, and `verify` reports the state while it lasts: a FAIL when
+//! `wrap` cannot append at all, a WARNING for a daily file that does not
+//! open for append right now.
 
 use praetore_mcp::store::Home;
 use serde_json::{Value, json};
@@ -194,8 +196,8 @@ fn verify_anchored(home: &Home, head: &str) -> Output {
 /// After `damage` put the journal in a state that stops the next append:
 /// the call is refused, not run, the client is told that no receipt could
 /// be recorded, stderr says REFUSED in observe, and the journal still ends
-/// at the seeded head.
-fn observe_refuses_after(damage: impl FnOnce(&Home)) {
+/// at the seeded head; `verify` against it exits `code` and says `says`.
+fn observe_refuses_after(damage: impl FnOnce(&Home), code: i32, says: &str) {
     let (_temp, home) = init_home();
     let head = seed(&home);
     damage(&home);
@@ -233,21 +235,37 @@ fn observe_refuses_after(damage: impl FnOnce(&Home)) {
     );
 
     // The gap is closed at the proxy. The journal as read is still the one
-    // the seed left, so verify against its head passes: that is what makes
-    // forwarding without the receipt invisible, and why the proxy refuses.
-    let out = verify_anchored(&home, &head);
-    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    // the seed left (the head matches); `verify` also sees that `wrap`
+    // cannot append to it, while the journal stays that way.
+    assert_verify_sees_the_state(&home, &head, code, says);
 }
+
+/// `verify` against the seeded head: the head still matches, and the
+/// journal state is reported with exit `code` and the text `says`.
+fn assert_verify_sees_the_state(home: &Home, head: &str, code: i32, says: &str) {
+    let out = verify_anchored(home, head);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(code), "{text}");
+    assert!(text.contains(says), "{text}");
+    assert!(!text.contains("does not match the expected head"), "{text}");
+}
+
+const CANNOT_APPEND: &str = "FAIL journal: wrap cannot append the next receipt";
+const NOT_RIGHT_NOW: &str = "WARNING journal: the next receipt cannot be appended right now";
 
 /// (a) One blank line after the last receipt. `verify` skips blank lines;
 /// the writer reads the last line back and finds nothing to chain from.
 #[test]
 fn a_blank_last_line_refuses_calls_in_observe() {
-    observe_refuses_after(|home| {
-        let path = daily_file(home);
-        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
-        file.write_all(b"\n").unwrap();
-    });
+    observe_refuses_after(
+        |home| {
+            let path = daily_file(home);
+            let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+            file.write_all(b"\n").unwrap();
+        },
+        1,
+        CANNOT_APPEND,
+    );
 }
 
 /// (b) `receipts/` moved aside and replaced by a symlink to it. Reads
@@ -255,12 +273,16 @@ fn a_blank_last_line_refuses_calls_in_observe() {
 #[cfg(unix)]
 #[test]
 fn a_symlinked_receipts_dir_refuses_calls_in_observe() {
-    observe_refuses_after(|home| {
-        let dir = home.receipts_dir();
-        let real = home.root.join("receipts.real");
-        fs::rename(&dir, &real).unwrap();
-        std::os::unix::fs::symlink("receipts.real", &dir).unwrap();
-    });
+    observe_refuses_after(
+        |home| {
+            let dir = home.receipts_dir();
+            let real = home.root.join("receipts.real");
+            fs::rename(&dir, &real).unwrap();
+            std::os::unix::fs::symlink("receipts.real", &dir).unwrap();
+        },
+        1,
+        CANNOT_APPEND,
+    );
 }
 
 /// (c) The daily file made read-only. Reads work; the append fails. Root
@@ -273,11 +295,15 @@ fn a_read_only_daily_file_refuses_calls_in_observe() {
         eprintln!("skipped: running as root, file modes are not enforced");
         return;
     }
-    observe_refuses_after(|home| {
-        use std::os::unix::fs::PermissionsExt;
-        let path = daily_file(home);
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
-    });
+    observe_refuses_after(
+        |home| {
+            use std::os::unix::fs::PermissionsExt;
+            let path = daily_file(home);
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        },
+        0,
+        NOT_RIGHT_NOW,
+    );
 }
 
 /// (d) The journal lock held by another process past its timeout, the
@@ -361,8 +387,7 @@ fn an_ambiguous_line_is_refused_in_observe_when_its_receipt_cannot_be_written() 
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert_eq!(by_id(&replies, 3)["result"]["isError"], true, "{replies:?}");
-    let out = verify_anchored(&home, &head);
-    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert_verify_sees_the_state(&home, &head, 1, CANNOT_APPEND);
 }
 
 /// Rewrites the home's authority with a validity that ended a minute ago,
