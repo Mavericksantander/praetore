@@ -735,6 +735,8 @@ Read these before relying on anything above.
    have decided, labeled `praetore.mode: observe` in the signed receipt, and
    forwards the call. Use it to try a policy, not to stop calls. It still
    refuses, as enforce does: a `tools/call` the policy does not classify, a
+   `tools/call` whose receipt cannot be written or that cannot be evaluated
+   (what it cannot record, it does not run; see Troubleshooting), a
    client line it cannot parse that may name a `safety*` tool, a client
    line over 32 MiB (the client gets a JSON-RPC error, `-32600` with the id
    when the kept prefix contains it, otherwise `-32700` with id null), and a
@@ -778,8 +780,8 @@ Read these before relying on anything above.
 | `another praetore-mcp policy command is running (lock …)` | A previous `policy` command was interrupted | If no other `policy` command is running, delete `~/.praetore/mcp/policy.json.lock`. |
 | `verify` prints `FAIL` | A journal line was edited, or the trust files do not match the keys that signed it | Do not trust that receipt. Check that `--dir` is the home that wrote it. Re-labeling observe as enforce is detected on purpose. |
 | `verify` prints `FAIL ... journal order` | An entry was removed, duplicated or reordered, or a daily file is missing | Do not trust the journal as complete. Compare with a copy or a head kept elsewhere (`verify --expected-head HEX`). |
-| Tool calls take 10 s and then fail with `still held by another process`, in both modes | Another process of the same user holds `receipts/.journal.lock`. Each receipt is appended under an exclusive `flock` that waits at most 10 s, and the call is decided only after its receipt is written | Enforce refuses the call and observe warns that the receipt could not be written. Find the holder (`lsof receipts/.journal.lock` or `fuser` on Linux) and stop it. Do not delete the lock file while a wrapper may be appending. |
-| Every call is refused in enforce with `does not end with a newline` | The last journal line is incomplete (an interrupted write, a full disk) | Run `praetore-mcp verify`, keep a copy of the journal, and remove the incomplete last line by hand. |
+| Tool calls take 10 s and then fail with `still held by another process`, in both modes | Another process of the same user holds `receipts/.journal.lock`. Each receipt is appended under an exclusive `flock` that waits at most 10 s, and the call is decided only after its receipt is written | Both modes refuse the call: no receipt could be written for it. Find the holder (`lsof receipts/.journal.lock` or `fuser` on Linux) and stop it. Do not delete the lock file while a wrapper may be appending. |
+| Every call is refused, in both modes, with `does not end with a newline` or `is unreadable` | The last journal line is incomplete (an interrupted write, a full disk) | Run `praetore-mcp verify`, keep a copy of the journal, and remove the incomplete last line by hand. |
 | About a year after `init`, every call is refused in enforce mode | The authority from `init` is valid for 364 days | Run `init` in a new `--dir` and `install` again. |
 
 Where to look:
