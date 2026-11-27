@@ -922,3 +922,266 @@ fn state_warnings_reach_the_user_as_a_system_message() {
     assert_eq!(with_warnings(None, &[]), None);
     assert_eq!(with_warnings(Some(decided.clone()), &[]), Some(decided));
 }
+
+/// The hook state directory holds the agent and attester private keys, with
+/// which anyone can sign receipts that `verify` accepts. No profile reads
+/// under it, the main session included, through any read tool, as written
+/// or through a symlink: the binary's `state_read` guard holds the call
+/// (signed as `unregistered`, naming the requested profile) and the default
+/// policy denies it on its own (`deny-state-reads`).
+#[test]
+fn nobody_reads_under_the_hook_state_directory() {
+    let p = Project::new("state-reads");
+    let state = p.state.display().to_string();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&p.state, p.root.join("state-link")).unwrap();
+    let mut inputs = vec![
+        (
+            "Read",
+            json!({ "file_path": format!("{state}/attester.key") }),
+        ),
+        (
+            "Read",
+            json!({ "file_path": format!("{state}/agents/main.key") }),
+        ),
+        (
+            "Read",
+            json!({ "file_path": format!("{state}/receipts.jsonl") }),
+        ),
+        (
+            "Read",
+            json!({ "file_path": p.path(".claude/praetore/attester.key") }),
+        ),
+        (
+            "Grep",
+            json!({ "pattern": "[0-9a-f]{64}", "path": state.clone(), "output_mode": "content" }),
+        ),
+        (
+            "Glob",
+            json!({ "pattern": "**/*.key", "path": state.clone() }),
+        ),
+    ];
+    #[cfg(unix)]
+    inputs.push((
+        "Read",
+        json!({ "file_path": p.path("state-link/attester.key") }),
+    ));
+    for agent in [None, Some("explorer"), Some("coder"), Some("web-fetch")] {
+        for (tool, input) in &inputs {
+            let verdict = p.tool(agent, tool, input.clone());
+            assert_eq!(
+                verdict.outcome,
+                DecisionOutcome::Deny,
+                "{agent:?} {tool} {input}"
+            );
+            let context = last_context(&p);
+            assert_eq!(
+                context["praetore.hook_guard"], STATE_READ_GUARD,
+                "{context}"
+            );
+            assert_eq!(
+                context["praetore.requested_profile"],
+                agent.unwrap_or(MAIN_AGENT),
+                "{context}"
+            );
+            assert_eq!(context["profile"], UNREGISTERED, "{context}");
+            assert_eq!(
+                hook_output(&verdict).unwrap()["hookSpecificOutput"]["permissionDecision"],
+                "deny"
+            );
+        }
+    }
+    // The receipts of a main-session denial verify: the state-read guard is
+    // the one guard that may name `main` as the requested profile.
+    verify_receipts(&p.state).unwrap();
+    // Reads next to the state directory are unaffected.
+    let verdict = p.tool(
+        None,
+        "Read",
+        json!({ "file_path": p.path(".claude/settings.json") }),
+    );
+    assert_eq!(verdict.outcome, DecisionOutcome::Allow, "{verdict:?}");
+    let verdict = p.tool(
+        Some("explorer"),
+        "Read",
+        json!({ "file_path": p.path("src/lib.rs") }),
+    );
+    assert_eq!(verdict.outcome, DecisionOutcome::Allow, "{verdict:?}");
+}
+
+/// The policy denies subagent state reads by itself, without the binary's
+/// guard: `deny-state-reads` names every profile except `main`, which only
+/// the guard holds (a restrictive read rule without a profile condition
+/// would also deny `main` every path that does not resolve to itself).
+#[test]
+fn the_default_policy_denies_state_reads_without_the_guard() {
+    let p = Project::new("state-policy");
+    let policy = load_policy(&p.state).unwrap();
+    let state = p.state.display().to_string();
+    let rule = policy
+        .rules
+        .iter()
+        .find(|rule| rule.id == "deny-state-reads")
+        .expect("deny-state-reads rule");
+    assert_eq!(rule.action_type, "claude:read");
+    assert_eq!(rule.effect, PolicyEffect::Deny);
+    assert_eq!(rule.parameter_conditions.len(), 1);
+    assert_eq!(rule.parameter_conditions[0].key, "path");
+    assert_eq!(rule.parameter_conditions[0].expected, json!(state));
+    assert_eq!(rule.context_conditions.len(), 1, "{rule:?}");
+    assert_eq!(rule.context_conditions[0].key, "profile");
+    let named: Vec<&str> = rule.context_conditions[0]
+        .expected
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|name| name.as_str().unwrap())
+        .collect();
+    for (name, _) in PROFILES {
+        assert_eq!(named.contains(&name), name != MAIN_AGENT, "{name}");
+    }
+    assert!(
+        rule.parameter_conditions[0].operator == praetore_core::MatchOperator::PathPrefix,
+        "{:?}",
+        rule.parameter_conditions[0].operator
+    );
+}
+
+/// A read tool whose path parameter is absent or not a string fails closed,
+/// as a write does; it never falls back to the working directory. `Grep` and
+/// `Glob` without `path` search the working directory, which is what the
+/// tools do, but a `path` of another type fails closed too.
+#[test]
+fn a_read_without_a_string_path_is_denied() {
+    let p = Project::new("missing-read-path");
+    for agent in [None, Some("explorer")] {
+        for (tool, input) in [
+            ("Read", json!({})),
+            ("Read", json!({ "file_path": ["/etc/passwd"] })),
+            ("Read", json!({ "file_path": 7 })),
+            ("Read", json!({ "path": p.path("src/a.rs") })),
+            ("Read", json!("x")),
+            ("Grep", json!({ "pattern": "x", "path": 7 })),
+            ("Glob", json!({ "pattern": "**/*", "path": ["/etc"] })),
+            ("Glob", json!([])),
+        ] {
+            let verdict = p.tool(agent, tool, input.clone());
+            assert_eq!(
+                verdict.outcome,
+                DecisionOutcome::Deny,
+                "{agent:?} {tool} {input}"
+            );
+            let context = last_context(&p);
+            assert_eq!(
+                context["praetore.path_check"]["status"], "missing",
+                "{context}"
+            );
+        }
+        // Without a path, Grep and Glob search the working directory.
+        for tool in ["Grep", "Glob"] {
+            let verdict = p.tool(agent, tool, json!({ "pattern": "x" }));
+            assert_eq!(verdict.outcome, DecisionOutcome::Allow, "{agent:?} {tool}");
+        }
+    }
+    // Without a working directory either, there is nothing to search.
+    let mut input = p.event(Some("explorer"), "Grep", json!({ "pattern": "x" }));
+    input.cwd = None;
+    assert_eq!(
+        authorize(&p.state, &input).unwrap().outcome,
+        DecisionOutcome::Deny
+    );
+}
+
+/// A command tool whose `command` is absent or not a string is unanalyzable,
+/// not an empty command: the main session is denied under the unanalyzable
+/// rule.
+#[test]
+fn a_command_without_a_string_command_is_unanalyzable() {
+    let p = Project::new("missing-command");
+    for (tool, input) in [
+        ("Bash", json!({})),
+        ("Bash", json!({ "command": 5 })),
+        ("Bash", json!({ "command": ["git", "push"] })),
+        ("Bash", json!([])),
+        ("Monitor", json!({ "url": "ws://x" })),
+    ] {
+        let verdict = p.tool(None, tool, input.clone());
+        assert_eq!(
+            verdict.outcome,
+            DecisionOutcome::Deny,
+            "{tool} {input}: {verdict:?}"
+        );
+        assert_eq!(
+            verdict.rule.as_deref(),
+            Some(UNANALYZABLE_RULE),
+            "{tool} {input}"
+        );
+    }
+}
+
+/// An unquoted brace expansion or glob is a value the shell computes: in
+/// command position or as a git subcommand the command is unanalyzable, and
+/// anywhere else the word counts as leaving the root. `rm -rf .cl{a,}ude`
+/// therefore ends where `rm -rf .claude` does: held for approval.
+#[test]
+fn brace_expansions_and_globs_cannot_hide_a_path_or_a_push() {
+    let p = Project::new("braces");
+    for (command, rule) in [
+        ("rm -rf .claude", "approval-command-touches-protected-path"),
+        ("rm -rf .cl{a,}ude", "approval-command-leaves-root"),
+        (
+            "echo '{}' | tee .cl{a,}ude/settings.local.json",
+            "approval-command-leaves-root",
+        ),
+        ("cat .claud?/settings.json", "approval-command-leaves-root"),
+        (
+            "cat .cl[a]ude/settings.json",
+            "approval-command-leaves-root",
+        ),
+        ("ls *.rs", "approval-command-leaves-root"),
+    ] {
+        let verdict = p.bash(None, command);
+        assert_eq!(
+            verdict.outcome,
+            DecisionOutcome::RequireApproval,
+            "{command}: {verdict:?}"
+        );
+        assert_eq!(verdict.rule.as_deref(), Some(rule), "{command}");
+    }
+    for command in [
+        "{git,push,origin,main}",
+        "git pu{s,}sh",
+        "echo push | xargs git",
+        "env -S 'git push'",
+        "GIT_CONFIG_PARAMETERS=\"'alias.p=push'\" git p",
+        "X=push git --config-env=alias.p=X p",
+    ] {
+        let verdict = p.bash(None, command);
+        assert_eq!(
+            verdict.outcome,
+            DecisionOutcome::Deny,
+            "{command}: {verdict:?}"
+        );
+        assert_eq!(
+            verdict.rule.as_deref(),
+            Some(UNANALYZABLE_RULE),
+            "{command}"
+        );
+    }
+    for command in ["git-push origin main", "/usr/libexec/git-core/git-push"] {
+        let verdict = p.bash(None, command);
+        assert_eq!(
+            verdict.outcome,
+            DecisionOutcome::RequireApproval,
+            "{command}: {verdict:?}"
+        );
+        assert_eq!(
+            verdict.rule.as_deref(),
+            Some("approval-git-push"),
+            "{command}"
+        );
+    }
+    // Quoted, the same characters are literal and the path is inside the root.
+    let verdict = p.bash(None, "cat 'src/{a,b}.rs' src/\\*.rs");
+    assert_eq!(verdict.outcome, DecisionOutcome::Allow, "{verdict:?}");
+}

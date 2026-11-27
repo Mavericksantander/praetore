@@ -6,14 +6,19 @@
 //! (arguments, option values after `=`, redirection targets), which the hook
 //! resolves against the project root. It never executes or expands anything.
 //! Whatever it cannot reason about lexically (command substitution, process
-//! substitution, heredocs, `eval`, a shell's `-c`, a variable in command
-//! position or next to `push`, an inline git alias) makes the command
-//! unanalyzable, which the policy denies. False positives such as
-//! `echo git push` or `echo curl` are accepted.
+//! substitution, heredocs, `eval`, a shell's `-c`, `xargs`, `env -S`, a
+//! variable in command position or next to `push`, a git alias or git
+//! configuration given inline or through the environment) makes the command
+//! unanalyzable, which the policy denies. An unquoted word the shell expands
+//! before running (a `$` expansion, a brace expansion `{a,b}`, a glob) has
+//! an unknown value: it is unanalyzable in command position or as a git
+//! subcommand, and counts as a path outside the root anywhere else (see
+//! [`PathWord::dynamic`]). False positives such as `echo git push` or
+//! `echo curl` are accepted.
 //!
 //! This is defense in depth, not a security boundary: a script, a Makefile,
-//! an alias or function defined elsewhere, a glob, or an encoded payload
-//! decoded by an allowed program does what the command text does not say.
+//! an alias or function defined elsewhere, or an encoded payload decoded by
+//! an allowed program does what the command text does not say.
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Scan {
@@ -34,7 +39,8 @@ pub struct Analysis {
 #[derive(Debug, PartialEq, Eq)]
 pub struct PathWord {
     pub text: String,
-    /// Contains a `$` expansion: its value is unknown.
+    /// The shell expands it before running (a `$` expansion, or an unquoted
+    /// brace expansion or glob): its value is unknown.
     pub dynamic: bool,
     /// The word in command position (a program run by path). The hook does
     /// not count a program outside the project, such as `/usr/bin/git`, as
@@ -45,13 +51,34 @@ pub struct PathWord {
 #[derive(Debug, Default)]
 struct Word {
     text: String,
-    /// Contains an unquoted or double-quoted `$` expansion.
+    /// Contains an unquoted or double-quoted `$` expansion, or an unquoted
+    /// brace expansion or glob (see [`expands`]).
     dynamic: bool,
     /// The first word after a `<` or `>` redirection operator.
     redirect: bool,
+    /// The characters written outside quotes and without a backslash: the
+    /// ones the shell may expand.
+    unquoted: String,
 }
 
 const SHELLS: [&str; 6] = ["sh", "bash", "zsh", "dash", "ksh", "fish"];
+/// Environment variables that change what `git` runs for a subcommand: its
+/// configuration (`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`/`_KEY_n`/
+/// `_VALUE_n`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, ... all under the
+/// `GIT_CONFIG` prefix), the repository whose configuration it reads, where
+/// it finds its subcommand binaries, and the home and XDG directories whose
+/// configuration files it loads. An alias set through any of them turns an
+/// innocent subcommand into `push`. An assignment to one of them in a
+/// segment that runs git is unanalyzable.
+const GIT_ENVIRONMENT: [&str; 7] = [
+    "GIT_CONFIG",
+    "GIT_DIR",
+    "GIT_COMMON_DIR",
+    "GIT_EXEC_PATH",
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "PATH",
+];
 /// Common programs that open network connections. Matched by basename on
 /// any word, so `sudo curl` and `xargs wget` count too.
 pub const NETWORK_TOOLS: [&str; 9] = [
@@ -144,21 +171,53 @@ fn scan_segment(words: &[Word]) -> Result<bool, &'static str> {
         if SHELLS.contains(&name) && words[index + 1..].iter().any(|w| runs_a_string(&w.text)) {
             return Err("shell -c");
         }
+        // `xargs` builds a command from its input; `env -S` splits one
+        // argument into a command line. Neither is visible here.
+        if name == "xargs" {
+            return Err("xargs");
+        }
+        if name == "env" && words[index + 1..].iter().any(|w| splits_a_string(&w.text)) {
+            return Err("env -S");
+        }
+    }
+    // A segment that runs git with its configuration, repository, binaries
+    // or home taken from an assignment (`GIT_CONFIG_PARAMETERS=... git p`,
+    // `env HOME=/x git p`) may be running an alias.
+    let runs_git = words.iter().any(|w| git_subcommand_of(&w.text).is_some());
+    if runs_git
+        && words.iter().any(|w| {
+            is_assignment(&w.text)
+                && w.text.split_once('=').is_some_and(|(name, _)| {
+                    GIT_ENVIRONMENT
+                        .iter()
+                        .any(|v| name == *v || (*v == "GIT_CONFIG" && name.starts_with(v)))
+                })
+        })
+    {
+        return Err("git configuration from the environment");
     }
     let mut git_push = false;
     for (index, word) in words.iter().enumerate() {
-        if basename(&word.text) != "git" {
+        let Some(subcommand) = git_subcommand_of(&word.text) else {
+            continue;
+        };
+        // `git-push` (the subcommand binary, run by name or by path).
+        if let Some(subcommand) = subcommand {
+            git_push |= subcommand == "push";
             continue;
         }
         let mut rest = words[index + 1..].iter();
         while let Some(next) = rest.next() {
+            // An alias in any global option or its value: `-c alias.p=push`,
+            // `--config-env=alias.p=VAR`, `--config-env alias.p=VAR`.
+            if next.text.contains("alias.") {
+                return Err("inline git alias");
+            }
             if GIT_OPTIONS_WITH_VALUE.contains(&next.text.as_str()) {
                 let value = rest.next().ok_or("git option without value")?;
-                if next.text == "-c" && value.text.contains("alias.") {
+                if value.text.contains("alias.") {
                     return Err("inline git alias");
                 }
-            } else if next.text.starts_with("-c") && next.text.contains("alias.") {
-                return Err("inline git alias");
             } else if next.text.starts_with('-') {
                 continue;
             } else {
@@ -171,6 +230,47 @@ fn scan_segment(words: &[Word]) -> Result<bool, &'static str> {
         }
     }
     Ok(git_push)
+}
+
+/// `Some(None)` for a word that runs `git`, `Some(Some(sub))` for a word that
+/// runs the subcommand binary `git-<sub>` directly, `None` otherwise.
+fn git_subcommand_of(word: &str) -> Option<Option<&str>> {
+    let name = basename(word);
+    if name == "git" {
+        return Some(None);
+    }
+    name.strip_prefix("git-")
+        .filter(|sub| !sub.is_empty())
+        .map(Some)
+}
+
+/// Whether an `env` argument splits a string into a command line: `-S` alone
+/// or in a group of short options, or `--split-string`.
+fn splits_a_string(argument: &str) -> bool {
+    match argument.strip_prefix('-') {
+        Some(long) if long.starts_with('-') => {
+            long == "-split-string" || long.starts_with("-split-string=")
+        }
+        Some(short) => short.contains('S'),
+        None => false,
+    }
+}
+
+/// Whether the shell expands the unquoted part of a word before running it:
+/// a brace expansion (`{a,b}`, `{1..3}`) or a glob (`*`, `?`, `[...]`). A
+/// lone `{}` (xargs, find) and a lone `[` (test) do not expand.
+fn expands(unquoted: &str) -> bool {
+    if unquoted.contains(['*', '?']) {
+        return true;
+    }
+    let bracket = unquoted
+        .split_once('[')
+        .is_some_and(|(_, rest)| rest.contains(']'));
+    let brace = unquoted
+        .split_once('{')
+        .and_then(|(_, rest)| rest.rsplit_once('}'))
+        .is_some_and(|(inside, _)| inside.contains(',') || inside.contains(".."));
+    bracket || brace
 }
 
 /// Splits a command into segments of words. Quotes and backslashes are
@@ -191,7 +291,9 @@ fn split(command: &str) -> Result<Vec<Vec<Word>>, &'static str> {
     }
 
     fn finish(word: &mut Option<Word>, segments: &mut [Vec<Word>]) {
-        if let Some(word) = word.take() {
+        if let Some(mut word) = word.take() {
+            // What the shell would expand has an unknown value, like `$VAR`.
+            word.dynamic |= expands(&word.unquoted);
             segments
                 .last_mut()
                 .expect("at least one segment")
@@ -274,7 +376,11 @@ fn split(command: &str) -> Result<Vec<Vec<Word>>, &'static str> {
                 redirect = false;
             }
             c if c.is_whitespace() => finish(&mut word, &mut segments),
-            c => begin(&mut word, &mut redirect).text.push(c),
+            c => {
+                let current = begin(&mut word, &mut redirect);
+                current.text.push(c);
+                current.unquoted.push(c);
+            }
         }
     }
     finish(&mut word, &mut segments);
@@ -329,8 +435,13 @@ mod tests {
             "g\\it pu\\sh",
             "\"git\" \"push\"",
             "git push > out.log 2>&1",
-            "xargs -I {} git push",
             "echo git push",
+            // The subcommand binary, by name or by path.
+            "git-push origin main",
+            "/usr/libexec/git-core/git-push origin main",
+            // A lone `[` (test) or `{}` (find) is not an expansion.
+            "[ -f x ] && git push",
+            "find . -name x -exec echo {} \\; ; git push",
         ] {
             assert!(push(command), "{command:?} should be detected");
         }
@@ -347,6 +458,10 @@ mod tests {
             "ls # git push",
             "git -C push status",
             "echo $HOME",
+            // git environment without git in the segment, and globs away
+            // from git, are analyzable.
+            "HOME=/tmp cargo test",
+            "ls *.rs; git status",
         ] {
             assert!(!push(command), "{command:?} should not be detected");
         }
@@ -375,6 +490,31 @@ mod tests {
             "cat <<EOF | sh\ngit push\nEOF",
             "diff <(git log) x",
             "git -c alias.p=push p",
+            // An alias through the environment or --config-env.
+            "GIT_CONFIG_PARAMETERS=\"'alias.p=push'\" git p",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p GIT_CONFIG_VALUE_0=push git p",
+            "GIT_CONFIG_GLOBAL=/tmp/cfg git p",
+            "HOME=/tmp git p",
+            "XDG_CONFIG_HOME=/tmp git p",
+            "GIT_DIR=/tmp/repo git p",
+            "GIT_EXEC_PATH=/tmp git p",
+            "PATH=/tmp:/usr/bin git p",
+            "env HOME=/tmp git p",
+            "X=push git --config-env=alias.p=X p",
+            "X=push git --config-env alias.p=X p",
+            // A command built by another program.
+            "echo push | xargs git",
+            "xargs -I {} git push",
+            "env -S 'git push'",
+            "env -iS 'git push'",
+            "env --split-string='git push'",
+            // Brace expansion and globs the shell resolves before running.
+            "{git,push,origin,main}",
+            "git pu{s,}sh",
+            "git pu{s..s}h",
+            "git pus?",
+            "git pus[h]",
+            "*it push",
             "echo 'unterminated",
             "trailing\\",
         ] {
@@ -383,6 +523,52 @@ mod tests {
                 "{command:?} should be unanalyzable"
             );
         }
+    }
+
+    /// An unquoted brace expansion or glob has an unknown value, like `$VAR`:
+    /// the hook then counts the word as leaving the root. Quoted or escaped,
+    /// it is literal.
+    #[test]
+    fn brace_expansions_and_globs_are_dynamic_words() {
+        let dynamic = |command: &str| -> Vec<(String, bool)> {
+            analysis(command)
+                .paths
+                .into_iter()
+                .map(|p| (p.text, p.dynamic))
+                .collect()
+        };
+        assert_eq!(
+            dynamic("rm -rf .cl{a,}ude"),
+            [("rm".to_string(), false), (".cl{a,}ude".to_string(), true)]
+        );
+        assert_eq!(
+            dynamic("cat .claud?/x *.rs src/[ab].rs"),
+            [
+                ("cat".to_string(), false),
+                (".claud?/x".to_string(), true),
+                ("*.rs".to_string(), true),
+                ("src/[ab].rs".to_string(), true),
+            ]
+        );
+        assert_eq!(
+            dynamic("echo {1..3} '{a,b}' \"*\" \\*"),
+            [
+                ("echo".to_string(), false),
+                ("{1..3}".to_string(), true),
+                ("{a,b}".to_string(), false),
+                ("*".to_string(), false),
+                ("*".to_string(), false),
+            ]
+        );
+        assert_eq!(
+            dynamic("xargs_like -I {} [ ]"),
+            [
+                ("xargs_like".to_string(), false),
+                ("{}".to_string(), false),
+                ("[".to_string(), false),
+                ("]".to_string(), false),
+            ]
+        );
     }
 
     fn analysis(command: &str) -> Analysis {
@@ -398,7 +584,7 @@ mod tests {
             "curl https://x.test",
             "cd x && wget -q https://x.test",
             "sudo /usr/bin/nc host 80",
-            "ls | xargs scp host:x",
+            "ls | scp host:x",
             "ssh host",
             "rsync -a . host:x",
             "echo curl",

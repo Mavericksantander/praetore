@@ -103,7 +103,7 @@ agente haga por otro camino queda fuera (ver Límites).
   `unanalyzable_command, use simple commands`. Una negación de un guard del
   hook (ver [`Bash` y `process:execute`](#bash-y-processexecute)) toma su
   clase de `praetore.hook_guard`, firmado: `exec_reserved_to_main` es
-  `capability`; `client_config_write`, `governance_write`,
+  `capability`; `state_read`, `client_config_write`, `governance_write`,
   `path_check_failed` y `no_project_root` son `path`. Un `RequireApproval` muestra
   la regla, el motivo y también `(evidence ...)`. La policy por defecto declara `Mission`
   los tipos `claude:*` y ninguna acción `Safety`.
@@ -179,6 +179,16 @@ Reglas de la policy por defecto:
   ruta ya resuelta (un symlink que sale de la raíz no cuenta como dentro). La
   sesión principal además lee en cualquier lugar y escribe en
   `~/.claude/projects` y `/private/tmp`.
+- Nadie lee bajo el directorio de estado del hook (el directorio dado a
+  `init`): guarda las claves privadas de los perfiles y del atestador, con
+  las que cualquiera firma recibos que `verify` acepta, y `receipts.jsonl`,
+  con los comandos de `main`. La regla `deny-state-reads` niega la lectura
+  (Read, Grep, Glob) a todo perfil salvo `main`; a `main` lo retiene el guard
+  `state_read` del binario (ver abajo), que cubre también a los subagentes
+  aunque la policy no tenga la regla. La regla no incluye a `main` porque una
+  regla restrictiva de ruta sin condición de perfil coincide también con toda
+  ruta que no se resuelve a sí misma, y `main` puede leer esas rutas en otros
+  lugares (`allow-read-main`).
 
 ### Resolución de rutas
 
@@ -208,15 +218,32 @@ existente, para que `coder` pueda crear directorios nuevos.
 [`src/shell.rs`](src/shell.rs) separa el comando en comandos simples
 (`;`, `&&`, `||`, `|`, `&`, saltos de línea, paréntesis y redirecciones),
 quita comillas y escapes, y busca una palabra `git` cuyo subcomando sea
-`push`, saltando las opciones globales (`-C`, `-c`, `--git-dir`, ...).
-Detecta `cd x && git push`, `sudo git push`, `/usr/bin/git push` y
-`git -C ../repo push`. Nunca ejecuta ni expande nada.
+`push`, saltando las opciones globales (`-C`, `-c`, `--git-dir`, ...), o una
+palabra `git-push` (el binario del subcomando, por nombre o por ruta).
+Detecta `cd x && git push`, `sudo git push`, `/usr/bin/git push`,
+`git -C ../repo push` y `/usr/libexec/git-core/git-push`. Nunca ejecuta ni
+expande nada.
 
 Si el comando contiene algo que no puede analizar léxicamente, lo marca como
 no analizable y la policy lo niega: sustitución de comandos (`$(...)`,
 backticks), sustitución de procesos, heredocs, `eval`, `sh -c` / `bash -c`,
-una variable en posición de comando o junto a `push`, o un alias inline
-(`git -c alias.x=push x`). Acepta falsos positivos como `echo git push`.
+`xargs`, `env -S`, una variable en posición de comando o junto a `push`, un
+alias en cualquier opción global de git o en su valor (`git -c alias.x=push x`,
+`git --config-env=alias.x=VAR x`), o una asignación, en el mismo comando
+simple que `git`, de una variable que cambia su configuración, su
+repositorio, sus binarios o su home (`GIT_CONFIG*`, `GIT_DIR`,
+`GIT_COMMON_DIR`, `GIT_EXEC_PATH`, `HOME`, `XDG_CONFIG_HOME`, `PATH`), con
+las que un alias convierte otro subcomando en `push`.
+
+Una palabra sin comillas que el shell expande antes de correr (`$VAR`, una
+expansión de llaves `{a,b}` o `{1..3}`, un glob `*`, `?`, `[ab]`) tiene valor
+desconocido: en posición de comando o como subcomando de git el comando es no
+analizable (`{git,push}`, `git pu{s,}sh`); en cualquier otra posición cuenta
+como ruta fuera de la raíz (ver abajo), así que `rm -rf .cl{a,}ude` termina
+igual que `rm -rf .claude`: retenido para aprobación. Un `{}` solo (xargs,
+find) o un `[` solo (test) no expanden; entre comillas o con barra invertida
+los mismos caracteres son literales. Acepta falsos positivos como
+`echo git push` o `ls *.rs`.
 
 ### `Bash` y `process:execute`
 
@@ -302,10 +329,23 @@ paralelo (dos subagentes a la vez) todavía pueden completarlo; el escaneo de
 que falta en todos los casos es que `main` corra `git` en ese directorio:
 otro caso de ejecución indirecta.
 
-**Escrituras sin ruta.** Una herramienta de escritura sin su parámetro de
-ruta (por ejemplo NotebookEdit con `file_path` en vez de `notebook_path`) se
-niega, y el motivo lo dice (`praetore.path_check` con estado `missing` en el
-contexto firmado).
+**Herramientas sin ruta.** Una herramienta de ruta sin su parámetro como
+string (ausente, de otro tipo JSON, con otro nombre como NotebookEdit con
+`file_path` en vez de `notebook_path`, o un `tool_input` que no es un objeto)
+se niega a todo perfil, `main` incluido, y el motivo lo dice
+(`praetore.path_check` con estado `missing` en el contexto firmado). `Read`
+nunca cae al directorio de trabajo; `Grep` y `Glob` sin `path` buscan en el
+`cwd` que manda Claude Code, que es lo que hacen esas herramientas, pero un
+`path` de otro tipo se niega. Un `Bash` o `Monitor` sin `command` string es
+no analizable (`deny-unanalyzable-command`), no un comando vacío.
+
+**Lecturas del estado.** Un `Read`, `Grep` o `Glob` cuya ruta (como se
+escribió o ya resuelta, por ejemplo a través de un symlink) cae bajo el
+directorio de estado se niega a todo perfil con el guard `state_read`, además
+de la regla `deny-state-reads` de la policy para los subagentes. Es el único
+guard, junto con `path_check_failed` en una lectura, que también retiene a
+`main`: su recibo nombra `main` como perfil pedido, y `verify` y
+`check-attribution.py` lo aceptan solo con esos guards.
 
 **Ejecución indirecta.** Lo que escribe un subagente lo puede ejecutar
 después la sesión principal: `build.rs`, un test, un script de
@@ -336,10 +376,10 @@ los dos casos se evalúan como `unregistered`, con recibo firmado. El motivo
 que firma el motor es la capacidad que le falta a `unregistered` (por ejemplo
 `authority does not permit capability: fs:write`); por qué se llegó ahí lo
 dicen dos campos del contexto firmado: `praetore.hook_guard`
-(`exec_reserved_to_main`, `client_config_write`, `governance_write`,
-`path_check_failed` o `no_project_root`) y `praetore.requested_profile`, el
-perfil que la llamada habría tenido. `check-attribution.py` (en `verify.sh`)
-exige que vengan juntos, en un Deny firmado como `unregistered`, con un
+(`exec_reserved_to_main`, `state_read`, `client_config_write`,
+`governance_write`, `path_check_failed` o `no_project_root`) y
+`praetore.requested_profile`, el perfil que la llamada habría tenido.
+`check-attribution.py` (en `verify.sh`) exige que vengan juntos, en un Deny firmado como `unregistered`, con un
 perfil pedido igual al agente firmado, y los cuenta aparte. Esa negación no
 la firma la clave del perfil pedido, así que no prueba que la pidió esa
 instancia. Esto aplica también a un estado nuevo: allí la escritura de
@@ -374,16 +414,17 @@ el hook la resuelve contra la raíz dada en `init` (archivo `project-root` del
 estado): de forma léxica (quitando `.` y `..`) y siguiendo symlinks. Marca
 `protected_path` si alguna cae en una ruta de la lista de configuración
 (incluidos `.claude` y `.git`), `leaves_root` si alguna cae fuera
-de la raíz (o es `~...` o `$VAR`, cuyo valor no conoce; `/dev/null` y
-similares no cuentan, ni el programa nombrado por ruta, como
-`/usr/bin/git`), y `network` si alguna palabra es `curl`, `wget`, `nc`,
-`ssh`, `scp`, `rsync`, `ftp`, `telnet` o `socat`. La policy pide aprobación
+de la raíz (o es `~...`, `$VAR`, una expansión de llaves o un glob sin
+comillas, cuyo valor no conoce; `/dev/null` y similares no cuentan, ni el
+programa nombrado por ruta, como `/usr/bin/git`), y `network` si alguna
+palabra es `curl`, `wget`, `nc`, `ssh`, `scp`, `rsync`, `ftp`, `telnet` o
+`socat`. La policy pide aprobación
 en cada caso con su propia regla. `Monitor` corre un comando de shell y
 recibe el mismo escaneo. `PowerShell` no es shell POSIX y el escáner no lo
 entiende: como todo comando no analizable, para `main` se niega
 (`deny-unanalyzable-command`); los subagentes no tienen `process:execute` y
-se les niegan los dos. Un `Monitor` sin `command` (fuente WebSocket) es no
-analizable también.
+se les niegan los dos. Un `Monitor` sin `command` (fuente WebSocket) y un
+`Bash` cuyo `command` no es un string son no analizables también.
 
 Se eligió `RequireApproval` y no `Deny` porque el escaneo es léxico y tiene
 falsos positivos (`cat .git/HEAD`, `ls /`), y porque por defecto el único
@@ -392,10 +433,10 @@ aprobación para escribir en `.claude/` y para `git push`. Un subagente no
 llega a estas reglas: se le niega `Bash` por falta de capacidad.
 
 Este escaneo **se puede evadir** y no es un límite de seguridad: un script o
-un `Makefile`, un alias o una función de shell definidos en otro lado, un
-glob, una ruta armada en tiempo de ejecución, un comando codificado que otro
-programa permitido decodifica, o cualquier programa que abra archivos o
-conexiones por su cuenta hacen lo que el texto del comando no dice. Dos
+un `Makefile`, un alias o una función de shell definidos en otro lado, una
+ruta armada en tiempo de ejecución, un comando codificado que otro programa
+permitido decodifica, o cualquier programa que abra archivos o conexiones
+por su cuenta hacen lo que el texto del comando no dice. Dos
 casos comunes que no detecta: `git config`, que escribe `.git/config` sin
 nombrarlo, y `git fetch`, `git clone`, `git pull` o `git submodule`, que
 usan la red (`git` no está en la lista de herramientas de red).
@@ -583,10 +624,13 @@ Los subagentes de ejemplo (`agents/`) son `planner` (opus, solo lectura),
 - **Atribuye al perfil, no aísla.** La firma dice qué perfil (`agent_type`)
   pidió la acción, y con SAF-14 el emisor firma para qué perfil emitió cada
   identidad. Pero las claves de todos los perfiles y la del atestador viven
-  en la misma cuenta de usuario que los agentes: un agente que lee archivos
-  puede firmar como otro. Es atribución entre agentes cooperativos, no
-  contención. Dos instancias del mismo perfil comparten clave; el
-  `agent_id` de Claude Code, si llega, queda como dato firmado, no como
+  en la misma cuenta de usuario que los agentes: un proceso de ese usuario
+  puede firmar como cualquiera. El hook niega a todo perfil la lectura del
+  directorio de estado con sus herramientas de archivos (`state_read`), pero
+  un `Bash` de `main` sigue pudiendo leerlo, con aprobación si el comando
+  nombra la ruta (ver [Límites](#límites)). Es atribución entre agentes
+  cooperativos, no contención. Dos instancias del mismo perfil comparten
+  clave; el `agent_id` de Claude Code, si llega, queda como dato firmado, no como
   clave propia. Ver
   [SAF-14](../../docs/proposals/SAF-14-identidad-por-agente.md).
 - **No prueba que la acción se ejecutó**, ni que no hubo acciones fuera del
