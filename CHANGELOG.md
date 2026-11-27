@@ -6,6 +6,27 @@
 
 ### Added
 
+- **praetore-mcp: a signed receipt for a client line it cannot parse.**
+  (#262) A line that is not UTF-8, not JSON, or has a duplicate key, a
+  lone surrogate escape, too deep a nesting or a number out of range now
+  gets one `mcp.unparsed_line` receipt before it is forwarded (observe) or
+  refused with `-32700` (enforce). A line that may name a `safety*` tool is
+  still refused in both modes, and its receipt says so with
+  `may_name_safety: true`. The receipt records the SHA-256 and length of
+  the raw bytes, a closed parse-error class and the tool names a tolerant
+  reader sees (record only). It is a DENY by the unclassified-action
+  guard, never an ALLOW, and it does not change what happens to the line;
+  if it cannot be written, the line is handled the same way and the stderr
+  notice says so. `receipts`, the dashboard and the session report show it
+  as `UNPARSED <sha256 prefix>`. A policy that declares `mcp.unparsed_line`
+  in `action_classes` is now refused by `policy check`, by `wrap` and by the
+  `policy` edits. Lines without this receipt: a line with a bare `\r`
+  (handled as an ambiguous line), a line over 32 MiB, and every line while
+  the home cannot be loaded. Enforce now writes one receipt per refused
+  unparseable line, so receipt counts grow. Older `report` and dashboard
+  versions show such a receipt as a DENY with tool `(omitted)`; verifiers
+  check it as any other receipt.
+
 - **praetore-mcp: `doctor` checks that the definition Claude Code runs for
   each governed server is a wrap for this home.** (#276) Claude Code keeps a
   server name in up to four places and runs the whole entry from the
@@ -127,8 +148,11 @@
   tool error saying that no receipt could be recorded (with the evidence id
   when there is one) and stderr says `REFUSED (observe, ...)`. Observe
   still never blocks because of a policy decision: a DENY or
-  REQUIRE_APPROVAL is forwarded with its receipt, as before. Unparseable client lines in
-  observe are unchanged (no receipt). **Action:** if you run observe, a home
+  REQUIRE_APPROVAL is forwarded with its receipt, as before. Unparseable client
+  lines get one `mcp.unparsed_line` receipt before they are forwarded
+  (observe) or refused with `-32700` (enforce); if it cannot be written, the
+  line is handled the same way and the stderr notice says so (see Added,
+  #262). **Action:** if you run observe, a home
   that cannot record (full disk, a lock held by another process, a
   read-only or damaged journal) now stops tool calls instead of letting
   them run unrecorded; the client shows the error. Fix the journal (the
