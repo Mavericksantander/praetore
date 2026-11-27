@@ -445,7 +445,22 @@ interrupted write), nothing more is appended: enforce refuses calls and
 observe warns until the journal is checked. A daily file that starts at
 `seq` 0 (and has at most 4096 entries) also verifies with `praetore-verify
 journal --journal FILE --attester-pin attester-public-key.hex`, with the same
-head. Each `evidence` is a complete
+head.
+
+The two verifiers report a missing head differently. `praetore-mcp verify`
+without `--expected-head` and `--expected-approval-head` exits 3
+(`UNANCHORED`): every check passed, but nothing shows that the journal was not
+cut at the end or rewritten with the home's keys, so it is not a pass.
+`praetore-verify journal` without `--expected-head` exits 0 and prints the
+`head_not_anchored` warning. It exits 1 when `--expected-head` is given and the
+head differs (`JOURNAL_HEAD_MISMATCH`), or when the opt-in `--require-anchored`
+is given and no head is (`JOURNAL_NOT_ANCHORED`). A script that checks only the
+exit code must therefore call `praetore-verify journal` with `--expected-head`
+or `--require-anchored`. `praetore-verify journal` reads one file that starts
+at `seq` 0 and does not read the approval journal; for a home, `praetore-mcp
+verify` with both saved heads is the complete check.
+
+Each `evidence` is a complete
 PRÆTORE HighAssurance (`v2`) `Evidence` document:
 
 * `action`: `action_type` `mcp.tools/call`, `target` = server name,
@@ -1011,7 +1026,10 @@ prints the same command with both heads at close, and `dashboard` takes
 the same flag.
 
 `praetore-verify` does not read this approval journal. It still verifies
-each evidence receipt on its own.
+each evidence receipt on its own. Its `journal` command exits 0 when no head
+is given (with a `head_not_anchored` warning), where `praetore-mcp verify`
+exits 3; the opt-in `--expected-head` or `--require-anchored` makes a wrong or
+missing head a failure (exit 1).
 
 ## Trust model
 
