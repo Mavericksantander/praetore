@@ -39,6 +39,23 @@
   accepted and ignored, so two different policy files shared one digest;
   `PolicyEffect` now refuses them, as the rest of the policy already did.
   Pinned by `crates/praetore-core/tests/input_bounds_hardening.rs`.
+- **praetore-verify: `--require-anchored` is accepted by `outcomes` and
+  `safety-journal`, and on a range it needs `--expected-anchor` too.**
+  Both commands verified without `--expected-head` and printed OK with
+  only the `head_not_anchored` warning, and `journal --range
+  --require-anchored` passed with the head alone while the anchor's `seq`
+  and `prev` were only what the file said. Now `outcomes --require-anchored`
+  fails with `JOURNAL_NOT_ANCHORED` and `safety-journal --require-anchored`
+  with `SAFETY_JOURNAL_NOT_ANCHORED` when no `--expected-head` was given,
+  after the chain verifies; a range under `--require-anchored` without
+  `--expected-anchor` fails with `JOURNAL_RANGE_NOT_ANCHORED` or
+  `SAFETY_RANGE_NOT_ANCHORED`. `range_start` is `null` unless
+  `--expected-anchor` was given, in both commands.
+- **praetore-verify outcomes: a gateway key pinned as a human role is
+  refused.** An `--approver-pin` or `--delegation-root-pin` whose key is
+  also an `--execution-pin` or an `--attester-pin` fails with
+  `OUTCOME_PIN_SAME_KEY` before any record is read, as `safety-manifest`
+  refuses a namespace key shared with another role.
 - **praetore-mcp: a receipts journal line is read only in the byte form
   `wrap` writes.** Integrity and the chain link are computed over the
   canonical evidence, so a line written again with other spacing, another
