@@ -166,7 +166,7 @@ fn assert_state_matches_verify(home: &Home) -> Value {
         if code == 3 { "UNANCHORED" } else { "FAIL" },
         v["total"],
         v["verified"],
-        v["failed"]
+        v["total"].as_u64().unwrap() - v["verified"].as_u64().unwrap()
     );
     assert!(report.contains(&summary), "{summary:?} not in\n{report}");
     match v["head"].as_object() {

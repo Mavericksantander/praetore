@@ -44,6 +44,13 @@
   OK again. This check alone does not stop calls from running without a
   receipt; observe refusing them does. The dashboard shows the same
   failure. Pinned by `crates/praetore-mcp/tests/journal_appendable.rs`.
+- **praetore-mcp: the `verify` summary counts failed receipts, not
+  failure messages.** `N receipts: V verified, F failed` now has
+  `F = N - V`. A failure of the journal as a whole (a head that does not
+  match, `wrap` unable to append, the approval journal) is still its own
+  `FAIL` line and still makes the result FAIL with exit 1, but it is no
+  longer counted as a failed receipt (a journal of two lines with one bad
+  line said `1 verified, 2 failed`; it now says `1 verified, 1 failed`).
 - **praetore-mcp: the journal and approval locks wait at most 10 s.** A
   process that kept `receipts/.journal.lock` or `approvals/.lock` left
   every call waiting with no reply. After 10 s the wait ends with an error
