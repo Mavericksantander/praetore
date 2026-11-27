@@ -999,6 +999,89 @@ fn two_ranges_verify_chained_with_expected_anchor() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("anchor_not_checked"));
 }
 
+/// On a range, --require-anchored needs --expected-anchor as well as
+/// --expected-head: until the anchor is checked, its `seq` and its link to
+/// the previous range are only what the file says, so `range_start` is
+/// reported only when --expected-anchor was given.
+#[test]
+fn a_range_under_require_anchored_needs_the_expected_anchor_too() {
+    let fx = Fixture::new();
+    let (_, first_head, second) = fx.ranges();
+    let anchor = first_head.head.to_hex();
+    let whole = fx.expected();
+    // Head given, anchor not: the range verifies, but it is not anchored.
+    let output = fx.verify_range(&second, &["--expected-head", &whole, "--require-anchored"]);
+    assert_rejected(&output, "JOURNAL_RANGE_NOT_ANCHORED");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("anchor was not checked"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // No head: the head comes first, with or without the anchor.
+    assert_rejected(
+        &fx.verify_range(&second, &["--require-anchored"]),
+        "JOURNAL_NOT_ANCHORED",
+    );
+    assert_rejected(
+        &fx.verify_range(
+            &second,
+            &["--expected-anchor", &anchor, "--require-anchored"],
+        ),
+        "JOURNAL_NOT_ANCHORED",
+    );
+    // Both: passes, and the range's position is reported.
+    let output = fx.verify_range(
+        &second,
+        &[
+            "--expected-anchor",
+            &anchor,
+            "--expected-head",
+            &whole,
+            "--require-anchored",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["details"]["range_start"], 2);
+    assert_eq!(summary["details"]["expected_anchor_verified"], true);
+    assert_eq!(summary["details"]["warnings"].as_array().unwrap().len(), 1);
+    // Without --expected-anchor the position is not reported: the anchor's
+    // `seq` was not checked against anything.
+    let output = fx.verify_range(&second, &["--expected-head", &whole]);
+    assert!(output.status.success());
+    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["details"]["range_start"], Value::Null);
+    assert_eq!(summary["details"]["expected_anchor_verified"], false);
+    assert_eq!(summary["details"]["anchor"], anchor);
+    assert_eq!(summary["details"]["entries"], 2);
+    // Text output: the same code, exit 1.
+    let path = fx.dir.write("range.jsonl", &second);
+    let output = run_verify(&[
+        "journal",
+        "--journal",
+        &path,
+        "--attester-pin",
+        &fx.pin,
+        "--range",
+        "--expected-head",
+        &whole,
+        "--require-anchored",
+        "--format",
+        "text",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .starts_with("ERROR journal JOURNAL_RANGE_NOT_ANCHORED"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
 #[test]
 fn a_range_with_a_wrong_anchor_or_truncated_fails() {
     let fx = Fixture::new();

@@ -984,7 +984,11 @@ praetore-verify safety-journal --journal executor-1.jsonl --ingest-pin ingest.pu
 
 Export `_unattributed` too (`--source _unattributed`): it holds the
 `rejected` inputs and the losses inside the ingester. Anchor heads outside
-the operator's control to detect truncation (SAF-13).
+the operator's control to detect truncation (SAF-13). Without
+`--expected-head` the command verifies the chain and reports the
+`head_not_anchored` warning; `--require-anchored` turns it into a failure
+(`SAFETY_JOURNAL_NOT_ANCHORED`, exit 1) once the chain verifies, so a
+script cannot take an unanchored OK for an anchored one.
 
 A whole-chain export holds at most 200000 records and 64 MiB. Export a
 longer chain in ranges: `--from-seq 0 --limit N` writes the first range and
@@ -1009,6 +1013,12 @@ praetore journal-export --safety --tenant <uuid> --source executor-1 \
 praetore-verify safety-journal --journal part-1.jsonl --ingest-pin ingest.pub \
   --range --expected-anchor <head of part-0> --format json
 ```
+
+Without `--expected-anchor` the anchor's `chain_seq` is only what the file
+says: `range_start` is reported as `null` and the `anchor_not_checked`
+warning is given; with `--require-anchored` a range needs both
+`--expected-anchor` and `--expected-head` (`SAFETY_RANGE_NOT_ANCHORED`
+otherwise).
 
 ## Offline evidence and authority verification
 
@@ -1139,6 +1149,13 @@ praetore-verify journal --journal part-0.jsonl --attester-pin attester-public-ke
 praetore-verify journal --journal part-1.jsonl --attester-pin attester-public-key.hex \
   --range --expected-anchor <head of part-0> --format json
 ```
+
+Without `--expected-anchor` the anchor's `seq` and `prev` are only what the
+file says: the range verifies with the `anchor_not_checked` warning and
+`range_start` is `null`. `--require-anchored` on a range needs both
+`--expected-anchor` and `--expected-head`: it fails with
+`JOURNAL_RANGE_NOT_ANCHORED` when the anchor was not given and with
+`JOURNAL_NOT_ANCHORED` when the head was not.
 
 Storage: about 3.7 KB per action in the database for receipts of about
 2.6 KB, before migration 0024. One run of the ignored test
@@ -1307,7 +1324,13 @@ evidence inside an execution receipt must be the journal's receipt for that
 request; the records of one request must agree (a dispatched held request was
 approved, `approval_rejected` has a reject decision). The command reports
 `counts`, `held` (every held request of the journal with its `outcome`) and
-`held_by_outcome`. The records are not chained: a removed record leaves no
+`held_by_outcome`. An approver or delegation-root pin whose key is also an
+execution pin or the attester pin is refused (`OUTCOME_PIN_SAME_KEY`): a
+gateway key cannot stand in for a human. Without `--expected-head` the
+journal, and so the outcomes, are not anchored: the command reports the
+`head_not_anchored` warning and, with `--require-anchored`, fails with
+`JOURNAL_NOT_ANCHORED` (exit 1) after everything verifies, as `journal`
+does. The records are not chained: a removed record leaves no
 trace, so the output does not show that the file is complete; an approved
 or executed request can show as `pending`, `approved_pending_dispatch` or
 `not_dispatched`. The order of the lines is not verified: the outcomes do

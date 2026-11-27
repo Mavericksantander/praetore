@@ -4,6 +4,23 @@
 
 ### Fixed
 
+- **praetore-verify: `--require-anchored` is accepted by `outcomes` and
+  `safety-journal`, and on a range it needs `--expected-anchor` too.**
+  Both commands verified without `--expected-head` and printed OK with
+  only the `head_not_anchored` warning, and `journal --range
+  --require-anchored` passed with the head alone while the anchor's `seq`
+  and `prev` were only what the file said. Now `outcomes --require-anchored`
+  fails with `JOURNAL_NOT_ANCHORED` and `safety-journal --require-anchored`
+  with `SAFETY_JOURNAL_NOT_ANCHORED` when no `--expected-head` was given,
+  after the chain verifies; a range under `--require-anchored` without
+  `--expected-anchor` fails with `JOURNAL_RANGE_NOT_ANCHORED` or
+  `SAFETY_RANGE_NOT_ANCHORED`. `range_start` is `null` unless
+  `--expected-anchor` was given, in both commands.
+- **praetore-verify outcomes: a gateway key pinned as a human role is
+  refused.** An `--approver-pin` or `--delegation-root-pin` whose key is
+  also an `--execution-pin` or an `--attester-pin` fails with
+  `OUTCOME_PIN_SAME_KEY` before any record is read, as `safety-manifest`
+  refuses a namespace key shared with another role.
 - **praetore-mcp: the journal and approval locks wait at most 10 s.** A
   process that kept `receipts/.journal.lock` or `approvals/.lock` left
   every call waiting with no reply. After 10 s the wait ends with an error
