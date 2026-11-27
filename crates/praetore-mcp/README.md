@@ -11,7 +11,9 @@ length), or refused if it may name a `safety*` tool (see Message handling). It n
 Rust code.
 
 * **observe** (default): every call that the policy classifies is
-  forwarded; the decision is only recorded. A call whose action type the
+  forwarded; the decision is only recorded. Observe never blocks because of
+  a policy decision (DENY or REQUIRE_APPROVAL); what it cannot record, it
+  does not run. A call whose action type the
   policy does not declare (a signed `unclassified` DENY, for example an undeclared
   `mcp.tools/call` or a `safety*` tool that is not exactly a declared Safety
   action) is refused in observe too, and a declared Safety call is forwarded
@@ -802,7 +804,9 @@ Things to know:
   it can be read, as above, otherwise `null`). Observe
   forwards them unchanged, warns with the SHA-256 and the length of the
   line, and evaluates and records **every**
-  `tools/call` reading it can find. Three kinds are detected:
+  `tools/call` reading it can find. If the receipt of one of those readings
+  cannot be recorded, observe refuses the whole line instead. Three kinds
+  are detected:
   * **Bare carriage returns.** The proxy frames on `\n`, and JSON treats
     `\r` as whitespace. Universal-newline readers end a line at `\r`, `\n`
     or `\r\n`: the MCP Python SDK (`TextIOWrapper`, `newline=None`) and
@@ -862,7 +866,8 @@ Things to know:
   Safety action (G7), even when the name would fail validation or the line
   is ambiguous. If a receipt cannot be written (`JournalError::Unavailable`:
   the journal cannot be read back, locked or appended), **both modes refuse
-  the call** and the reply carries the evidence id. Earlier versions of observe
+  the call** and the reply carries the evidence id; an ambiguous line with
+  such a reading is refused whole. Earlier versions of observe
   forwarded such calls with a warning and no receipt; a journal that
   could not be appended but still read back intact then passed `verify`
   with the heads kept earlier, saying nothing about the calls that ran.
