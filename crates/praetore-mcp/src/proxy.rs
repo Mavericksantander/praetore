@@ -7,6 +7,7 @@ use crate::{
     gate::{Evaluator, GateError, Mode, Verdict},
     journal::JournalError,
     json::JsonValue,
+    unparsed::{UNPARSED_LINE_ACTION_TYPE, UnparsedLine},
 };
 use praetore_core::DecisionOutcome;
 use serde_json::{Value, json};
@@ -831,6 +832,27 @@ fn refuse_safety_unparseable(out: &mut Outcome, mode: Mode, what: &str, reason: 
     )));
 }
 
+/// What became of the receipt of an unparseable line, for its notice.
+fn unparsed_receipt_note(receipt: &Result<Verdict, GateError>) -> String {
+    match receipt {
+        Ok(Verdict {
+            evidence_id,
+            journaled: Ok(_),
+            ..
+        }) => format!("signed receipt {UNPARSED_LINE_ACTION_TYPE} (evidence {evidence_id})"),
+        Ok(Verdict {
+            evidence_id,
+            journaled: Err(error),
+            ..
+        }) => format!(
+            "!!! receipt {UNPARSED_LINE_ACTION_TYPE} (evidence {evidence_id}) could NOT be written: {error} !!!"
+        ),
+        Err(error) => {
+            format!("!!! receipt {UNPARSED_LINE_ACTION_TYPE} could NOT be written: {error} !!!")
+        }
+    }
+}
+
 fn refuse_unparseable(out: &mut Outcome, what: &str, reason: &str, raw: &[u8]) {
     out.warnings.push(format!(
         "praetore-mcp: REFUSED {what} client line in enforce mode ({reason}; {}); it could hide a tools/call",
@@ -863,22 +885,38 @@ pub fn handle_client_line(
     let mut out = Outcome::default();
     match classify(raw) {
         Classified::Passthrough => out.to_server = Some(forward_unchanged(raw)),
-        // A line this proxy cannot parse is never forwarded silently: it is
-        // refused if it may name a safety* tool (G7), refused in enforce,
-        // and forwarded in observe with a warning that identifies it.
-        Classified::Unparseable(reason) if may_name_safety_tool(raw) => {
-            refuse_safety_unparseable(&mut out, mode, "an unparseable", &reason, raw);
-        }
-        Classified::Unparseable(reason) => match mode {
-            Mode::Observe => {
-                out.warnings.push(format!(
-                    "praetore-mcp: WARNING unparseable client line ({reason}; {}); forwarded unchanged WITHOUT a receipt (observe)",
-                    fingerprint(raw)
-                ));
-                out.to_server = Some(forward_unchanged(raw));
+        // A line this proxy cannot parse is never forwarded silently. It
+        // gets its signed receipt first, in both modes (T-016-B4). Then the
+        // line alone decides, whatever the receipt or its write did: refused
+        // if it may name a safety* tool (G7, the receipt signs
+        // `may_name_safety: true`), refused in enforce, and forwarded in
+        // observe with a warning that identifies it.
+        Classified::Unparseable(reason) => {
+            let receipt = evaluator.record_unparsed(server, &UnparsedLine::of(raw, &reason));
+            let receipt = unparsed_receipt_note(&receipt);
+            if may_name_safety_tool(raw) {
+                refuse_safety_unparseable(&mut out, mode, "an unparseable", &reason, raw);
+                if let Some(warning) = out.warnings.last_mut() {
+                    warning.push_str(&format!("; {receipt}"));
+                }
+                return out;
             }
-            Mode::Enforce => refuse_unparseable(&mut out, "an unparseable", &reason, raw),
-        },
+            match mode {
+                Mode::Observe => {
+                    out.warnings.push(format!(
+                        "praetore-mcp: WARNING unparseable client line ({reason}; {}); {receipt}; forwarded unchanged (observe)",
+                        fingerprint(raw)
+                    ));
+                    out.to_server = Some(forward_unchanged(raw));
+                }
+                Mode::Enforce => {
+                    refuse_unparseable(&mut out, "an unparseable", &reason, raw);
+                    if let Some(warning) = out.warnings.last_mut() {
+                        warning.push_str(&format!("; {receipt}"));
+                    }
+                }
+            }
+        }
         Classified::Ambiguous {
             reason,
             unparsed: true,
@@ -1204,6 +1242,7 @@ mod tests {
         result: Result<DecisionOutcome, String>,
         journal_error: Option<JournalError>,
         calls: Vec<(String, Value)>,
+        unparsed: Vec<UnparsedLine>,
     }
 
     impl Fixed {
@@ -1212,11 +1251,40 @@ mod tests {
                 result,
                 journal_error: None,
                 calls: Vec::new(),
+                unparsed: Vec::new(),
+            }
+        }
+
+        fn verdict(&self, outcome: DecisionOutcome) -> Verdict {
+            Verdict {
+                unclassified: false,
+                outcome,
+                evidence_id: Uuid::nil(),
+                rule_ids: vec!["rule-x".into()],
+                reason: "Policy rule 'rule-x' matched".into(),
+                journaled: match &self.journal_error {
+                    None => Ok(PathBuf::from("/j")),
+                    Some(error) => Err(error.clone()),
+                },
+                consumed_approval: None,
+                hold_message: None,
             }
         }
     }
 
     impl Evaluator for Fixed {
+        /// Returns the configured outcome (ALLOW too), so a test sees that
+        /// the receipt's verdict never decides what happens to the line.
+        fn record_unparsed(
+            &mut self,
+            _server: &str,
+            line: &UnparsedLine,
+        ) -> Result<Verdict, GateError> {
+            self.unparsed.push(line.clone());
+            let outcome = self.result.clone()?;
+            Ok(self.verdict(outcome))
+        }
+
         fn evaluate(&mut self, server: &str, params: &Value) -> Result<Verdict, GateError> {
             self.calls.push((server.into(), params.clone()));
             let outcome = self.result.clone()?;
@@ -1452,7 +1520,11 @@ mod tests {
         assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
         let warning = &out.warnings[0];
         assert!(warning.contains("unparseable client line"), "{warning}");
-        assert!(warning.contains("WITHOUT a receipt (observe)"), "{warning}");
+        assert!(
+            warning.contains("signed receipt mcp.unparsed_line")
+                && warning.contains("forwarded unchanged (observe)"),
+            "{warning}"
+        );
         assert!(
             warning.contains(&format!("sha256 {digest}, {} bytes", raw.len())),
             "{warning}"
@@ -1464,6 +1536,34 @@ mod tests {
         assert_eq!(reply["id"], Value::Null);
         assert!(out.warnings[0].contains(&digest), "{:?}", out.warnings);
         assert!(eval.calls.is_empty());
+        // One receipt per line, in each mode, over the raw bytes.
+        assert_eq!(eval.unparsed.len(), 2);
+        assert!(eval.unparsed.iter().all(|line| line.line_sha256 == digest));
+    }
+
+    /// The receipt never decides the line (T-016-B4): whatever its verdict
+    /// says (ALLOW here, which the real gate never gives) and whatever the
+    /// tolerant reader saw, observe forwards and enforce refuses.
+    #[test]
+    fn the_unparsed_receipt_never_decides_the_line() {
+        let with_tool: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"write_file\",\"arguments\":{\"p\":\"\xff\"}}}\n";
+        let garbage: &[u8] = b"this is not json\n";
+        for outcome in [DecisionOutcome::Allow, DecisionOutcome::Deny] {
+            for raw in [with_tool, garbage] {
+                let mut eval = Fixed::new(Ok(outcome));
+                let observe = handle_client_line(raw, Mode::Observe, "s", &mut eval);
+                assert_eq!(observe.to_server.as_deref(), Some(raw), "{outcome:?}");
+                assert!(observe.to_client.is_none(), "{outcome:?}");
+                let enforce = handle_client_line(raw, Mode::Enforce, "s", &mut eval);
+                assert!(enforce.to_server.is_none(), "{outcome:?}");
+                let reply: Value =
+                    serde_json::from_slice(enforce.to_client.as_deref().unwrap()).unwrap();
+                assert_eq!(reply["error"]["code"], -32700, "{outcome:?}");
+                assert_eq!(eval.unparsed.len(), 2);
+                let tools = &eval.unparsed[0].tolerant_tools;
+                assert_eq!(tools.is_empty(), raw == garbage, "{tools:?}");
+            }
+        }
     }
 
     /// T-016-B6: the `-32700` for a refused line carries the line's `id`
@@ -2106,6 +2206,14 @@ mod tests {
     struct BidiRuleEvaluator;
 
     impl Evaluator for BidiRuleEvaluator {
+        fn record_unparsed(
+            &mut self,
+            _server: &str,
+            _line: &UnparsedLine,
+        ) -> Result<Verdict, GateError> {
+            Err(GateError::Failed("not used".into()))
+        }
+
         fn evaluate(&mut self, _server: &str, _params: &Value) -> Result<Verdict, GateError> {
             Ok(Verdict {
                 unclassified: false,

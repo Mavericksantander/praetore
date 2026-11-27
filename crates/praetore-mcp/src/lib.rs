@@ -23,4 +23,5 @@ pub mod report;
 pub mod report_pdf;
 pub mod shown;
 pub mod store;
+pub mod unparsed;
 pub mod when;

@@ -87,16 +87,18 @@ pub fn render_table(
                     .as_deref()
                     .map(|t| t.chars().take(19).collect::<String>().replace('T', " "))
                     .unwrap_or_else(|| "-".into());
-                let tool = evidence
-                    .action
-                    .parameters
-                    .get("tool")
-                    .map(|t| {
+                let tool = crate::unparsed::reader_label(
+                    &evidence.action.action_type,
+                    &evidence.action.parameters,
+                )
+                .or_else(|| {
+                    evidence.action.parameters.get("tool").map(|t| {
                         t.as_str()
                             .map(str::to_owned)
                             .unwrap_or_else(|| t.to_string())
                     })
-                    .unwrap_or_else(|| "(omitted)".into());
+                })
+                .unwrap_or_else(|| "(omitted)".into());
                 let outcome = evidence.decision.outcome;
                 let rule = evidence
                     .decision
