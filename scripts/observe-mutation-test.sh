@@ -26,6 +26,10 @@ revert() {
 }
 trap revert EXIT
 
+# `cargo test --test` alone does not build the examples; the test runs
+# examples/fake_server as the wrapped server.
+cargo build --locked -p praetore-mcp --example fake_server
+
 printf '== baseline: %s\n' "${command[*]}"
 "${command[@]}"
 
