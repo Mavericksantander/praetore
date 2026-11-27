@@ -347,6 +347,10 @@ pub struct Outcome {
 enum CallDecision {
     Forward,
     Block(String),
+    /// Refused because no receipt could be recorded (evaluation error, or a
+    /// receipt the journal could not take). A line that holds such a call is
+    /// never forwarded, in either mode: what cannot be recorded is not run.
+    Unrecorded(String),
 }
 
 fn decide(
@@ -386,22 +390,18 @@ fn decide(
                 "PRÆTORE refused this tool call because the policy does not classify it: {error}"
             ))
         }
-        Err(error) => match mode {
-            Mode::Enforce => {
-                warnings.push(format!(
-                    "praetore-mcp: ERROR evaluating {server_shown}/{tool}: {error}; call REFUSED (enforce, fail closed)"
-                ));
-                CallDecision::Block(format!(
-                    "PRÆTORE could not evaluate this tool call, so it was refused (fail closed): {error}"
-                ))
-            }
-            Mode::Observe => {
-                warnings.push(format!(
-                    "praetore-mcp: WARNING evaluating {server_shown}/{tool} failed: {error}; call forwarded WITHOUT a receipt (observe mode)"
-                ));
-                CallDecision::Forward
-            }
-        },
+        // A call that could not be evaluated has no decision and no receipt.
+        // It is refused in both modes: observe records decisions, and a call
+        // forwarded without one would run with nothing to record.
+        Err(error) => {
+            warnings.push(format!(
+                "praetore-mcp: ERROR evaluating {server_shown}/{tool}: {error}; call REFUSED ({}, fail closed: no receipt could be recorded)",
+                mode.as_str()
+            ));
+            CallDecision::Unrecorded(format!(
+                "PRÆTORE could not evaluate this tool call, so no receipt could be recorded and it was refused (fail closed): {error}"
+            ))
+        }
         Ok(verdict) => decide_verdict(mode, &server_shown, &tool, &verdict, warnings),
     }
 }
@@ -426,26 +426,25 @@ fn decide_verdict(
                     Mode::Observe => "observe: this call cannot have a receipt",
                 }
             ));
-            return CallDecision::Block(format!(
+            return CallDecision::Unrecorded(format!(
                 "PRÆTORE could not write a receipt for this tool call that verifies when read back, so it was refused. Evidence id: {}",
                 verdict.evidence_id
             ));
         }
-        match mode {
-            Mode::Enforce => {
-                warnings.push(format!(
-                    "praetore-mcp: ERROR receipt for {server}/{tool} could not be written: {error}; call REFUSED (enforce)"
-                ));
-                return CallDecision::Block(format!(
-                    "PRÆTORE could not record a receipt for this tool call, so it was refused (fail closed). Evidence id: {}",
-                    verdict.evidence_id
-                ));
-            }
-            Mode::Observe => warnings.push(format!(
-                "praetore-mcp: WARNING !!! receipt for {server}/{tool} (evidence {}) could NOT be written: {error}; call forwarded anyway (observe mode) !!!",
-                verdict.evidence_id
-            )),
-        }
+        // The journal could not take the receipt (a cut or blank last line,
+        // a symlink, a read-only file, a held lock, a full disk). The call
+        // is refused in both modes: a call forwarded without its receipt
+        // leaves nothing for `verify` to check, and an observe journal that
+        // still verifies would then say nothing about it.
+        warnings.push(format!(
+            "praetore-mcp: ERROR receipt for {server}/{tool} (evidence {}) could not be written: {error}; call REFUSED ({}, fail closed: no receipt could be recorded)",
+            verdict.evidence_id,
+            mode.as_str()
+        ));
+        return CallDecision::Unrecorded(format!(
+            "PRÆTORE could not record a receipt for this tool call, so it was refused (fail closed). Evidence id: {}",
+            verdict.evidence_id
+        ));
     }
     let rules = if verdict.rule_ids.is_empty() {
         "none (default deny)".to_owned()
@@ -901,26 +900,37 @@ pub fn handle_client_line(
                 for call in &candidates {
                     // Observe forwards and only records receipts, except a
                     // reading named `safety*` that is not a declared Safety
-                    // action (G7): then the line is refused.
+                    // action (G7), or a reading whose receipt could not be
+                    // recorded: then the line is refused.
                     let decision = decide(mode, server, call, evaluator, &mut out.warnings);
-                    if let CallDecision::Block(text) = decision
-                        && crate::gate::is_safety_named(&call.params)
-                    {
-                        refused.get_or_insert((call.id.clone(), text));
+                    let why = match decision {
+                        CallDecision::Unrecorded(text) => Some((
+                            text,
+                            "a tools/call reading that could not be recorded",
+                            "praetore-mcp: an ambiguous message with a tools/call that could not be recorded was not forwarded",
+                        )),
+                        CallDecision::Block(text) if crate::gate::is_safety_named(&call.params) => {
+                            Some((
+                                text,
+                                "an unclassified safety* tool call",
+                                "praetore-mcp: an ambiguous message naming a safety* tool was not forwarded",
+                            ))
+                        }
+                        _ => None,
+                    };
+                    if let Some((text, what, unread)) = why {
+                        refused.get_or_insert((call.id.clone(), text, what, unread));
                     }
                 }
                 match refused {
                     None => out.to_server = Some(forward_unchanged(raw)),
-                    Some((id, text)) => {
-                        out.warnings.push(
-                            "praetore-mcp: ambiguous line with an unclassified safety* tool call REFUSED (observe)".into(),
-                        );
+                    Some((id, text, what, unread)) => {
+                        out.warnings.push(format!(
+                            "praetore-mcp: ambiguous line with {what} REFUSED (observe)"
+                        ));
                         out.to_client = Some(match id {
                             Some(id) => line(&blocked_response(&id, &text)),
-                            None => line(&parse_error_response(
-                                "praetore-mcp: an ambiguous message naming a safety* tool was not forwarded",
-                                raw,
-                            )),
+                            None => line(&parse_error_response(unread, raw)),
                         });
                     }
                 }
@@ -929,7 +939,7 @@ pub fn handle_client_line(
         Classified::ToolCall(call) => {
             match decide(mode, server, &call, evaluator, &mut out.warnings) {
                 CallDecision::Forward => out.to_server = Some(forward_unchanged(raw)),
-                CallDecision::Block(text) => {
+                CallDecision::Block(text) | CallDecision::Unrecorded(text) => {
                     if let Some(id) = &call.id {
                         out.to_client = Some(line(&blocked_response(id, &text)));
                     }
@@ -945,7 +955,7 @@ pub fn handle_client_line(
                 blocked.push(match &item.call {
                     Some(call) => match decide(mode, server, call, evaluator, &mut out.warnings) {
                         CallDecision::Forward => None,
-                        CallDecision::Block(text) => Some(text),
+                        CallDecision::Block(text) | CallDecision::Unrecorded(text) => Some(text),
                     },
                     None => None,
                 });
@@ -1348,15 +1358,31 @@ mod tests {
         assert_eq!(out.to_server.as_deref(), Some(CALL));
     }
 
+    /// A call the gate could not evaluate has no receipt: it is refused in
+    /// both modes, with a reply the client can read and a stderr line that
+    /// names the mode.
     #[test]
-    fn evaluation_errors_fail_closed_only_in_enforce() {
-        let mut eval = Fixed::new(Err("KEY_LOAD".into()));
-        let out = handle_client_line(CALL, Mode::Enforce, "fs", &mut eval);
-        assert!(out.to_server.is_none());
-        assert!(out.to_client.is_some());
-        let out = handle_client_line(CALL, Mode::Observe, "fs", &mut eval);
-        assert_eq!(out.to_server.as_deref(), Some(CALL));
-        assert!(out.warnings[0].contains("WITHOUT a receipt"));
+    fn evaluation_errors_fail_closed_in_both_modes() {
+        for mode in [Mode::Enforce, Mode::Observe] {
+            let mut eval = Fixed::new(Err("KEY_LOAD".into()));
+            let out = handle_client_line(CALL, mode, "fs", &mut eval);
+            assert!(out.to_server.is_none(), "{mode:?}");
+            let reply: Value = serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
+            assert_eq!(reply["result"]["isError"], true, "{mode:?}");
+            assert!(
+                reply["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no receipt could be recorded"),
+                "{reply}"
+            );
+            let warning = &out.warnings[0];
+            assert!(
+                warning.contains("REFUSED") && warning.contains(mode.as_str()),
+                "{warning}"
+            );
+            assert!(!warning.contains("forwarded"), "{warning}");
+        }
     }
 
     /// A receipt that would not verify when read back: the call is not
@@ -1385,16 +1411,32 @@ mod tests {
         }
     }
 
+    /// A receipt the journal could not take (`Unavailable`): the call is
+    /// refused in both modes and the reply carries the evidence id, so the
+    /// client can quote what was decided but not recorded.
     #[test]
-    fn journal_failure_refuses_in_enforce_and_warns_in_observe() {
-        let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
-        eval.journal_error = Some(JournalError::Unavailable("disk full".into()));
-        let out = handle_client_line(CALL, Mode::Enforce, "fs", &mut eval);
-        assert!(out.to_server.is_none());
-        assert!(out.to_client.is_some());
-        let out = handle_client_line(CALL, Mode::Observe, "fs", &mut eval);
-        assert_eq!(out.to_server.as_deref(), Some(CALL));
-        assert!(out.warnings[0].contains("could NOT be written"));
+    fn journal_failure_refuses_the_call_in_both_modes() {
+        for mode in [Mode::Enforce, Mode::Observe] {
+            let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
+            eval.journal_error = Some(JournalError::Unavailable("disk full".into()));
+            let out = handle_client_line(CALL, mode, "fs", &mut eval);
+            assert!(out.to_server.is_none(), "{mode:?}");
+            let reply: Value = serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
+            assert_eq!(reply["result"]["isError"], true, "{mode:?}");
+            let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.contains("could not record a receipt") && text.contains("Evidence id: "),
+                "{text}"
+            );
+            let warning = &out.warnings[0];
+            assert!(
+                warning.contains("could not be written")
+                    && warning.contains("REFUSED")
+                    && warning.contains(mode.as_str()),
+                "{warning}"
+            );
+            assert!(!warning.contains("forwarded"), "{warning}");
+        }
     }
 
     /// Unparseable client lines: observe forwards an unparseable line, but never silently:
@@ -1448,6 +1490,100 @@ mod tests {
             assert_eq!(reply["id"], id, "{label}");
             assert!(eval.calls.is_empty(), "{label}");
         }
+    }
+
+    /// An ambiguous line in observe whose reading could not be recorded (the
+    /// journal did not take the receipt, or the call could not be
+    /// evaluated) is refused, not forwarded: what cannot be recorded is not
+    /// run, whatever the tool is called. With a working journal the same
+    /// line is forwarded, as before.
+    #[test]
+    fn an_ambiguous_line_is_refused_in_observe_when_a_reading_cannot_be_recorded() {
+        let raw = br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"echo","arguments":{"n":1e2}}}
+"#;
+        assert!(matches!(
+            classify(raw),
+            Classified::Ambiguous {
+                unparsed: false,
+                ..
+            }
+        ));
+        let mut recorded = Fixed::new(Ok(DecisionOutcome::Allow));
+        let out = handle_client_line(raw, Mode::Observe, "fs", &mut recorded);
+        assert_eq!(out.to_server.as_deref(), Some(&raw[..]));
+
+        let mut journal_down = Fixed::new(Ok(DecisionOutcome::Allow));
+        journal_down.journal_error = Some(JournalError::Unavailable("disk full".into()));
+        let not_evaluated = Fixed::new(Err("KEY_LOAD".into()));
+        for (label, mut eval) in [("journal", journal_down), ("evaluation", not_evaluated)] {
+            let out = handle_client_line(raw, Mode::Observe, "fs", &mut eval);
+            assert!(out.to_server.is_none(), "{label}: forwarded");
+            let reply: Value = serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
+            assert_eq!(reply["id"], 7, "{label}");
+            assert_eq!(reply["result"]["isError"], true, "{label}");
+            assert!(
+                reply["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no receipt could be recorded")
+                    || reply["result"]["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("could not record a receipt"),
+                "{label}: {reply}"
+            );
+            assert!(
+                out.warnings.iter().any(|w| w
+                    .contains("ambiguous line with a tools/call reading that could not be recorded REFUSED (observe)")),
+                "{label}: {:?}",
+                out.warnings
+            );
+        }
+    }
+
+    /// Case 6 of F1, the only one with no trace on disk: another process
+    /// holds the journal lock past its timeout. The real gate waits
+    /// `LOCK_TIMEOUT`, writes nothing, and observe refuses the call; once
+    /// the lock is let go the next call is recorded and forwarded.
+    #[test]
+    fn a_journal_lock_held_past_its_timeout_refuses_the_call_in_observe() {
+        let temp = tempfile::tempdir().unwrap();
+        let home =
+            crate::store::Home::new(std::fs::canonicalize(temp.path()).unwrap().join("home"));
+        crate::store::init(&home).unwrap();
+        let mut gate = crate::gate::Gate::load(&home, Mode::Observe).unwrap();
+        let held = crate::journal::JournalLock::acquire(&home.receipts_dir()).unwrap();
+        let started = std::time::Instant::now();
+        let out = handle_client_line(CALL, Mode::Observe, "fs", &mut gate);
+        assert!(
+            started.elapsed() >= crate::journal::LOCK_TIMEOUT,
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(out.to_server.is_none(), "forwarded: {:?}", out.warnings);
+        let reply: Value = serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
+        assert_eq!(reply["id"], 7);
+        assert_eq!(reply["result"]["isError"], true);
+        assert!(
+            reply["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("could not record a receipt"),
+            "{reply}"
+        );
+        assert!(
+            out.warnings.iter().any(|w| w.contains("lock")
+                && w.contains("could not be written")
+                && w.contains("REFUSED (observe")),
+            "{:?}",
+            out.warnings
+        );
+        assert!(crate::receipts::read_journal(&home).unwrap().is_empty());
+
+        drop(held);
+        let out = handle_client_line(CALL, Mode::Observe, "fs", &mut gate);
+        assert_eq!(out.to_server.as_deref(), Some(CALL), "{:?}", out.warnings);
+        assert_eq!(crate::receipts::read_journal(&home).unwrap().len(), 1);
     }
 
     /// Ambiguous client lines in observe: the warning names the raw line by

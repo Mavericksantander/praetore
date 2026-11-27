@@ -648,15 +648,16 @@ pub fn verify_journal_with(
     }
     // The writer's own view of the journal: `wrap` finds the next position
     // with the same function, and refuses to append when it fails. A journal
-    // the writer refuses leaves every later call without a receipt (observe
-    // forwards it, enforce refuses it), so `verify` must not pass on it.
+    // the writer refuses gets every later call refused, in both modes, while
+    // its chain and head stay intact, so `verify` must not pass on it. It sees
+    // this only while the journal stays in that state.
     match crate::gate::Journal::new(home).check_appendable() {
         Ok(None) => {}
         Ok(Some(warning)) => report.warnings.push(format!(
-            "WARNING journal: the next receipt cannot be appended right now ({warning}); until it can, wrap forwards calls WITHOUT a receipt in observe and refuses them in enforce"
+            "WARNING journal: the next receipt cannot be appended right now ({warning}); until it can, every call is refused, in both modes"
         )),
         Err(error) => report.failures.push(format!(
-            "FAIL journal: wrap cannot append the next receipt ({error}); every call is forwarded WITHOUT a receipt in observe and refused in enforce until the journal is repaired"
+            "FAIL journal: wrap cannot append the next receipt ({error}); every call is refused, in both modes, until the journal is repaired"
         )),
     }
     let approvals = crate::approvals::verify(home, &parsed_evidence)?;

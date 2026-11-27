@@ -3,12 +3,13 @@
 //! `wrap` finds where the next receipt goes with `journal::next_entry`.
 //! When that fails (a blank line at the end of the daily file, a
 //! whitespace-only later `*.jsonl` file, a symlink in place of `receipts/`
-//! or of the daily file), observe forwards every call WITHOUT a receipt and
-//! enforce refuses every call. Before this check, `verify` with both heads
-//! said OK on such a home: the chain was intact and the head unchanged,
-//! while nothing was being recorded. Now `verify` runs the same function and
-//! reports FAIL. A daily file that exists but cannot be opened for append is
-//! a WARNING: permissions can change before the next call.
+//! or of the daily file), every call is refused, in both modes, until the
+//! journal is repaired. Before this check, `verify` with both heads said OK
+//! on such a home: the chain was intact and the head unchanged, while no call
+//! could be recorded. Now `verify` runs the same function and reports FAIL.
+//! A daily file that exists but cannot be opened for append is a WARNING:
+//! permissions can change before the next call. `verify` sees either state
+//! only while the journal stays in it; once repaired, it says OK again.
 
 use praetore_mcp::store::Home;
 use std::{
@@ -157,13 +158,16 @@ fn seeded() -> (tempfile::TempDir, Home, String) {
 }
 
 /// The state `wrap` refuses fails `verify`, with and without the heads,
-/// naming the writer's error; and an observe call on that home ran with no
-/// receipt (the head did not move), which is what the failure is about.
+/// naming the writer's error; and an observe call on that home is refused,
+/// not run (the head did not move): every call is refused, in both modes,
+/// until the journal is repaired.
 fn assert_fails_as_unappendable(home: &Home, head: &str, cause: &str) {
     let stderr = observe_echo(home, 2);
     assert!(
-        stderr.contains("could NOT be written") && stderr.contains("fake_server: EXECUTED echo"),
-        "observe forwarded the call without a receipt before this check existed: {stderr}"
+        stderr.contains("could not be written")
+            && stderr.contains("REFUSED (observe")
+            && !stderr.contains("fake_server: EXECUTED echo"),
+        "every call is refused, in both modes, until the journal is repaired: {stderr}"
     );
     for out in [anchored(home, head), verify(home, &[])] {
         let text = stdout(&out);
@@ -215,8 +219,8 @@ fn a_symlink_in_place_of_the_daily_file_fails_verify() {
 }
 
 /// A daily file that exists but does not open for append is a warning, not
-/// a failure: permissions can change before the next call. The call still
-/// ran without a receipt, so `verify` says so.
+/// a failure: permissions can change before the next call. Meanwhile the
+/// call is refused, in both modes, so `verify` says so.
 #[cfg(unix)]
 #[test]
 fn a_read_only_daily_file_is_a_warning() {
@@ -230,7 +234,12 @@ fn a_read_only_daily_file_is_a_warning() {
     let file = daily_file(&home);
     fs::set_permissions(&file, fs::Permissions::from_mode(0o400)).unwrap();
     let stderr = observe_echo(&home, 2);
-    assert!(stderr.contains("could NOT be written"), "{stderr}");
+    assert!(
+        stderr.contains("could not be written")
+            && stderr.contains("REFUSED (observe")
+            && !stderr.contains("fake_server: EXECUTED echo"),
+        "{stderr}"
+    );
     let out = anchored(&home, &head);
     let text = stdout(&out);
     assert_eq!(out.status.code(), Some(0), "{text}");
@@ -281,5 +290,8 @@ fn an_empty_home_and_an_empty_daily_file_verify() {
     );
     // And the writer does append after it.
     let stderr = observe_echo(&home, 2);
-    assert!(!stderr.contains("could NOT be written"), "{stderr}");
+    assert!(
+        !stderr.contains("could not be written") && stderr.contains("fake_server: EXECUTED echo"),
+        "{stderr}"
+    );
 }

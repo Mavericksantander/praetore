@@ -2,15 +2,38 @@
 
 ## Unreleased
 
+### Breaking
+
+- **praetore-mcp: observe refuses a call it cannot record, like enforce.**
+  When the receipts journal could not take the receipt (a blank or cut last
+  line, a whitespace-only later daily file, `receipts/` or the daily file
+  replaced by a symlink, a read-only daily file, `.journal.lock` held by
+  another process for more than 10 s, a full disk), observe forwarded the
+  `tools/call` with a stderr warning and no receipt. The journal still read
+  back intact, so `verify --expected-head` with the head kept earlier said
+  OK and nothing showed that calls had run. The same happened when a call
+  could not be evaluated after startup (clock, replay guard), and for an
+  ambiguous line whose `tools/call` reading could not be recorded. All of
+  these are now refused in observe as in enforce: the client gets an MCP
+  tool error saying that no receipt could be recorded (with the evidence id
+  when there is one) and stderr says `REFUSED (observe, ...)`. Observe
+  still never blocks because of a policy decision: a DENY or
+  REQUIRE_APPROVAL is forwarded with its receipt, as before. Unparseable client lines in
+  observe are unchanged (no receipt). **Action:** if you run observe, a home
+  that cannot record (full disk, a lock held by another process, a
+  read-only or damaged journal) now stops tool calls instead of letting
+  them run unrecorded; the client shows the error. Fix the journal (the
+  troubleshooting table in the GUIDE lists each message) to resume.
+
 ### Fixed
 
 - **praetore-mcp: `verify` fails when `wrap` could not append the next
   receipt.** A blank line at the end of the daily file, a whitespace-only
   later `*.jsonl` file, or a symlink in place of `receipts/` or of the
-  daily file made `wrap` refuse to append: observe forwarded every call
-  WITHOUT a receipt and enforce refused every call, while `verify`, with
-  both heads, said OK, because the chain and its head were intact. `verify`
-  now finds the next position with the same function as `wrap`
+  daily file made `wrap` refuse to append, so every call is refused, in
+  both modes, until the journal is repaired (see Breaking), while `verify`,
+  with both heads, said OK, because the chain and its head were intact.
+  `verify` now finds the next position with the same function as `wrap`
   (`journal::next_entry`) and reports
   `FAIL journal: wrap cannot append the next receipt (...)`, exit 1, with
   or without the heads. A daily file that exists but does not open for
@@ -21,8 +44,8 @@
 - **praetore-mcp: the journal and approval locks wait at most 10 s.** A
   process that kept `receipts/.journal.lock` or `approvals/.lock` left
   every call waiting with no reply. After 10 s the wait ends with an error
-  naming the lock: the receipt is not written, so enforce refuses the call
-  and observe warns.
+  naming the lock: the receipt is not written, so the call is refused
+  (in both modes, see Breaking).
 - **praetore-mcp: the `-32700` for a refused line carries its `id`** when
   the line has one complete top-level `id`. Otherwise the `id` is `null`,
   as before.

@@ -1371,8 +1371,7 @@ impl Journal {
     /// What `verify` says about the next append, without the lock and
     /// without writing. `Err` is the state [`Journal::record`] refuses
     /// ([`crate::journal::next_entry`]): a failed check, because every call
-    /// is then forwarded without a receipt (observe) or refused (enforce)
-    /// until someone fixes the journal. `Ok(Some(warning))` is a daily file
+    /// is then refused, in both modes, until someone fixes the journal. `Ok(Some(warning))` is a daily file
     /// or directory that does not take an append right now
     /// ([`crate::journal::append_access`]), which can change before the
     /// next call.
