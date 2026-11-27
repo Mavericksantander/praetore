@@ -430,7 +430,15 @@ it is; before, such lines verified when they came before the first chained
 entry, and a signed receipt could be added there without changing the
 head. Move a 0.3.3 journal out of `receipts/` to keep it. The v0.3.3
 `praetore-mcp verify` does not read 0.3.4 receipts: it reads each line as
-a bare evidence document, and a 0.3.4 line is not one. Concurrent
+a bare evidence document, and a 0.3.4 line is not one. A chained line is
+read only in the byte form `wrap` writes: `{"seq":N,"prev":"<64
+hex>","evidence":<canonical evidence>}`, with no other spacing, key order
+or JSON escape, as the approval journal already requires of its lines.
+Integrity and the chain link are computed over the canonical evidence, so a
+line written again in another byte form would otherwise verify while a
+reader of the text sees other bytes. `verify` and `receipts` report such a
+line as `not in canonical form`, and `wrap` holds an approved call it
+meets while reading which approvals were used. Concurrent
 wrappers serialize appends with a lock file (`receipts/.journal.lock`,
 `flock`, on Linux and macOS). A wrapper waits at most 10 s for that lock;
 after that the receipt is not written, so the call is refused in both

@@ -94,11 +94,25 @@ pub fn parse_line(text: &str) -> Result<Entry, String> {
     let prev = ChainLink::from_hex(line.prev).ok_or("prev is not 64 lowercase hex characters")?;
     let evidence =
         Evidence::from_json(line.evidence.get()).map_err(|e| format!("{}: {e}", e.code()))?;
+    let position = Position {
+        seq: line.seq,
+        prev,
+    };
+    // The bytes must be the ones `chained_line` writes. Integrity and the
+    // chain link are computed over the canonical evidence, so a line written
+    // again in another byte form (whitespace, key order, a JSON escape) would
+    // otherwise verify while readers that look at the text see other bytes.
+    let canonical = evidence
+        .to_json()
+        .map_err(|e| format!("cannot serialize evidence: {e}"))?;
+    let expected = chained_line(&position, &canonical);
+    if text != expected.trim_end_matches('\n') {
+        return Err(
+            "not in canonical form: the line is not the bytes wrap writes for this entry".into(),
+        );
+    }
     Ok(Entry {
-        position: Some(Position {
-            seq: line.seq,
-            prev,
-        }),
+        position: Some(position),
         evidence,
     })
 }

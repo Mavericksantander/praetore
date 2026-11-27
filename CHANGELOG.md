@@ -51,6 +51,19 @@
   `FAIL` line and still makes the result FAIL with exit 1, but it is no
   longer counted as a failed receipt (a journal of two lines with one bad
   line said `1 verified, 2 failed`; it now says `1 verified, 1 failed`).
+- **praetore-mcp: a receipts journal line is read only in the byte form
+  `wrap` writes.** Integrity and the chain link are computed over the
+  canonical evidence, so a line written again with other spacing, another
+  key order or a JSON escape verified, also against the saved head, while
+  the text read other bytes: a forwarded receipt whose
+  `praetore.approval_id` was written as `praetore.approval\u005fid` was not
+  found by the substring search `wrap` used for used approvals, and with
+  the execution record cut from the approval journal the same approval ran
+  again. `verify` and `receipts` now report such a line as `not in
+  canonical form` (the approval journal already did), and `wrap` parses
+  every receipt line before it forwards on an approval, so the call is
+  held. Lines written by praetore-mcp 0.3.4 and later are already in that
+  form.
 - **praetore-mcp: the journal and approval locks wait at most 10 s.** A
   process that kept `receipts/.journal.lock` or `approvals/.lock` left
   every call waiting with no reply. After 10 s the wait ends with an error
