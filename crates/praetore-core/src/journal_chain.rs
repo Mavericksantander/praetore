@@ -1450,6 +1450,30 @@ mod tests {
         assert!(verify_journal_report(&second, &pins, None, None, None).is_err());
     }
 
+    /// A range's anchor line in another byte form fails like any other
+    /// receipt line, also with the expected anchor and head.
+    #[test]
+    fn a_range_anchor_in_another_byte_form_fails() {
+        let pins = [set_03_pin()];
+        let (_, first_head, second, second_head, _) = two_ranges(10);
+        let (anchor, rest) = second.split_once('\n').unwrap();
+        let rewritten = anchor.replacen("{\"seq\":", "{\"seq\": ", 1);
+        assert_ne!(rewritten, anchor);
+        let text = format!("{rewritten}\n{rest}");
+        let error = verify_journal_range(
+            &text,
+            &pins,
+            None,
+            Some(&first_head.head),
+            Some(&second_head.head),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, ChainError::NotCanonical { line: 9 }),
+            "{error}"
+        );
+    }
+
     #[test]
     fn a_range_with_a_wrong_anchor_fails() {
         let pins = [set_03_pin()];
