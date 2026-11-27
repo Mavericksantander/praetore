@@ -364,3 +364,73 @@ fn an_ambiguous_line_is_refused_in_observe_when_its_receipt_cannot_be_written() 
     let out = verify_anchored(&home, &head);
     assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
 }
+
+/// Rewrites the home's authority with a validity that ended a minute ago,
+/// signed again with the home's issuer key: the home still loads (nothing
+/// at startup checks the window), and the engine refuses to evaluate each
+/// call with `AuthorityExpired`, which is what happens about a year after
+/// `init`.
+fn expire_the_authority(home: &Home) {
+    use praetore_core::{AgentIdentity, AgentKeyPair, Authority, authority::Validity};
+    use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
+    let key: Value = serde_json::from_str(&fs::read_to_string(home.issuer_key()).unwrap()).unwrap();
+    let secret: [u8; 32] = hex::decode(key["secret_key_hex"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let issuer = AgentKeyPair::from_secret_bytes(&secret);
+    let agent: AgentIdentity =
+        serde_json::from_str(&fs::read_to_string(home.agent()).unwrap()).unwrap();
+    let authority: Authority =
+        serde_json::from_str(&fs::read_to_string(home.authority()).unwrap()).unwrap();
+    let at = |offset: Duration| {
+        (OffsetDateTime::now_utc() + offset)
+            .replace_nanosecond(0)
+            .unwrap()
+            .format(&Rfc3339)
+            .unwrap()
+    };
+    let mut authority = authority.with_validity(Validity {
+        not_before: Some(at(-Duration::minutes(10))),
+        not_after: Some(at(-Duration::minutes(1))),
+    });
+    authority.sign_for_agent(&issuer, &agent).unwrap();
+    fs::write(
+        home.authority(),
+        serde_json::to_string_pretty(&authority).unwrap(),
+    )
+    .unwrap();
+}
+
+/// A call that cannot be evaluated after a successful start (here, an
+/// authority past its window) has no decision to record: observe refuses
+/// it, end to end, as enforce does, and the journal gets nothing.
+#[test]
+fn a_call_that_cannot_be_evaluated_is_refused_in_observe() {
+    let (_temp, home) = init_home();
+    seed(&home);
+    let before = fs::read(daily_file(&home)).unwrap();
+    expire_the_authority(&home);
+
+    let (replies, stderr) = wrap_observe(&home, &[call(3, "echo", json!({"after": "expiry"}))]);
+    assert_eq!(executed(&stderr, "echo"), 0, "forwarded: {stderr}");
+    let reply = by_id(&replies, 3);
+    assert_eq!(reply["result"]["isError"], true, "{reply}");
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("could not evaluate this tool call")
+            && text.contains("no receipt could be recorded"),
+        "{text}"
+    );
+    assert!(
+        stderr.lines().any(|line| line.contains("ERROR evaluating")
+            && line.contains("AUTHORITY_EXPIRED")
+            && line.contains("REFUSED (observe")),
+        "{stderr}"
+    );
+    assert_eq!(
+        fs::read(daily_file(&home)).unwrap(),
+        before,
+        "a receipt was written"
+    );
+}
