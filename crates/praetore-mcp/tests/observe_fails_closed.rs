@@ -279,3 +279,88 @@ fn a_read_only_daily_file_refuses_calls_in_observe() {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
     });
 }
+
+/// (d) The journal lock held by another process past its timeout, the
+/// case that leaves nothing on disk. Each call waits the lock timeout,
+/// writes nothing and is refused; the journal still ends at the seed.
+#[test]
+fn a_held_journal_lock_refuses_calls_in_observe() {
+    let (_temp, home) = init_home();
+    let head = seed(&home);
+    let held = praetore_mcp::journal::JournalLock::acquire(&home.receipts_dir()).unwrap();
+    let (replies, stderr) = wrap_observe(&home, &[call(3, "echo", json!({"while": "locked"}))]);
+    drop(held);
+    assert_eq!(executed(&stderr, "echo"), 0, "forwarded: {stderr}");
+    let reply = by_id(&replies, 3);
+    assert_eq!(reply["result"]["isError"], true, "{reply}");
+    assert!(
+        reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("could not record a receipt"),
+        "{reply}"
+    );
+    assert!(
+        stderr.lines().any(|line| line.contains("lock")
+            && line.contains("could not be written")
+            && line.contains("REFUSED (observe")),
+        "{stderr}"
+    );
+    let out = verify_anchored(&home, &head);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+}
+
+/// (e) An ambiguous line (a number not in canonical form) after a blank
+/// last line: observe records each reading of an ambiguous line, and a
+/// reading whose receipt cannot be written refuses the whole line, not
+/// only one named `safety*`.
+#[test]
+fn an_ambiguous_line_is_refused_in_observe_when_its_receipt_cannot_be_written() {
+    let (_temp, home) = init_home();
+    let head = seed(&home);
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(daily_file(&home))
+        .unwrap();
+    file.write_all(b"\n").unwrap();
+    drop(file);
+    // Sent as written: serde_json would print 1e2 as 100.0.
+    let mut input = session(&[]);
+    input.push_str(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"n":1e2}}}"#);
+    input.push('\n');
+    let server = fake_server();
+    let out = run(
+        Path::new(bin()),
+        &[
+            "wrap",
+            "--dir",
+            home.root.to_str().unwrap(),
+            "--name",
+            "fake",
+            "--mode",
+            "observe",
+            "--no-report",
+            "--",
+            server.to_str().unwrap(),
+        ],
+        &input,
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "{stderr}");
+    assert_eq!(executed(&stderr, "echo"), 0, "forwarded: {stderr}");
+    assert!(stderr.contains("ambiguous client line"), "{stderr}");
+    assert!(
+        stderr.contains(
+            "ambiguous line with a tools/call reading that could not be recorded REFUSED (observe)"
+        ),
+        "{stderr}"
+    );
+    let replies: Vec<Value> = stdout(&out)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(by_id(&replies, 3)["result"]["isError"], true, "{replies:?}");
+    let out = verify_anchored(&home, &head);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+}
