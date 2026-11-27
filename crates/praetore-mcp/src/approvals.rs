@@ -423,15 +423,14 @@ pub fn approval_named(evidence: &Evidence) -> Result<Option<&str>, String> {
     }
 }
 
-/// Approval ids named by receipts in the receipts journal. Only lines that
-/// contain the context key are parsed; one that cannot be read is an error,
-/// so the call is not forwarded.
+/// Approval ids named by receipts in the receipts journal. Every line is
+/// parsed as `verify` parses it; one that cannot be read is an error, so
+/// the call is not forwarded. A substring test on the raw text is not
+/// enough: a line written again with the key as a JSON escape would hide
+/// its approval id from it.
 fn approvals_named_in_receipts(home: &Home) -> Result<BTreeSet<String>, String> {
     let mut named = BTreeSet::new();
     for line in crate::receipts::read_journal(home)? {
-        if !line.text.contains(APPROVAL_KEY) {
-            continue;
-        }
         let entry = crate::journal::parse_line(&line.text).map_err(|e| {
             format!(
                 "cannot read {}:{} to check which approvals were used: {e}",
