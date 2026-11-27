@@ -413,7 +413,10 @@ fn initialize_with(
     }
 
     write_private_file(&directory.join(PROJECT_ROOT_FILE), root.as_bytes())?;
-    let policy = default_policy_for(root, &home, profiles);
+    // The state directory holds the agent and attester keys: the policy
+    // denies every read under it (see `state_directory`).
+    let state = state_directory(directory)?;
+    let policy = default_policy_for(root, &home, &state, profiles);
     policy.validate()?;
     write_private_file(
         &directory.join(POLICY_FILE),
@@ -430,13 +433,24 @@ fn initialize_with(
 }
 
 #[cfg(test)]
-fn default_policy(root: &str, home: &str) -> Policy {
-    default_policy_for(root, home, &PROFILES)
+fn default_policy(root: &str, home: &str, state: &str) -> Policy {
+    default_policy_for(root, home, state, &PROFILES)
+}
+
+/// The canonical path of the hook state directory. The agent and attester
+/// private keys live there, so no profile may read under it: the default
+/// policy denies it (`deny-state-reads`) and the binary holds such a read
+/// whatever the policy says (guard `state_read`).
+fn state_directory(directory: &Path) -> Result<String, BoxError> {
+    Ok(fs::canonicalize(directory)?
+        .to_str()
+        .ok_or("hook state directory must be valid UTF-8")?
+        .to_string())
 }
 
 /// [`default_policy`] for the given profiles: the subagent rules name every
 /// profile except `main`.
-fn default_policy_for(root: &str, home: &str, profiles: &[(&str, &[&str])]) -> Policy {
+fn default_policy_for(root: &str, home: &str, state: &str, profiles: &[(&str, &[&str])]) -> Policy {
     let non_main = profiles
         .iter()
         .map(|(name, _)| *name)
@@ -450,6 +464,15 @@ fn default_policy_for(root: &str, home: &str, profiles: &[(&str, &[&str])]) -> P
         "claude-code-agents",
         1,
         vec![
+            // The hook state (agent and attester private keys, receipts): no
+            // subagent reads under it. The main session is held by the
+            // binary's `state_read` guard alone: a restrictive path rule
+            // without a profile condition would also match every read whose
+            // path does not resolve to itself (unsafe for the engine), and
+            // `main` may read such paths elsewhere (`allow-read-main`).
+            PolicyRule::new("deny-state-reads", "claude:read", PolicyEffect::Deny)
+                .with_parameter_condition(PolicyCondition::path_prefix("path", state))
+                .with_context_condition(PolicyCondition::one_of("profile", non_main.clone())),
             PolicyRule::new("deny-git-internals", "claude:write", PolicyEffect::Deny)
                 .with_parameter_condition(PolicyCondition::path_prefix(
                     "path",
@@ -614,6 +637,7 @@ fn classify(
     root: Option<&str>,
 ) -> (String, &'static str, Value, Option<Value>) {
     let field = |key: &str| input.get(key).and_then(Value::as_str);
+    let param = |key: &str| Param::of(input, key);
     let path_param = |path: Option<&str>| match path.or(cwd) {
         Some(path) => {
             let lexical = absolute(path, cwd);
@@ -634,19 +658,43 @@ fn classify(
         let (parameters, check) = path_param(path);
         (action.to_string(), capability, parameters, check)
     };
+    // A path tool without its path parameter as a string (absent, another
+    // JSON type, another key such as `file_path` on NotebookEdit, or a
+    // `tool_input` that is not an object) fails closed: the policy sees
+    // `PATH_CHECK_FAILED`, which no ALLOW matches and every restrictive
+    // path rule does.
+    let missing = |action: &str, capability: &'static str, parameters: Value| {
+        let check = json!({ "lexical": null, "resolved": null, "status": "missing" });
+        (action.to_string(), capability, parameters, Some(check))
+    };
+    // `Read` names its file; it never falls back to the working directory.
+    let read = |path: Param| match path {
+        Param::Text(path) => with_path("claude:read", "fs:read", Some(path)),
+        Param::Absent | Param::Invalid => missing(
+            "claude:read",
+            "fs:read",
+            json!({ "path": PATH_CHECK_FAILED }),
+        ),
+    };
+    // `Grep` and `Glob` search `path`, or the working directory Claude Code
+    // reports when the parameter is absent (what the tools do).
+    let search = |path: Param| match (path, cwd) {
+        (Param::Text(path), _) => with_path("claude:read", "fs:read", Some(path)),
+        (Param::Absent, Some(_)) => with_path("claude:read", "fs:read", None),
+        (Param::Absent, None) | (Param::Invalid, _) => missing(
+            "claude:read",
+            "fs:read",
+            json!({ "path": PATH_CHECK_FAILED }),
+        ),
+    };
     // A write also records whether it touches client configuration (see
     // `CLIENT_CONFIG_PATHS`), checked on the lexical and the resolved path.
-    // A write tool without its path parameter (or with another one, such as
-    // `file_path` on NotebookEdit) fails closed: the policy sees
-    // `PATH_CHECK_FAILED`, which no ALLOW matches.
-    let write = |path: Option<&str>| {
-        let Some(path) = path else {
-            let check = json!({ "lexical": null, "resolved": null, "status": "missing" });
-            return (
-                "claude:write".to_string(),
+    let write = |path: Param| {
+        let Param::Text(path) = path else {
+            return missing(
+                "claude:write",
                 "fs:write",
                 json!({ "path": PATH_CHECK_FAILED, "client_config": true }),
-                Some(check),
             );
         };
         let (action, capability, mut parameters, check) =
@@ -664,28 +712,32 @@ fn classify(
         (action, capability, parameters, check)
     };
     match tool_name {
-        "Read" => with_path("claude:read", "fs:read", field("file_path")),
-        "Grep" | "Glob" => with_path("claude:read", "fs:read", field("path")),
-        "Edit" | "MultiEdit" | "Write" => write(field("file_path")),
-        "NotebookEdit" => write(field("notebook_path")),
+        "Read" => read(param("file_path")),
+        "Grep" | "Glob" => search(param("path")),
+        "Edit" | "MultiEdit" | "Write" => write(param("file_path")),
+        "NotebookEdit" => write(param("notebook_path")),
         // `Monitor` runs a shell command like `Bash` and gets the same scan.
         // `PowerShell` is not POSIX shell: the scanner cannot analyze it, so
-        // the main session always needs approval. A `Monitor` without a
-        // command (a WebSocket source) is unanalyzable too.
+        // the main session always needs approval. A command tool without a
+        // string `command` (a `Monitor` with a WebSocket source, a `Bash`
+        // whose input is not an object) is unanalyzable too.
         "Bash" | "Monitor" | "PowerShell" => {
-            let command = field("command").unwrap_or_default();
-            let scan = match tool_name {
-                "PowerShell" => shell::Scan::Unanalyzable("PowerShell is not analyzed"),
-                "Monitor" if field("command").is_none() => {
-                    shell::Scan::Unanalyzable("Monitor without a command")
-                }
-                _ => shell::scan(command),
+            let command = param("command");
+            let text = match command {
+                Param::Text(text) => text,
+                Param::Absent | Param::Invalid => "",
+            };
+            let scan = match (tool_name, command) {
+                ("PowerShell", _) => shell::Scan::Unanalyzable("PowerShell is not analyzed"),
+                (_, Param::Text(command)) => shell::scan(command),
+                (_, Param::Absent) => shell::Scan::Unanalyzable("no command string"),
+                (_, Param::Invalid) => shell::Scan::Unanalyzable("command is not a string"),
             };
             let parameters = match scan {
                 shell::Scan::Analyzed(analysis) => {
                     let paths = command_paths(&analysis.paths, cwd, root);
                     json!({
-                        "command": command,
+                        "command": text,
                         "analyzable": true,
                         "git_push": analysis.git_push,
                         "protected_path": paths.protected,
@@ -694,7 +746,7 @@ fn classify(
                     })
                 }
                 shell::Scan::Unanalyzable(reason) => json!({
-                    "command": command,
+                    "command": text,
                     "analyzable": false,
                     "unanalyzable_reason": reason,
                 }),
@@ -727,6 +779,30 @@ fn classify(
             json!({ "tool": other }),
             None,
         ),
+    }
+}
+
+/// A string parameter of a tool input.
+#[derive(Debug, Clone, Copy)]
+enum Param<'a> {
+    /// The key is not in the input.
+    Absent,
+    /// The key holds a string.
+    Text(&'a str),
+    /// The key holds another JSON type, or the input is not an object. It
+    /// fails closed like an absent path parameter: the tool cannot have
+    /// been called with it.
+    Invalid,
+}
+
+impl<'a> Param<'a> {
+    fn of(input: &'a Value, key: &str) -> Self {
+        match input.as_object().map(|object| object.get(key)) {
+            None => Self::Invalid,
+            Some(None) => Self::Absent,
+            Some(Some(Value::String(text))) => Self::Text(text),
+            Some(Some(_)) => Self::Invalid,
+        }
     }
 }
 
@@ -1235,11 +1311,19 @@ fn instance_claims(input: &HookInput) -> (Vec<(&'static str, String)>, Option<Va
 }
 
 /// Signed context keys of a denial by the hook's own guard: which guard
-/// (`exec_reserved_to_main`, `client_config_write`, `governance_write`,
-/// `path_check_failed`, `no_project_root`) and the profile the call would
-/// otherwise have had.
+/// (`exec_reserved_to_main`, `state_read`, `client_config_write`,
+/// `governance_write`, `path_check_failed`, `no_project_root`) and the
+/// profile the call would otherwise have had.
 const HOOK_GUARD_CLAIM: &str = "praetore.hook_guard";
 const REQUESTED_PROFILE_CLAIM: &str = "praetore.requested_profile";
+/// The guard that holds a read under the hook state directory. With
+/// [`PATH_CHECK_FAILED_GUARD`] on a read, the only guards that also hold the
+/// main session, so a receipt may name `main` as the requested profile with
+/// these and no other.
+const STATE_READ_GUARD: &str = "state_read";
+/// The guard that holds a read or a write whose path failed its check (for
+/// a read: the path parameter is absent or not a string).
+const PATH_CHECK_FAILED_GUARD: &str = "path_check_failed";
 
 /// Signed context key for Claude Code's `tool_use_id`. It ties a receipt to
 /// the tool call it was made for; it is not a replay key (a re-delivered
@@ -1383,14 +1467,39 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
                 (Some(root), Some(path)) => governed(path, root),
                 _ => true,
             });
+    // No profile reads under the hook state directory, `main` included: it
+    // holds the agent and attester private keys, with which anyone can sign
+    // receipts that `verify` accepts. The default policy denies it too
+    // (`deny-state-reads`); this guard holds the read whatever the policy
+    // says, on the path as written and as resolved.
+    let state = state_directory(directory)?;
+    let state_guard = action_type == "claude:read"
+        && path_check.as_ref().is_some_and(|check| {
+            ["lexical", "resolved"].iter().any(|key| {
+                check[*key]
+                    .as_str()
+                    .is_some_and(|path| within(&normalize(path), &state))
+            })
+        });
+    let path_missing = path_check
+        .as_ref()
+        .is_some_and(|check| check["status"] == json!("missing"));
+    // A read without its path as a string fails closed for every profile.
+    // The policy alone cannot hold `main` here: `allow-read-main` has no
+    // path condition, so the unsafe `PATH_CHECK_FAILED` value matches it.
+    let read_guard = action_type == "claude:read" && path_missing;
     // Which guard held the call, and the profile it would have had, are
     // recorded in the signed context: the engine's own reason (the missing
     // capability of `unregistered`) does not say why.
     let guard = if exec_guard {
         Some("exec_reserved_to_main")
+    } else if state_guard {
+        Some(STATE_READ_GUARD)
+    } else if read_guard {
+        Some(PATH_CHECK_FAILED_GUARD)
     } else if write_guard {
         Some(if parameters["path"] == json!(PATH_CHECK_FAILED) {
-            "path_check_failed"
+            PATH_CHECK_FAILED_GUARD
         } else if root.is_none() {
             "no_project_root"
         } else if parameters["client_config"] == json!(true) {
@@ -1405,9 +1514,6 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
         claims.push((HOOK_GUARD_CLAIM, guard.to_string()));
         claims.push((REQUESTED_PROFILE_CLAIM, profile_name.to_string()));
     }
-    let path_missing = path_check
-        .as_ref()
-        .is_some_and(|check| check["status"] == json!("missing"));
     let profile_name = if guard.is_some() {
         UNREGISTERED
     } else {
@@ -1507,13 +1613,17 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
             "agent_id without agent_type is not the main session; evaluated as '{UNREGISTERED}': {}",
             evidence.decision.reason
         ),
+        None if state_guard => format!(
+            "the hook state directory holds the agent and attester keys and no profile reads under it (guard {STATE_READ_GUARD}); evaluated as '{UNREGISTERED}': {}",
+            evidence.decision.reason
+        ),
         None if write_guard => format!(
             "writes to client configuration, .claude and .git are reserved to the main session (guard {}, GHSA-wg33-3h8v-xvqw); evaluated as '{UNREGISTERED}': {}",
             guard.unwrap_or_default(),
             evidence.decision.reason
         ),
         None if path_missing => format!(
-            "the {} tool input has no path parameter (`notebook_path` for NotebookEdit, `file_path` for Write, Edit and MultiEdit), so the path check fails closed",
+            "the {} tool input has no path parameter as a string (`notebook_path` for NotebookEdit, `file_path` for Read, Write, Edit and MultiEdit, `path` for Grep and Glob), so the path check fails closed",
             input.tool_name
         ),
         None if exec_guard => format!(
@@ -1784,17 +1894,21 @@ fn check_guard_claims(evidence: &Evidence, attribution: &Attribution) -> Result<
     }
     let known = [
         "exec_reserved_to_main",
+        STATE_READ_GUARD,
         "client_config_write",
         "governance_write",
-        "path_check_failed",
+        PATH_CHECK_FAILED_GUARD,
         "no_project_root",
     ];
-    let guard_ok = guard
-        .and_then(Value::as_str)
-        .is_some_and(|guard| known.contains(&guard));
-    let requested_ok = requested
-        .and_then(Value::as_str)
-        .is_some_and(|p| p != MAIN_AGENT && p != UNREGISTERED && p == attribution.agent);
+    let guard = guard.and_then(Value::as_str);
+    let guard_ok = guard.is_some_and(|guard| known.contains(&guard));
+    // Only the read guards (state directory, missing path) hold the main
+    // session; every other guard names a subagent profile.
+    let main_allowed = guard == Some(STATE_READ_GUARD)
+        || (guard == Some(PATH_CHECK_FAILED_GUARD) && evidence.action.action_type == "claude:read");
+    let requested_ok = requested.and_then(Value::as_str).is_some_and(|p| {
+        (p != MAIN_AGENT || main_allowed) && p != UNREGISTERED && p == attribution.agent
+    });
     if !guard_ok
         || !requested_ok
         || attribution.profile != UNREGISTERED

@@ -16,8 +16,11 @@ A denial the hook's own guard decided (GHSA-wg33-3h8v-xvqw) is signed as
 `unregistered` and names, in the signed context, the guard
 (praetore.hook_guard) and the profile the call would otherwise have had
 (praetore.requested_profile). Those fields must come together, name a known
-guard and a profile other than main and unregistered that equals the signed
-agent, and belong to a Deny.
+guard and a profile other than unregistered that equals the signed agent, and
+belong to a Deny. Only the read guards (state_read, a read under the hook
+state directory, which holds the private keys; path_check_failed on a
+claude:read, a read without its path as a string) also hold the main session,
+so only they may name main as the requested profile.
 
 Usage: check-attribution.py <bundle> [index.json]
 Exits 0 when every entry agrees with its signed receipt, 1 otherwise.
@@ -34,6 +37,7 @@ GUARD_KEY = "praetore.hook_guard"
 REQUESTED_KEY = "praetore.requested_profile"
 GUARDS = {
     "exec_reserved_to_main",
+    "state_read",
     "client_config_write",
     "governance_write",
     "path_check_failed",
@@ -99,8 +103,14 @@ def check(bundle, index_path):
         if guard is not None or requested is not None:
             if guard not in GUARDS:
                 errors.append(f"{name}: guard firmado desconocido {guard!r}")
-            if not isinstance(requested, str) or requested in ("main", UNREGISTERED) or requested != agent:
-                errors.append(f"{name}: perfil pedido {requested!r} no corresponde al agente firmado {agent!r}")
+            # Only the read guards hold the main session: a read under the
+            # state directory, or a read without its path as a string.
+            holds_main = guard == "state_read" or (
+                guard == "path_check_failed" and evidence["action"]["action_type"] == "claude:read"
+            )
+            reserved = (UNREGISTERED,) if holds_main else ("main", UNREGISTERED)
+            if not isinstance(requested, str) or requested in reserved or requested != agent:
+                errors.append(f"{name}: perfil pedido {requested!r} no corresponde al agente firmado {agent!r} (guard {guard!r})")
             if profile != UNREGISTERED or evidence["decision"]["outcome"] != "Deny":
                 errors.append(f"{name}: un guard del hook solo firma un Deny como {UNREGISTERED!r}")
         if profile != UNREGISTERED and profile != agent:

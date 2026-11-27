@@ -286,7 +286,7 @@ fn tool_mapping_agrees_with_action_type_of() {
 
 #[test]
 fn default_policy_is_format_2_and_declares_every_mapped_action_type() {
-    let policy = default_policy("/project", "/home/user");
+    let policy = default_policy("/project", "/home/user", "/project/.claude/praetore");
     policy.validate().unwrap();
     for tool in ["Read", "Write", "Bash", "WebFetch", "Agent", "Other"] {
         assert_eq!(

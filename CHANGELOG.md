@@ -4,6 +4,32 @@
 
 ### Fixed
 
+- **claude-code-hook: no profile reads the hook state directory, and the
+  `Bash` scan no longer misses brace expansion, globs or git aliases set
+  through the environment.** A subagent with `fs:read` (or the main session)
+  could `Read` or `Grep` `<state>/attester.key` and `agents/*.key`, with
+  which anyone signs receipts that `verify` accepts; a main session with
+  `network:invoke` could then send them out. The default policy now denies
+  `claude:read` under the state directory to every subagent
+  (`deny-state-reads`), and the binary holds such a read for every profile,
+  the main session included, as the `state_read` guard (signed as
+  `unregistered` with the requested profile; `verify` and
+  `check-attribution.py` accept `main` as the requested profile only for the
+  read guards). A `Read` without a string `file_path`, a `Grep` or `Glob`
+  with a `path` of another type, and a `Bash` or `Monitor` without a string
+  `command` fail closed instead of reading the working directory or scanning
+  an empty command. In the `Bash` scan, an unquoted word the shell expands
+  (`{a,b}`, `{1..3}`, `*`, `?`, `[ab]`) has an unknown value like `$VAR`:
+  unanalyzable in command position or as a git subcommand, outside the root
+  elsewhere, so `rm -rf .cl{a,}ude` is held for approval like
+  `rm -rf .claude` and `{git,push,origin,main}` is denied. `xargs`, `env -S`,
+  an alias in any git global option or value (`--config-env=alias.p=VAR`),
+  and an assignment to `GIT_CONFIG*`, `GIT_DIR`, `GIT_COMMON_DIR`,
+  `GIT_EXEC_PATH`, `HOME`, `XDG_CONFIG_HOME` or `PATH` in a command that
+  runs git are unanalyzable; `git-push` run by name or by path is a push. A
+  new `init` is needed for the policy rule; the guard applies to existing
+  state. Writes to client configuration through MCP file tools are not
+  covered by this change.
 - **praetore-mcp: the journal and approval locks wait at most 10 s.** A
   process that kept `receipts/.journal.lock` or `approvals/.lock` left
   every call waiting with no reply. After 10 s the wait ends with an error
