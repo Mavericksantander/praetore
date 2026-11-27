@@ -4,6 +4,18 @@
 
 ### Fixed
 
+- **praetore-core: three input bounds found by the 2026-11-26 audit.** A
+  `journal --range` anchor whose `seq` sat next to `u64::MAX` overflowed
+  the chain counter (a panic with overflow checks, a wrapped entry count
+  without them); the anchor is now refused as malformed unless a full range
+  of `MAX_CHAIN_ENTRIES` fits after it, and every increment is checked. A
+  delegation document between 64 KiB and its documented 1 MiB was refused
+  as invalid, because it was parsed under the limits of a single signed
+  value; it is parsed under its own limits (`JsonLimits`) and a document
+  of 600 roots loads. Unknown fields inside a `Recover` effect were
+  accepted and ignored, so two different policy files shared one digest;
+  `PolicyEffect` now refuses them, as the rest of the policy already did.
+  Pinned by `crates/praetore-core/tests/input_bounds_hardening.rs`.
 - **praetore-mcp: the journal and approval locks wait at most 10 s.** A
   process that kept `receipts/.journal.lock` or `approvals/.lock` left
   every call waiting with no reply. After 10 s the wait ends with an error
