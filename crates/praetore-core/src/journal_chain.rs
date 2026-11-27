@@ -189,6 +189,11 @@ pub enum ChainError {
     /// A range's anchor (the receipt just before it) does not link to the
     /// expected head of the previous range.
     AnchorMismatch { actual: ChainLink },
+    /// Receipt line `line` is not the bytes the exporter writes for its
+    /// entry (`{"seq":N,"prev":"<hex>","evidence":<canonical evidence>}`):
+    /// the same JSON in another byte form (whitespace, key order, an
+    /// escape).
+    NotCanonical { line: u64 },
 }
 
 impl ChainError {
@@ -199,7 +204,8 @@ impl ChainError {
             | Self::BrokenLink { .. }
             | Self::DuplicateEvidenceId { .. }
             | Self::DuplicateRecordId { .. }
-            | Self::MixedKinds { .. } => "JOURNAL_CHAIN_FAIL",
+            | Self::MixedKinds { .. }
+            | Self::NotCanonical { .. } => "JOURNAL_CHAIN_FAIL",
             Self::Record { .. } => "EVIDENCE_FAIL",
             Self::DatabaseHeadMismatch => "JOURNAL_HEAD_MISMATCH",
             Self::PolicyNotApplicable => "INVALID_REQUEST",
@@ -265,6 +271,11 @@ impl fmt::Display for ChainError {
                 f,
                 "the range's anchor links to {actual}, not to the expected head of the previous \
                  range"
+            ),
+            Self::NotCanonical { line } => write!(
+                f,
+                "entry {line}: not in canonical form (the line is not the bytes written for \
+                 this receipt)"
             ),
             Self::PolicyNotApplicable => write!(
                 f,
@@ -667,6 +678,26 @@ fn receipt_line(seq: u64, prev: &ChainLink, evidence: &Evidence) -> Result<Strin
     ))
 }
 
+/// `text` (one line, without its newline) must be exactly the line
+/// [`receipt_line`] writes for `evidence` at `seq` after `prev`. Integrity,
+/// signature and link are computed over the canonical evidence, so the same
+/// JSON in another byte form would otherwise verify while a reader of the
+/// text sees other bytes. praetore-mcp's receipts journal requires the same
+/// bytes (`journal::parse_line`).
+fn require_canonical(
+    seq: u64,
+    text: &str,
+    prev: &ChainLink,
+    evidence: &Evidence,
+) -> Result<(), ChainError> {
+    let expected = receipt_line(seq, prev, evidence)?;
+    if expected.strip_suffix('\n') == Some(text) {
+        Ok(())
+    } else {
+        Err(ChainError::NotCanonical { line: seq })
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Entry<'a> {
@@ -826,6 +857,7 @@ pub fn verify_journal_range(
         line: entry.seq,
         error,
     })?;
+    require_canonical(entry.seq, anchor_line, &prev, &evidence)?;
     let mut state = ChainState::new(attesters, policy);
     state.resume(entry.seq, prev, &evidence)?;
     let anchor = state.prev;
@@ -892,6 +924,7 @@ fn verify_lines(
             (Some(evidence), None, None) => {
                 let evidence = Evidence::from_json(evidence.get())
                     .map_err(|error| ChainError::Evidence { line, error })?;
+                require_canonical(line, current, &prev, &evidence)?;
                 state.append(&evidence)?;
                 if let Some(receipts) = receipts.as_mut() {
                     receipts.push(evidence);
@@ -1020,6 +1053,65 @@ mod tests {
             .push(&Evidence::from_json(&value["evidence"].to_string()).unwrap())
             .unwrap();
         assert_eq!(receipts.unused_attesters(), vec![1]);
+    }
+
+    /// A receipt line in another byte form (key order, whitespace, a JSON
+    /// escape in a key) is the same JSON, so its integrity hash, signature
+    /// and link still check. It must fail: the line is not the bytes the
+    /// exporter writes, and readers that look at the text would see other
+    /// bytes than the ones that were verified.
+    #[test]
+    fn a_receipt_line_in_another_byte_form_fails_even_with_the_expected_head() {
+        let head = verify_chain(SET_03_CHAIN, &set_03_pin(), None, None).unwrap();
+        let lines: Vec<&str> = SET_03_CHAIN.lines().collect();
+        let escaped = lines
+            .iter()
+            .position(|line| line.contains("\"praetore.path_check\""))
+            .unwrap();
+        let rewrites = [
+            // Same members, reversed order, spaces after separators.
+            (1, {
+                let value: serde_json::Map<String, serde_json::Value> =
+                    serde_json::from_str(lines[1]).unwrap();
+                let reversed: Vec<String> = value
+                    .iter()
+                    .rev()
+                    .map(|(key, value)| {
+                        format!("{}: {value}", serde_json::Value::from(key.as_str()))
+                    })
+                    .collect();
+                format!("{{{}}}", reversed.join(", "))
+            }),
+            // `.` written as `\u002e` in a key.
+            (
+                escaped,
+                lines[escaped].replacen(
+                    "\"praetore.path_check\"",
+                    "\"praetore\\u002epath_check\"",
+                    1,
+                ),
+            ),
+        ];
+        for (index, rewritten) in rewrites {
+            assert_ne!(rewritten, lines[index]);
+            let value: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
+            let original: serde_json::Value = serde_json::from_str(lines[index]).unwrap();
+            assert_eq!(
+                value, original,
+                "line {index}: the rewrite must be the same JSON"
+            );
+            let mut text = String::new();
+            for (at, line) in lines.iter().enumerate() {
+                text.push_str(if at == index { &rewritten } else { line });
+                text.push('\n');
+            }
+            let error = verify_chain(&text, &set_03_pin(), None, Some(&head.head)).unwrap_err();
+            assert!(
+                matches!(error, ChainError::NotCanonical { line } if line == index as u64),
+                "line {index}: {error}"
+            );
+            assert_eq!(error.code(), "JOURNAL_CHAIN_FAIL");
+        }
     }
 
     #[test]
@@ -1378,6 +1470,30 @@ mod tests {
         );
         // A range is not a whole chain: it does not start at seq 0.
         assert!(verify_journal_report(&second, &pins, None, None, None).is_err());
+    }
+
+    /// A range's anchor line in another byte form fails like any other
+    /// receipt line, also with the expected anchor and head.
+    #[test]
+    fn a_range_anchor_in_another_byte_form_fails() {
+        let pins = [set_03_pin()];
+        let (_, first_head, second, second_head, _) = two_ranges(10);
+        let (anchor, rest) = second.split_once('\n').unwrap();
+        let rewritten = anchor.replacen("{\"seq\":", "{\"seq\": ", 1);
+        assert_ne!(rewritten, anchor);
+        let text = format!("{rewritten}\n{rest}");
+        let error = verify_journal_range(
+            &text,
+            &pins,
+            None,
+            Some(&first_head.head),
+            Some(&second_head.head),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, ChainError::NotCanonical { line: 9 }),
+            "{error}"
+        );
     }
 
     #[test]

@@ -35,6 +35,14 @@ límites de "Qué NO prueba", que siguen vigentes.
   - `evidence`: un recibo `Evidence` completo, tal como lo emite
     `Evidence::to_json`. Se valida con `Evidence::from_json`, que rechaza
     claves duplicadas y campos desconocidos.
+- Una línea de recibo son exactamente los bytes
+  `{"seq":N,"prev":"<hex>","evidence":<Evidence::to_json>}`: sin espacios,
+  con los miembros en ese orden y la evidencia canónica. El mismo JSON
+  escrito de otra forma (espacios, otro orden, un escape JSON) falla con
+  `JOURNAL_CHAIN_FAIL` ("not in canonical form"), aunque la integridad, la
+  firma y el link no cambien, porque se calculan sobre la evidencia
+  canónica. Vale también para el ancla de un rango. El journal de recibos
+  de praetore-mcp exige la misma forma (`journal::parse_line`).
 - Cada `evidence_id` aparece una sola vez en el archivo.
 
 ## Storage records and the database chain (format v1, extension)
