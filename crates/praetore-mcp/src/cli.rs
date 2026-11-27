@@ -26,6 +26,8 @@ Usage:
                          [--dir DIR] [--mode observe|enforce] [--dry-run] [--yes]
   praetore-mcp uninstall [--client claude-desktop|cursor|vscode|claude-code] [--config FILE]
                          [--dry-run] [--yes]
+  praetore-mcp doctor    [--dir DIR] [--client claude-code] [--project PATH]
+                         [--claude-config FILE] [--mode observe|enforce]
   praetore-mcp receipts  [--dir DIR] [--tail N]
   praetore-mcp verify    [--dir DIR] [--expected-head HEX] [--expected-approval-head HEX]
   praetore-mcp dashboard [--dir DIR] [--port N] [--expected-head HEX] [--expected-approval-head HEX]
@@ -49,9 +51,9 @@ Keys created by `init` are LOCAL/DEV keys, including a separate approver
 key. The policy written by `init` has no rules: in enforce mode every
 tools/call is denied until a `policy allow` rule allows it. Observe mode
 records a DENY and forwards the call; it still refuses unclassified calls,
-unparseable lines that may name a safety* tool, lines over 32 MiB and
-batches with a refused call, and, when the home cannot be loaded, every
-tools/call. Enforce mode blocks DENY. A REQUIRE_APPROVAL call is not
+calls whose receipt cannot be written, unparseable lines that may name a
+safety* tool, lines over 32 MiB and batches with a refused call, and, when
+the home cannot be loaded, every tools/call. Enforce mode blocks DENY. A REQUIRE_APPROVAL call is not
 forwarded until someone runs `approve` for that exact call. `approve`
 reads a confirmation from an interactive terminal; that check is
 cooperative (a process that can act as this user can still approve). If
@@ -63,8 +65,10 @@ Exit codes:
   1    the command ran and found a problem: `verify` found a failed receipt,
        `report` wrote a report that says verify failed, `policy check`
        found an invalid policy or engine, `policy coverage` found a tool
-       allowed only by an allow-all rule, or `install` / `uninstall` could
-       not read, parse or write a config (or was not confirmed)
+       allowed only by an allow-all rule, `doctor` found a governed server
+       whose winning definition is not a wrap for this home and mode (or
+       has no definition), or `install` / `uninstall` could not read, parse
+       or write a config (or was not confirmed)
   2    usage error, or the command could not run (message on stderr)
   3    `verify` found nothing wrong but was not given both heads kept
        outside this machine (UNANCHORED): not a pass, see `verify --help`
@@ -82,10 +86,12 @@ With no rules, every tools/call is denied by default in enforce mode. Only
 tools/call is evaluated: initialize, tools/list and the rest of the MCP
 traffic pass, so a client can start the server and list its tools. Observe
 mode records a DENY and forwards the call, but it still refuses a tools/call
-the policy does not classify, a client line it cannot parse that may name a
-safety* tool, a client line over 32 MiB, and a whole batch when a tools/call
-in it is refused. When the home cannot be loaded (before init, for example),
-every tools/call and every client line that cannot be parsed is refused.
+the policy does not classify, a tools/call whose receipt cannot be written
+(or that cannot be evaluated): what it cannot record, it does not run. It
+also refuses a client line it cannot parse that may name a safety* tool, a
+client line over 32 MiB, and a whole batch when a tools/call in it is
+refused. When the home cannot be loaded (before init, for example), every
+tools/call and every client line that cannot be parsed is refused.
 Allow tools with
 `praetore-mcp policy allow --id ID --server NAME --tool NAME`.
 
@@ -108,8 +114,9 @@ passed to the server unchanged (including any --help).
   --name SERVER server name used in policy rules and receipts
                 (default: the command's file name)
   --mode MODE   observe (default): record the decision and forward the call;
-                unclassified calls and client lines that cannot be checked
-                are still refused (see `praetore-mcp init --help`)
+                unclassified calls, calls whose receipt cannot be written
+                and client lines that cannot be checked are still refused
+                (see `praetore-mcp init --help`)
                 enforce: block DENY. REQUIRE_APPROVAL is not forwarded until
                 `praetore-mcp approve <id>` for that exact call
   --no-report   do not write the session report (same as `report = false`
@@ -175,6 +182,47 @@ mcpServers value is rewritten.
 
 Exit code: 0 on success or nothing to do, 1 if a config could not be read,
 parsed or written, or was not confirmed, 2 on a usage error.";
+
+const DOCTOR_HELP: &str =
+    "Usage: praetore-mcp doctor [--dir DIR] [--client claude-code] [--project PATH]
+                           [--claude-config FILE] [--mode observe|enforce]
+
+Checks, for one project, which definition Claude Code runs for each server
+the policy of DIR governs, and whether that definition is `wrap` for this
+home and mode. The servers checked are the distinct `target` values of the
+rules in DIR/policy.json plus every entry wrapped for DIR in any scope.
+
+Claude Code keeps a server name in up to four places and runs the whole
+entry from the highest one, nothing is merged: managed-mcp.json
+(/Library/Application Support/ClaudeCode/ on macOS, /etc/claude-code/ on
+Linux; when it exists, only its servers load), local scope
+(projects[\"<project>\"].mcpServers in ~/.claude.json), project scope
+(<project>/.mcp.json, once approved: enabledMcpjsonServers or
+enableAllProjectMcpServers in the project's state in ~/.claude.json or in
+~/.claude/settings.json, <project>/.claude/settings.json or
+settings.local.json; disabledMcpjsonServers rejects it), then user scope
+(mcpServers in ~/.claude.json). `install` wraps user and project scope
+only, so a raw entry above a wrapped one runs the server with no policy
+and no receipt while `verify` still passes.
+
+One line per server: OK (the winner is a wrap for DIR, this mode and this
+name), FAIL (a raw definition, a wrap for another home, mode or name, or
+no definition) or WARN (a raw definition below the winner, a project
+entry not approved yet, enableAllProjectMcpServers). Every FAIL ends with
+the command that fixes it (`claude mcp remove NAME -s SCOPE`, or install).
+doctor reads files and writes nothing.
+
+  --dir DIR            home whose policy is checked (default $PRAETORE_MCP_HOME,
+                       then ~/.praetore/mcp)
+  --client NAME        claude-code (the only client in this version)
+  --project PATH       the project directory (default: the current directory)
+  --claude-config FILE the ~/.claude.json to read (default ~/.claude.json;
+                       CLAUDE_CONFIG_DIR is not followed)
+  --mode MODE          the mode the wraps must have (default observe)
+
+Exit code: 0 when every server's winning definition is a wrap for DIR and
+MODE, 1 when one is raw, wrapped for another home, mode or name, or not
+defined, 2 on a usage error or a file that is not strict JSON.";
 
 const RECEIPTS_HELP: &str = "Usage: praetore-mcp receipts [--dir DIR] [--tail N]
 
@@ -358,6 +406,7 @@ fn help_for(command: &str) -> Option<&'static str> {
         "wrap" => WRAP_HELP,
         "install" => INSTALL_HELP,
         "uninstall" => UNINSTALL_HELP,
+        "doctor" => DOCTOR_HELP,
         "receipts" => RECEIPTS_HELP,
         "verify" => VERIFY_HELP,
         "dashboard" => DASHBOARD_HELP,
@@ -470,6 +519,7 @@ pub fn run(args: &[String]) -> i32 {
         "wrap" => cmd_wrap(rest),
         "install" => cmd_install(rest, false),
         "uninstall" => cmd_install(rest, true),
+        "doctor" => cmd_doctor(rest),
         "receipts" => cmd_receipts(rest),
         "verify" => cmd_verify(rest),
         "dashboard" => cmd_dashboard(rest),
@@ -540,8 +590,8 @@ fn cmd_init(args: &[String]) -> Result<i32, String> {
                 "  In enforce mode every tools/call is denied unless a rule allows it. Observe"
             );
             println!("  mode records a DENY and forwards the call, but it still refuses calls the");
-            println!("  policy does not classify and client lines it cannot check (see");
-            println!("  `init --help`). To allow a tool:");
+            println!("  policy does not classify, calls whose receipt cannot be written and");
+            println!("  client lines it cannot check (see `init --help`). To allow a tool:");
             let program = crate::commands::program();
             let dir = dir_suffix(&home);
             println!("    {program} policy allow --id ID --server NAME --tool NAME{dir}");
@@ -740,14 +790,8 @@ fn cmd_install(args: &[String], uninstall: bool) -> Result<i32, String> {
                 ));
             }
         }
-        let exe = std::env::current_exe()
-            .and_then(|exe| exe.canonicalize())
-            .map_err(|e| format!("cannot locate the praetore-mcp executable: {e}"))?;
         Some(WrapTarget {
-            exe: install::strip_verbatim_prefix(
-                exe.to_str()
-                    .ok_or("praetore-mcp executable path is not UTF-8")?,
-            ),
+            exe: install::running_exe()?,
             dir: install::strip_verbatim_prefix(
                 home.root
                     .to_str()
@@ -874,6 +918,152 @@ fn cmd_install(args: &[String], uninstall: bool) -> Result<i32, String> {
         );
     }
     Ok(code)
+}
+
+/// A strict JSON document, or `None` for a file that does not exist. An
+/// unreadable or malformed file is a usage-level error (exit 2): doctor
+/// cannot say what Claude Code runs without it.
+fn read_json_file(path: &Path) -> Result<Option<JsonValue>, String> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot read {}: {error}", path.shown())),
+    };
+    JsonValue::parse(&text)
+        .map(Some)
+        .map_err(|error| format!("{} is not strict JSON ({error})", path.shown()))
+}
+
+fn read_json_at(path: PathBuf) -> Result<Option<(PathBuf, JsonValue)>, String> {
+    Ok(read_json_file(&path)?.map(|doc| (path, doc)))
+}
+
+fn cmd_doctor(args: &[String]) -> Result<i32, String> {
+    use crate::doctor::{self, ClaudeCodeConfig};
+    let parsed = parse(
+        args,
+        &[
+            "--dir",
+            "--client",
+            "--project",
+            "--claude-config",
+            "--mode",
+        ],
+        &[],
+        false,
+    )?;
+    if let Some(client) = parsed.value("--client")
+        && Client::parse(client) != Some(Client::ClaudeCode)
+    {
+        return Err(format!(
+            "doctor supports --client claude-code only in this version, got {client:?}"
+        ));
+    }
+    let home = parsed.home()?;
+    let mode = parsed.mode()?;
+    let policy = store::load_policy(&home)?;
+    let project = match parsed.value("--project") {
+        Some(path) => store::resolve_home(Some(Path::new(path)))?,
+        None => {
+            std::env::current_dir().map_err(|e| format!("cannot resolve current directory: {e}"))?
+        }
+    };
+    let project = project.canonicalize().unwrap_or(project);
+    let user_home = store::user_home();
+    let claude_config = match parsed.value("--claude-config") {
+        Some(path) => PathBuf::from(path),
+        None => {
+            if std::env::var_os("CLAUDE_CONFIG_DIR").is_some_and(|v| !v.is_empty()) {
+                eprintln!(
+                    "praetore-mcp: warning: CLAUDE_CONFIG_DIR is set and is not followed; pass --claude-config FILE to read the .claude.json Claude Code uses"
+                );
+            }
+            user_home
+                .as_ref()
+                .map(|h| h.join(".claude.json"))
+                .ok_or("cannot determine the home directory; pass --claude-config FILE")?
+        }
+    };
+    let mut config = ClaudeCodeConfig {
+        managed: None,
+        user: read_json_at(claude_config)?,
+        project_file: read_json_at(project.join(".mcp.json"))?,
+        project: project.clone(),
+        settings: Vec::new(),
+    };
+    for path in doctor::managed_mcp_paths() {
+        if let Some(found) = read_json_at(path)? {
+            config.managed = Some(found);
+            break;
+        }
+    }
+    for path in doctor::settings_paths(user_home.as_deref(), &project) {
+        config.settings.extend(read_json_at(path)?);
+    }
+
+    let dir = install::strip_verbatim_prefix(
+        home.root
+            .to_str()
+            .ok_or("home directory path is not UTF-8")?,
+    );
+    let mut targets: BTreeMap<String, ()> = policy
+        .rules
+        .iter()
+        .filter_map(|rule| rule.target.clone())
+        .map(|target| (target, ()))
+        .collect();
+    targets.extend(config.wrapped_for(&dir).into_iter().map(|name| (name, ())));
+    let targets: std::collections::BTreeSet<String> = targets.into_keys().collect();
+
+    println!(
+        "doctor: client claude-code, home {} (mode {}), project {}",
+        home.root.shown(),
+        mode.as_str(),
+        project.shown()
+    );
+    let source = |file: &Option<(PathBuf, JsonValue)>| {
+        file.as_ref()
+            .map_or("none".to_owned(), |(path, _)| path.shown().to_string())
+    };
+    println!(
+        "sources: managed {}, user and local {}, project {}, settings {}",
+        source(&config.managed),
+        source(&config.user),
+        source(&config.project_file),
+        if config.settings.is_empty() {
+            "none".to_owned()
+        } else {
+            config
+                .settings
+                .iter()
+                .map(|(path, _)| path.shown().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    );
+    if targets.is_empty() {
+        println!(
+            "summary: 0 server(s): the policy has no rule with a target and no entry is wrapped for this home"
+        );
+        return Ok(0);
+    }
+    let expected = doctor::Expected {
+        exe: install::running_exe()?,
+        dir,
+        mode,
+    };
+    let commands = doctor::Commands {
+        program: crate::commands::program(),
+        dir_suffix: dir_suffix(&home),
+        mode,
+    };
+    let reports = doctor::diagnose(&config, &targets, &expected, &commands);
+    print!("{}", doctor::render(&reports, &config.enable_all_sources()));
+    Ok(if reports.iter().any(doctor::ServerReport::is_failure) {
+        1
+    } else {
+        0
+    })
 }
 
 fn cmd_receipts(args: &[String]) -> Result<i32, String> {
@@ -1290,7 +1480,7 @@ fn save_policy(home: &Home, original: &str, updated: &str) -> Result<(), String>
     Ok(())
 }
 
-fn cmd_policy(args: &[String]) -> Result<i32, String> {
+pub(crate) fn cmd_policy(args: &[String]) -> Result<i32, String> {
     use crate::policy::{self, ArgOperator, RuleSpec};
     let Some((sub, rest)) = args.split_first() else {
         return Err(format!("policy needs a subcommand\n\n{USAGE}"));
@@ -1472,4 +1662,36 @@ fn cmd_policy(args: &[String]) -> Result<i32, String> {
     };
     println!("{}", policy::RESTART_REMINDER);
     Ok(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every help text that lists what observe still refuses names a call
+    /// whose receipt cannot be written: observe does not run what it cannot
+    /// record (CHANGELOG, Breaking). Only reads the constants.
+    #[test]
+    fn the_help_lists_an_unrecordable_call_among_what_observe_refuses() {
+        let words = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        for (name, text, phrase) in [
+            (
+                "USAGE",
+                USAGE,
+                "it still refuses unclassified calls, calls whose receipt cannot be written,",
+            ),
+            (
+                "INIT_HELP",
+                INIT_HELP,
+                "a tools/call whose receipt cannot be written (or that cannot be evaluated): what it cannot record, it does not run.",
+            ),
+            (
+                "WRAP_HELP",
+                WRAP_HELP,
+                "unclassified calls, calls whose receipt cannot be written and client lines that cannot be checked are still refused",
+            ),
+        ] {
+            assert!(words(text).contains(phrase), "{name}: {}", words(text));
+        }
+    }
 }

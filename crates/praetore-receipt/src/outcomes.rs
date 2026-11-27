@@ -325,6 +325,9 @@ pub enum OutcomeError {
     InvalidPin,
     /// Two pins of the same role share a key id.
     DuplicatePin,
+    /// An approver or delegation-root pin is also an execution pin or an
+    /// evidence attester pin: a gateway key cannot stand in for a human.
+    SharedRoleKey,
     Malformed {
         line: usize,
     },
@@ -395,6 +398,7 @@ impl OutcomeError {
             Self::TooLarge => "OUTCOMES_TOO_LARGE",
             Self::InvalidPin => "INVALID_PIN",
             Self::DuplicatePin => "OUTCOME_PIN_DUPLICATE",
+            Self::SharedRoleKey => "OUTCOME_PIN_SAME_KEY",
             Self::Malformed { .. } => "OUTCOME_MALFORMED",
             Self::UnknownRequest { .. } => "OUTCOME_UNKNOWN_REQUEST",
             Self::EvidenceMismatch { .. } => "OUTCOME_EVIDENCE_MISMATCH",
@@ -419,6 +423,11 @@ impl std::fmt::Display for OutcomeError {
             Self::TooLarge => return f.write_str("outcomes file too large"),
             Self::InvalidPin => return f.write_str("invalid key pin"),
             Self::DuplicatePin => return f.write_str("two pins share a key id"),
+            Self::SharedRoleKey => {
+                return f.write_str(
+                    "an approver or delegation-root pin is also an execution or attester key",
+                );
+            }
             Self::Malformed { .. } => "malformed record",
             Self::UnknownRequest { .. } => "request not in the journal",
             Self::EvidenceMismatch { .. } => "record not bound to the journal receipt",
@@ -505,6 +514,24 @@ pub fn verify_outcomes(
             if pins[..index].iter().any(|other| other.key_id == pin.key_id) {
                 return Err(OutcomeError::DuplicatePin);
             }
+        }
+    }
+    // A human role (approver, delegation root) is never a gateway role
+    // (execution key, evidence attester): with the same key, the gateway
+    // could approve its own actions and the records would still verify.
+    let gateway_keys = || {
+        keys.execution
+            .iter()
+            .map(|pin| pin.public_key.as_bytes())
+            .chain(
+                keys.evidence_attesters
+                    .iter()
+                    .map(VerifiedPublicKey::as_bytes),
+            )
+    };
+    for human in keys.approvers.iter().chain(delegation_roots) {
+        if gateway_keys().any(|key| key == human.public_key.as_bytes()) {
+            return Err(OutcomeError::SharedRoleKey);
         }
     }
     // A request is named by agent and request id; one that appears twice in

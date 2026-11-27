@@ -1344,6 +1344,11 @@ pub fn receipt_view(line: &LineVerdict, approval_status: &BTreeMap<String, Strin
 }
 
 fn tool_of(evidence: &Evidence) -> Value {
+    if let Some(label) =
+        crate::unparsed::reader_label(&evidence.action.action_type, &evidence.action.parameters)
+    {
+        return Value::String(label);
+    }
     match evidence.action.parameters.get("tool") {
         Some(Value::String(tool)) => Value::String(tool.clone()),
         Some(other) => Value::String(other.to_string()),

@@ -373,4 +373,84 @@ fn without_an_expected_head_the_verifier_warns_that_a_prefix_also_verifies() {
             .iter()
             .any(|w| w.starts_with("head_not_anchored"))
     );
+
+    // --require-anchored turns the warning into a failure, after the chain
+    // verifies; with the head it passes.
+    let output = verify(&[
+        "--journal",
+        &journal,
+        "--ingest-pin",
+        &ingest,
+        "--require-anchored",
+    ]);
+    assert!(!output.status.success());
+    assert_eq!(summary(&output)["code"], "SAFETY_JOURNAL_NOT_ANCHORED");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("head is not anchored"));
+    let output = verify(&[
+        "--journal",
+        &journal,
+        "--ingest-pin",
+        &ingest,
+        "--expected-head",
+        &head,
+        "--require-anchored",
+    ]);
+    assert!(output.status.success());
+    // Text output: the same code, exit 1.
+    let output = Command::new(env!("CARGO_BIN_EXE_praetore-verify"))
+        .args([
+            "safety-journal",
+            "--journal",
+            &journal,
+            "--ingest-pin",
+            &ingest,
+            "--require-anchored",
+            "--format",
+            "text",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .starts_with("ERROR safety-journal SAFETY_JOURNAL_NOT_ANCHORED"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    // A range (here: the chain read as a range behind its first record) also
+    // needs --expected-anchor: until then the anchor's position is only what
+    // the file says, so range_start is null.
+    let anchor_hash =
+        serde_json::from_str::<Value>(source.lines().next().unwrap()).unwrap()["record_hash"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    let range = |extra: &[&str]| {
+        let mut args = vec!["--journal", &journal, "--ingest-pin", &ingest, "--range"];
+        args.extend_from_slice(extra);
+        verify(&args)
+    };
+    let output = range(&["--expected-head", &head, "--require-anchored"]);
+    assert!(!output.status.success());
+    assert_eq!(summary(&output)["code"], "SAFETY_RANGE_NOT_ANCHORED");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("anchor was not checked"));
+    let output = range(&["--expected-head", &head]);
+    assert!(output.status.success());
+    assert_eq!(summary(&output)["details"]["range_start"], Value::Null);
+    assert_eq!(summary(&output)["details"]["anchor_verified"], false);
+    let output = range(&[
+        "--expected-anchor",
+        &anchor_hash,
+        "--expected-head",
+        &head,
+        "--require-anchored",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(summary(&output)["details"]["range_start"], 1);
+    assert_eq!(summary(&output)["details"]["anchor_verified"], true);
 }

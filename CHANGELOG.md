@@ -6,6 +6,23 @@
 
 ### Added
 
+- **praetore-mcp: `doctor` checks that the definition Claude Code runs for
+  each governed server is a wrap for this home.** (#276) Claude Code keeps a
+  server name in up to four places and runs the whole entry from the
+  highest one: `managed-mcp.json`, local scope, an approved project
+  `.mcp.json`, then user scope. `install` wraps user and project scope
+  only, so a repository whose `.mcp.json` ships a raw `filesystem` shadows
+  the wrapped user-scope `filesystem` as soon as the user approves the
+  project's servers: every tools/call then runs without praetore-mcp,
+  without a receipt, and `verify` passes unchanged. `doctor [--dir DIR]
+  [--project PATH]` resolves the winner for every policy target and every
+  entry wrapped for DIR, prints `OK`, `FAIL` or `WARN` per server with the
+  scope, file and command, and on `FAIL` the `claude mcp remove NAME -s
+  SCOPE` or `install` line that fixes it. Exit 1 for a raw winner, a wrap
+  for another home, mode or name, or a target with no definition; 2 for a
+  file that is not strict JSON. The README section "Known limits of
+  `install`" now points the shadow cases to `doctor`.
+
 - **Example policy for the filesystem MCP server in Claude Code.** (#254)
   `examples/claude-code-mcp-policy/policy.json` allows the read-only tools
   of the filesystem server by name, denies `write_file`, `edit_file` and
@@ -95,6 +112,51 @@
   a source of higher priority is valid.
 
 ### Breaking
+
+- **praetore-mcp: observe refuses a call it cannot record, like enforce.** (#264)
+  When the receipts journal could not take the receipt (a blank or cut last
+  line, a whitespace-only later daily file, `receipts/` or the daily file
+  replaced by a symlink, a read-only daily file, `.journal.lock` held by
+  another process for more than 10 s, a full disk), observe forwarded the
+  `tools/call` with a stderr warning and no receipt. The journal still read
+  back intact, so `verify --expected-head` with the head kept earlier said
+  OK and nothing showed that calls had run. The same happened when a call
+  could not be evaluated after startup (clock, replay guard), and for an
+  ambiguous line whose `tools/call` reading could not be recorded. All of
+  these are now refused in observe as in enforce: the client gets an MCP
+  tool error saying that no receipt could be recorded (with the evidence id
+  when there is one) and stderr says `REFUSED (observe, ...)`. Observe
+  still never blocks because of a policy decision: a DENY or
+  REQUIRE_APPROVAL is forwarded with its receipt, as before. Unparseable client lines in
+  observe are unchanged (no receipt). **Action:** if you run observe, a home
+  that cannot record (full disk, a lock held by another process, a
+  read-only or damaged journal) now stops tool calls instead of letting
+  them run unrecorded; the client shows the error. Fix the journal (the
+  troubleshooting table in the GUIDE lists each message) to resume.
+
+- **praetore-verify: `--require-anchored` is accepted by `outcomes` and
+  `safety-journal`, and on a range it needs `--expected-anchor` too.** (#272)
+  Both commands verified without `--expected-head` and printed OK with
+  only the `head_not_anchored` warning, and `journal --range
+  --require-anchored` passed with the head alone while the anchor's `seq`
+  and `prev` were only what the file said. Now `outcomes --require-anchored`
+  fails with `JOURNAL_NOT_ANCHORED` and `safety-journal --require-anchored`
+  with `SAFETY_JOURNAL_NOT_ANCHORED` when no `--expected-head` was given,
+  after the chain verifies; a range under `--require-anchored` without
+  `--expected-anchor` fails with `JOURNAL_RANGE_NOT_ANCHORED` or
+  `SAFETY_RANGE_NOT_ANCHORED`. `range_start` is `null` unless
+  `--expected-anchor` was given, in both commands.
+  **Action:** a script that verifies a range with `--require-anchored` must also pass
+  `--expected-anchor`, and a JSON consumer reads `range_start` only when
+  `--expected-anchor` was given. Outcome records (`approvals.jsonl`) are
+  still not chained: `--require-anchored` anchors the journal, not them.
+
+- **praetore-verify outcomes: a gateway key pinned as a human role is
+  refused.** (#272) An `--approver-pin` or `--delegation-root-pin` whose key is
+  also an `--execution-pin` or an `--attester-pin` fails with
+  `OUTCOME_PIN_SAME_KEY` before any record is read, as `safety-manifest`
+  refuses a namespace key shared with another role.
+  **Action:** give the approver and delegation-root roles keys of their own.
 
 - **praetore-mcp: `report` has the level and exit code of `verify`; without
   heads it exits 3.** (#255) It printed `verify passed` and exited 0 when
@@ -186,11 +248,54 @@
 
 ### Fixed
 
+- **praetore-core: three input bounds found by the 2026-11-26 audit.** (#268) A
+  `journal --range` anchor whose `seq` sat next to `u64::MAX` overflowed
+  the chain counter (a panic with overflow checks, a wrapped entry count
+  without them); the anchor is now refused as malformed unless a full range
+  of `MAX_CHAIN_ENTRIES` fits after it, and every increment is checked. A
+  delegation document between 64 KiB and its documented 1 MiB was refused
+  as invalid, because it was parsed under the limits of a single signed
+  value; it is parsed under its own limits (`JsonLimits`) and a document
+  of 600 roots loads. Unknown fields inside a `Recover` effect were
+  accepted and ignored, so two different policy files shared one digest;
+  `PolicyEffect` now refuses them, as the rest of the policy already did.
+  Pinned by `crates/praetore-core/tests/input_bounds_hardening.rs`.
+  **Action:** a policy with an unknown field inside a `Recover` effect no longer
+  loads; remove the field.
+
+- **claude-code-hook: the registration snippet pins `"disableAllHooks":
+  false`.** (#275) A `.claude/settings.json` that arrives with a `git clone` or
+  `git pull` and sets `"disableAllHooks": true` disabled the hook
+  registered in `settings.local.json`, with nothing in the receipts: the
+  hook never ran. Claude Code reads the value left after settings
+  precedence, and `settings.local.json` wins over the shared project file,
+  so the explicit `false` in the registration keeps the hook on (checked
+  with Claude Code 2.1.332). `--settings`, `--safe-mode`, `--restricted`
+  and managed settings sit above it and can still turn hooks off; the
+  README says so. A test reads the README snippet and fails if the key is
+  removed.
+  **Action:** add `"disableAllHooks": false` at the top level of your existing
+  `<project>/.claude/settings.local.json`.
+
+- **praetore-mcp: a receipts journal line is read only in the byte form
+  `wrap` writes.** (#266) Integrity and the chain link are computed over the
+  canonical evidence, so a line written again with other spacing, another
+  key order or a JSON escape verified, also against the saved head, while
+  the text read other bytes: a forwarded receipt whose
+  `praetore.approval_id` was written as `praetore.approval\u005fid` was not
+  found by the substring search `wrap` used for used approvals, and with
+  the execution record cut from the approval journal the same approval ran
+  again. `verify` and `receipts` now report such a line as `not in
+  canonical form` (the approval journal already did), and `wrap` parses
+  every receipt line before it forwards on an approval, so the call is
+  held. Lines written by praetore-mcp 0.3.4 and later are already in that
+  form.
+
 - **praetore-mcp: the journal and approval locks wait at most 10 s.** (#252)
   A process that kept `receipts/.journal.lock` or `approvals/.lock` left
   every call waiting with no reply. After 10 s the wait ends with an error
-  naming the lock: the receipt is not written, so enforce refuses the call
-  and observe warns.
+  naming the lock: the receipt is not written, so the call is refused
+  (in both modes, see Breaking).
 - **praetore-mcp: the `-32700` for a refused line carries its `id`** (#252)
   when the line has one complete top-level `id`. Otherwise the `id` is
   `null`, as before.

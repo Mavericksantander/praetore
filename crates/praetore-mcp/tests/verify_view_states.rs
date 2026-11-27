@@ -245,13 +245,23 @@ fn json_keys(names: &[&str]) -> Value {
     Value::Object(object)
 }
 
+/// Edits the first journal line as a JSON value and writes it back in the
+/// byte form `wrap` writes (`seq`, `prev`, then the canonical evidence), so
+/// the edit itself is what the view reports, not the byte form.
 fn rewrite_first_line(home: &Home, edit: impl FnOnce(&mut Value)) {
     let file = journal_file(home);
     let text = fs::read_to_string(&file).unwrap();
     let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
     let mut value: Value = serde_json::from_str(&lines[0]).unwrap();
     edit(&mut value);
-    lines[0] = serde_json::to_string(&value).unwrap();
+    let evidence =
+        praetore_core::canonical::canonicalize_json(&value["evidence"].to_string()).unwrap();
+    lines[0] = format!(
+        "{{\"seq\":{},\"prev\":{},\"evidence\":{}}}",
+        value["seq"],
+        value["prev"],
+        std::str::from_utf8(&evidence).unwrap()
+    );
     fs::write(&file, lines.join("\n") + "\n").unwrap();
 }
 

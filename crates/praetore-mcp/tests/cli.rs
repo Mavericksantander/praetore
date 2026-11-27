@@ -21,6 +21,7 @@ fn every_subcommand_has_help_on_stdout_with_exit_zero() {
         "wrap",
         "install",
         "uninstall",
+        "doctor",
         "receipts",
         "verify",
         "dashboard",
@@ -108,6 +109,8 @@ fn usage_errors_exit_two() {
         &["wrap"],
         &["policy", "no-such-subcommand"],
         &["receipts", "--tail", "many"],
+        &["doctor", "--client", "cursor"],
+        &["doctor", "--mode", "loud"],
     ] {
         let out = run(args);
         assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
@@ -116,7 +119,7 @@ fn usage_errors_exit_two() {
 }
 
 /// Observe mode is not "never blocks": it still refuses unclassified calls,
-/// unparseable lines that may name a safety* tool, lines over 32 MiB,
+/// calls whose receipt cannot be written, unparseable lines that may name a safety* tool, lines over 32 MiB,
 /// batches with a refused call, and, when the home cannot be loaded, every
 /// call and every unparseable line. The help says so, in words a test can
 /// pin.
@@ -127,24 +130,33 @@ fn init_help_says_what_observe_mode_still_refuses() {
     assert!(
         init.contains(
             "Observe mode records a DENY and forwards the call, but it still refuses a \
-             tools/call the policy does not classify, a client line it cannot parse that \
-             may name a safety* tool, a client line over 32 MiB, and a whole batch when a \
-             tools/call in it is refused. When the home cannot be loaded (before init, for \
-             example), every tools/call and every client line that cannot be parsed is \
-             refused."
+             tools/call the policy does not classify, a tools/call whose receipt cannot be \
+             written (or that cannot be evaluated): what it cannot record, it does not run. \
+             It also refuses a client line it cannot parse that may name a safety* tool, a \
+             client line over 32 MiB, and a whole batch when a tools/call in it is refused. \
+             When the home cannot be loaded (before init, for example), every tools/call \
+             and every client line that cannot be parsed is refused."
         ),
         "{init}"
     );
     let top = words(&stdout(&run(&["--help"])));
     assert!(
         top.contains(
-            "it still refuses unclassified calls, unparseable lines that may name a \
-             safety* tool, lines over 32 MiB and batches with a refused call, and, when the \
-             home cannot be loaded, every tools/call."
+            "it still refuses unclassified calls, calls whose receipt cannot be written, \
+             unparseable lines that may name a safety* tool, lines over 32 MiB and batches \
+             with a refused call, and, when the home cannot be loaded, every tools/call."
         ),
         "{top}"
     );
-    for text in [&init, &top] {
+    let wrap = words(&stdout(&run(&["wrap", "--help"])));
+    assert!(
+        wrap.contains(
+            "unclassified calls, calls whose receipt cannot be written and client lines \
+             that cannot be checked are still refused"
+        ),
+        "{wrap}"
+    );
+    for text in [&init, &top, &wrap] {
         assert!(!text.contains("never blocks"), "{text}");
     }
 }
@@ -164,7 +176,8 @@ fn init_output_says_what_observe_mode_still_refuses() {
         text.contains(
             "In enforce mode every tools/call is denied unless a rule allows it. Observe \
              mode records a DENY and forwards the call, but it still refuses calls the \
-             policy does not classify and client lines it cannot check (see `init --help`)."
+             policy does not classify, calls whose receipt cannot be written and client \
+             lines it cannot check (see `init --help`)."
         ),
         "{text}"
     );

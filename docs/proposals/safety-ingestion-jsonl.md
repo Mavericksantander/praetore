@@ -182,14 +182,17 @@ Para cada línea, en orden, fail-closed:
 5. Con `--source-pins`, la firma de cada evento contra la llave de su fuente.
 6. Con `--expected-head`, el head es igual a ese valor. Sin él, el
    verificador advierte (`head_not_anchored`, en stderr y en
-   `details.warnings`) que un prefijo truncado también verifica.
+   `details.warnings`) que un prefijo truncado también verifica; con
+   `--require-anchored` falla (`SAFETY_JOURNAL_NOT_ANCHORED`) y, en un
+   rango, exige también `--expected-anchor` (`SAFETY_RANGE_NOT_ANCHORED`).
 
 Reporta la cantidad de `accepted`, `undeclared`, `invalid_name`,
 `duplicate`, `conflict`, `late`, `rejected`, `loss`, eventos perdidos y
 mensajes descartados, más la cantidad de epochs, el epoch final y su
 high-water. Códigos: `SAFETY_CHAIN_FAIL`, `SAFETY_SEQUENCE_FAIL`,
 `EVIDENCE_FAIL`, `AUTH_FAIL`, `SAFETY_EVENT_SIGNATURE_INVALID`,
-`JOURNAL_HEAD_MISMATCH`, `INVALID_REQUEST`, `INPUT_TOO_LARGE`.
+`JOURNAL_HEAD_MISMATCH`, `SAFETY_JOURNAL_NOT_ANCHORED`,
+`SAFETY_RANGE_NOT_ANCHORED`, `INVALID_REQUEST`, `INPUT_TOO_LARGE`.
 
 ## Qué prueba y qué NO prueba
 
