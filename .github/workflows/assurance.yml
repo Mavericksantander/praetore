@@ -451,6 +451,17 @@ jobs:
       # runtime tests to fail on every mutant; exits 1 if one survives.
       - run: ./scripts/g7-mutation-test.sh
 
+  observe-mutation:
+    name: Observe fails closed mutation test (evaluation error forwarded)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      # Runs the end-to-end test of an evaluation error in observe, then
+      # applies scripts/observe-mutants/m2-evaluation-error-forwarded.patch
+      # and requires the same test to fail by a panic (exit 101).
+      - run: ./scripts/observe-mutation-test.sh
+
   g1-mutation:
     name: G1 mutation test (gap check and rejected records removed)
     runs-on: ubuntu-latest

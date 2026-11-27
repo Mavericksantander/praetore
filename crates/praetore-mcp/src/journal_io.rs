@@ -66,6 +66,20 @@ pub(crate) fn append_journal_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Whether `path` opens for append right now. Nothing is written and
+/// nothing is created: a missing file is an error. `verify` uses it to warn
+/// about a daily file `wrap` would not be able to append to.
+pub(crate) fn opens_for_append(path: &Path) -> io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(crate::journal::nofollow_flag());
+    }
+    options.open(path).map(drop)
+}
+
 fn open_journal(path: &Path) -> io::Result<(fs::File, bool)> {
     let mut options = fs::OpenOptions::new();
     options.append(true);

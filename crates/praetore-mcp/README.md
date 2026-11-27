@@ -11,7 +11,9 @@ length), or refused if it may name a `safety*` tool (see Message handling). It n
 Rust code.
 
 * **observe** (default): every call that the policy classifies is
-  forwarded; the decision is only recorded. A call whose action type the
+  forwarded; the decision is only recorded. Observe never blocks because of
+  a policy decision (DENY or REQUIRE_APPROVAL); what it cannot record, it
+  does not run. A call whose action type the
   policy does not declare (a signed `unclassified` DENY, for example an undeclared
   `mcp.tools/call` or a `safety*` tool that is not exactly a declared Safety
   action) is refused in observe too, and a declared Safety call is forwarded
@@ -439,10 +441,27 @@ line as `not in canonical form`, and `wrap` holds an approved call it
 meets while reading which approvals were used. Concurrent
 wrappers serialize appends with a lock file (`receipts/.journal.lock`,
 `flock`, on Linux and macOS). A wrapper waits at most 10 s for that lock;
-after that the receipt is not written, so enforce refuses the call and
-observe warns. If the last line is incomplete (an
-interrupted write), nothing more is appended: enforce refuses calls and
-observe warns until the journal is checked. A daily file that starts at
+after that the receipt is not written, so the call is refused in both
+modes. If the last line is incomplete (an
+interrupted write), nothing more is appended: both modes refuse every call
+until the journal is checked. A call is forwarded only once its receipt
+is on disk, in observe as in enforce: a journal that cannot take the
+receipt (a blank or cut last line, a symlink, a read-only file, a held
+lock, a full disk) still reads back intact, so forwarding anyway would
+leave calls that ran with nothing for `verify` to see. `verify` finds the
+next position with the same function as `wrap`: when `wrap` cannot append
+(a blank line at the end of the daily file, a whitespace-only later
+`*.jsonl` file, a symlink in place of `receipts/` or of the daily file,
+an unreadable last line), `verify` reports
+`FAIL journal: wrap cannot append the next receipt` and exits 1, with or
+without the heads: every call is refused, in both modes, until the journal
+is repaired, while the chain and its head stay intact. `verify` sees this
+only while the journal stays in that state: once it is repaired, `verify`
+with the heads kept earlier says OK again, so this check does not on its
+own show that calls were refused in between. A daily file that exists but
+does not open for append right now (for example read-only) is a
+`WARNING journal:` line, not a failure: permissions can change before the
+next call. A daily file that starts at
 `seq` 0 (and has at most 4096 entries) also verifies with `praetore-verify
 journal --journal FILE --attester-pin attester-public-key.hex`, with the same
 head. Each `evidence` is a complete
@@ -806,7 +825,9 @@ Things to know:
   it can be read, as above, otherwise `null`). Observe
   forwards them unchanged, warns with the SHA-256 and the length of the
   line, and evaluates and records **every**
-  `tools/call` reading it can find. Three kinds are detected:
+  `tools/call` reading it can find. If the receipt of one of those readings
+  cannot be recorded, observe refuses the whole line instead. Three kinds
+  are detected:
   * **Bare carriage returns.** The proxy frames on `\n`, and JSON treats
     `\r` as whitespace. Universal-newline readers end a line at `\r`, `\n`
     or `\r\n`: the MCP Python SDK (`TextIOWrapper`, `newline=None`) and
@@ -858,12 +879,19 @@ Things to know:
   those keys. This does not stop a process that reads the key files and
   copies them; see the trust model.
 * Errors while evaluating one call after a successful start (clock, replay
-  guard): **enforce refuses the call (fail closed); observe forwards it with
-  a loud stderr warning and no receipt.** Exceptions (G7): an unclassified
+  guard): **both modes refuse the call (fail closed).** A call that was not
+  evaluated has no decision to record, and observe records decisions. The
+  client gets an MCP tool error that says no receipt could be recorded;
+  the stderr line names the mode. The same holds for an unclassified
   action type and any `safety*` tool name that is not exactly a declared
-  Safety action are refused in observe as well, even when the name would
-  fail validation or the line is ambiguous. If a receipt cannot be written,
-  enforce refuses the call; observe forwards it and warns.
+  Safety action (G7), even when the name would fail validation or the line
+  is ambiguous. If a receipt cannot be written (`JournalError::Unavailable`:
+  the journal cannot be read back, locked or appended), **both modes refuse
+  the call** and the reply carries the evidence id; an ambiguous line with
+  such a reading is refused whole. Earlier versions of observe
+  forwarded such calls with a warning and no receipt; a journal that
+  could not be appended but still read back intact then passed `verify`
+  with the heads kept earlier, saying nothing about the calls that ran.
 * Before a receipt is written, its journal line is read back and checked as
   `verify` would check it. If it does not read back as the receipt that was
   signed (for example a float argument that prints as text which parses to

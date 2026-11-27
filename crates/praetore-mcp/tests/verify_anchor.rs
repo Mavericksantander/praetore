@@ -209,9 +209,10 @@ fn a_journal_rewritten_with_the_keys_fails_against_the_saved_anchor() {
         ],
     );
     assert_eq!(code, 1, "{report}");
-    // Every receipt is validly signed; only the head tells.
+    // Every receipt is validly signed; only the head tells, on its own
+    // FAIL line: no receipt failed.
     assert!(
-        report.contains("FAIL 2 receipts: 2 verified, 1 failed"),
+        report.contains("FAIL 2 receipts: 2 verified, 0 failed"),
         "{report}"
     );
     assert!(

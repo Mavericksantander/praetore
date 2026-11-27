@@ -914,27 +914,11 @@ fn cmd_verify(args: &[String]) -> Result<i32, String> {
     for failure in &report.failures {
         println!("{failure}");
     }
-    let join = |map: &BTreeMap<_, usize>| {
-        map.iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    let by_mode: BTreeMap<&str, usize> = report
-        .by_mode
-        .iter()
-        .map(|(k, v)| (k.as_str(), *v))
-        .collect();
     let assurance = report.assurance();
-    println!(
-        "{} {} receipts: {} verified, {} failed | mode: {} | decision: {}",
-        assurance.label(),
-        report.total,
-        report.ok,
-        report.failures.len(),
-        join(&by_mode),
-        join(&report.by_decision)
-    );
+    println!("{}", report.summary());
+    for warning in &report.warnings {
+        println!("{warning}");
+    }
     println!(
         "checked: integrity hash, attester signature ({}), agent intent signature, authority signature against {} at decision time, praetore.mode binding, journal order (seq and hash link)",
         home.attester_pin().shown(),

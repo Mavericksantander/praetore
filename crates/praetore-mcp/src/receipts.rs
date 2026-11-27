@@ -171,6 +171,9 @@ pub struct VerifyReport {
     pub lines: Vec<LineVerdict>,
     /// Which journals were compared with a head given by the caller.
     pub anchors: Anchors,
+    /// States that do not fail a check but that the person should see: the
+    /// daily file or directory does not take an append right now.
+    pub warnings: Vec<String>,
 }
 
 /// Which journals `verify` compared with a state kept by the caller: a
@@ -231,6 +234,30 @@ pub const UNANCHORED_EXIT: i32 = 3;
 pub const NO_JOURNAL: &str = "none";
 
 impl VerifyReport {
+    /// The summary line of `verify`: `LABEL N receipts: V verified, F
+    /// failed | mode: ... | decision: ...`. `failed` counts journal lines
+    /// that did not verify, not failure messages: a failure of the journal
+    /// as a whole (its head, whether `wrap` can append to it, the approval
+    /// journal) is printed on its own `FAIL` line and is not a receipt.
+    pub fn summary(&self) -> String {
+        let join = |pairs: Vec<(&str, usize)>| {
+            pairs
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        format!(
+            "{} {} receipts: {} verified, {} failed | mode: {} | decision: {}",
+            self.assurance().label(),
+            self.total,
+            self.ok,
+            self.total - self.ok,
+            join(self.by_mode.iter().map(|(k, v)| (k.as_str(), *v)).collect()),
+            join(self.by_decision.iter().map(|(k, v)| (*k, *v)).collect())
+        )
+    }
+
     pub fn assurance(&self) -> Assurance {
         if !self.failures.is_empty() {
             return Assurance::Failed;
@@ -643,6 +670,20 @@ pub fn verify_journal_with(
             )),
         }
     }
+    // The writer's own view of the journal: `wrap` finds the next position
+    // with the same function, and refuses to append when it fails. A journal
+    // the writer refuses gets every later call refused, in both modes, while
+    // its chain and head stay intact, so `verify` must not pass on it. It sees
+    // this only while the journal stays in that state.
+    match crate::gate::Journal::new(home).check_appendable() {
+        Ok(None) => {}
+        Ok(Some(warning)) => report.warnings.push(format!(
+            "WARNING journal: the next receipt cannot be appended right now ({warning}); until it can, every call is refused, in both modes"
+        )),
+        Err(error) => report.failures.push(format!(
+            "FAIL journal: wrap cannot append the next receipt ({error}); every call is refused, in both modes, until the journal is repaired"
+        )),
+    }
     let approvals = crate::approvals::verify(home, &parsed_evidence)?;
     report.failures.extend(approvals.failures);
     if let (Some(Expected::Nothing), Some(head)) = (expected_approval_head, &approvals.head) {
@@ -672,6 +713,41 @@ pub fn verify_journal_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One line out of two fails, and the journal as a whole fails too
+    /// (`wrap` cannot append after it): the summary counts one failed
+    /// receipt, not two, and the verdict is still FAIL.
+    #[test]
+    fn the_verify_summary_counts_failed_lines_not_journal_failures() {
+        let report = VerifyReport {
+            total: 2,
+            ok: 1,
+            failures: vec![
+                "FAIL receipts/x.jsonl:2: integrity hash mismatch".to_owned(),
+                "FAIL journal: wrap cannot append the next receipt (x)".to_owned(),
+            ],
+            by_mode: BTreeMap::from([("observe".to_owned(), 1)]),
+            by_decision: BTreeMap::from([("ALLOW", 1)]),
+            ..VerifyReport::default()
+        };
+        assert_eq!(
+            report.summary(),
+            "FAIL 2 receipts: 1 verified, 1 failed | mode: observe=1 | decision: ALLOW=1"
+        );
+        let journal_only = VerifyReport {
+            total: 1,
+            ok: 1,
+            failures: vec!["FAIL journal: wrap cannot append the next receipt (x)".to_owned()],
+            ..VerifyReport::default()
+        };
+        assert!(
+            journal_only
+                .summary()
+                .starts_with("FAIL 1 receipts: 1 verified, 0 failed"),
+            "{}",
+            journal_only.summary()
+        );
+    }
     use praetore_core::{Action, AgentId, AgentIdentity, Authority, DecidedBy, Decision};
     use uuid::Uuid;
 
