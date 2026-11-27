@@ -4,6 +4,44 @@
 
 ### Fixed
 
+- **Sandbox: every directory on the way to the target must satisfy the
+  root's rule, and an effect whose directory left the root is never
+  `confirmed` (T-013B).** The gateway checked owner, mode and (macOS) ACL
+  of the sandbox root only. A process with write access to a directory
+  inside the root could rename `a/b` out of the root after the gateway had
+  opened it and before its `renameat`/`unlinkat`; the temporary file of a
+  write is visible to `readdir` and gave the exact moment. The write or
+  delete then landed in the moved directory, outside the root, and the
+  signed receipt said `confirmed` (reproduced 200/200 writes, 143/200
+  deletes). Now `praetore-sandbox-fs` takes a directory check from its
+  caller (`Root::with_directory_check`) and applies it to every directory
+  between the root and the target's parent, both included: the portable
+  walk checks each component as it opens it; after `openat2` the parent is
+  walked back up with `openat(fd, "..")` exactly as many steps as the path
+  has directories, each checked, and must end at the root. The gateway
+  passes the rule of its root (owned by the gateway user, not group/other
+  writable, no extended ACL entries), so no other local user can rename a
+  directory on the way: refusal `insecure_directory_in_path`, or
+  `parent_directory_outside_root` when the walk does not end at the root,
+  both before any effect. After the effect, the path is resolved again
+  from the root and must reach the directory the effect used, holding the
+  expected entry; otherwise the report is `executed`, never `confirmed`,
+  and the output names why (`unconfirmed`: `parent_not_at_path`,
+  `entry_mismatch`, `directory_sync_failed`). `Written` and `Removed`
+  carry `unconfirmed: Option<Unconfirmed>` and `confirmed()` instead of a
+  `confirmed` field; `Root::unlink_in` is the delete step with that
+  confirmation. Not changed: a process the rule admits (the gateway user
+  itself, or root) can still move an opened directory out; the effect
+  then lands there and is reported `executed` with `unconfirmed`.
+- **Sandbox paths: one invisible-character rule.** The gateway's path
+  check refused a local list of format characters that lacked the tag
+  characters (U+E0000 to U+E007F, invisible in most renderers), the
+  Arabic and Kaithi number signs and others, so `report\u{E0041}.txt`
+  was accepted and shown to an approver as `report.txt`. The gateway and
+  the sandbox supervisor now refuse every character
+  `praetore_core::display::is_invisible` names (the workspace's one rule,
+  G7), which also covers every space other than U+0020. The supervisor's
+  ASCII allowlist already refused them; its own list is removed.
 - **praetore-mcp: the journal and approval locks wait at most 10 s.** A
   process that kept `receipts/.journal.lock` or `approvals/.lock` left
   every call waiting with no reply. After 10 s the wait ends with an error

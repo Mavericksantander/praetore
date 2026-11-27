@@ -7,7 +7,11 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use praetore_core::{Action, Authority, canonical::parse_json_rejecting_duplicates};
+// `is_invisible`: the workspace's one rule for characters that render
+// invisibly or reorder text (G7), shared with the gateway's sandbox adapter.
+use praetore_core::{
+    Action, Authority, canonical::parse_json_rejecting_duplicates, display::is_invisible,
+};
 use praetore_gateway::{
     DispatchReport, ExecutionKey, action_digest, authority_tenant_id,
     sandbox::{MAX_COMPONENT_BYTES, MAX_PATH_BYTES},
@@ -675,8 +679,11 @@ fn value_matches_kind(kind: ParameterKind, value: &Value) -> bool {
 ///
 /// The allowlist already implies the following, which are still checked
 /// explicitly as defense in depth: an empty value; NUL and every other
-/// control character; Unicode format (Cf) and bidirectional controls and
-/// U+2028/U+2029; a root (`/` or `\`); a drive or UNC prefix; a leading `~`;
+/// control character; every character `praetore_core::display::is_invisible`
+/// names (Unicode format and bidirectional controls, tag characters,
+/// U+2028/U+2029 and every space other than U+0020; the same rule the
+/// gateway's sandbox adapter applies); a root (`/` or `\`); a drive or UNC
+/// prefix; a leading `~`;
 /// any `%`; and any empty, `.` or `..` segment (so `a//b`, `./a` and a
 /// trailing separator are refused). Symlinks are not resolved here (fix B).
 fn lexically_confined_text(text: &str) -> bool {
@@ -691,7 +698,7 @@ fn lexically_confined_text(text: &str) -> bool {
         && !text.contains('%')
         && !text
             .chars()
-            .any(|character| character.is_control() || is_format_or_bidi_char(character))
+            .any(|character| character.is_control() || is_invisible(character))
         && text
             .split(['/', '\\'])
             .all(|segment| !matches!(segment, "" | "." | "..") && allowed_path_segment(segment))
@@ -706,36 +713,6 @@ fn allowed_path_segment(segment: &str) -> bool {
         && segment
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-}
-
-/// Unicode general category Cf (format: bidirectional embeddings, overrides
-/// and isolates, marks, zero-width characters, tags, ...) plus U+2028/U+2029.
-/// Written out because `std` exposes no general-category lookup.
-fn is_format_or_bidi_char(character: char) -> bool {
-    matches!(
-        character,
-        '\u{00AD}'
-            | '\u{0600}'..='\u{0605}'
-            | '\u{061C}'
-            | '\u{06DD}'
-            | '\u{070F}'
-            | '\u{0890}'..='\u{0891}'
-            | '\u{08E2}'
-            | '\u{180E}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{2028}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{206F}'
-            | '\u{FEFF}'
-            | '\u{FFF9}'..='\u{FFFB}'
-            | '\u{110BD}'
-            | '\u{110CD}'
-            | '\u{13430}'..='\u{1343F}'
-            | '\u{1BCA0}'..='\u{1BCA3}'
-            | '\u{1D173}'..='\u{1D17A}'
-            | '\u{E0001}'
-            | '\u{E0020}'..='\u{E007F}'
-    )
 }
 
 fn is_json_content_type(headers: &HeaderMap) -> bool {
@@ -2101,6 +2078,9 @@ mod tests {
                 '\u{2028}',
                 '\u{2029}',
                 '\u{E0041}',
+                '\u{0600}',
+                '\u{110BD}',
+                '\u{00A0}',
             ])
         {
             values.push(format!("a{character}txt.exe"));

@@ -27,6 +27,7 @@ uuid = "1.18"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 praetore-sandbox-fs = { path = "../praetore-sandbox-fs" }
+rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }
 
 [dev-dependencies]
 # G7 runtime tests count engine calls with the test-only probe.
@@ -36,5 +37,3 @@ ed25519-dalek = { version = "3", features = ["rand_core"] }
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
-[target.'cfg(unix)'.dev-dependencies]
-rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }

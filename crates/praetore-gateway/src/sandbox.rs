@@ -27,6 +27,15 @@
 //!   re-validated; otherwise the action is refused (fail closed). At open,
 //!   leftover temporary files (see [`TEMP_PREFIX`], matched ASCII
 //!   case-insensitively) are removed without following links.
+//! - The same owner/mode/ACL rule applies to every directory between the
+//!   root and the target's parent (both included), on every resolution
+//!   (`insecure_directory_in_path`): the portable walk checks each
+//!   component as it opens it; after `openat2` the parent is walked back up
+//!   with `..`, exactly as many steps as the path has directories, and must
+//!   end at the root (`parent_directory_outside_root` otherwise). So no
+//!   other local user can rename a directory on the way to the target while
+//!   an action is in flight. See [`praetore_sandbox_fs`] ("Directories
+//!   between the root and the target").
 //! - Refusal codes are terminal except `sandbox_root_unavailable`,
 //!   `parent_directory_unavailable` and `file_unavailable` (descriptor or
 //!   I/O errors while inspecting), which are transient.
@@ -68,34 +77,45 @@
 //! class `no_effect`. Any error from the effect call itself (`write_file`, or
 //! the `unlinkat` of a delete, `ENOENT` included) is signed `effect_failed`.
 //!
-//! Residual risks (documented, not solved here): a process that can rename
-//! directories inside the root *and* write outside it on the same
-//! filesystem can move an already opened directory out of the root while a
-//! single operation is in flight; a hard link created by such a process
-//! after the checks is not detected (it cannot redirect `fs:write_file`,
-//! which replaces the entry by rename, nor make `fs:delete_file` remove
-//! anything but the inside name); there is no quota on the number of files;
-//! and idempotency/reconciliation records are kept in memory and are lost on
-//! restart, like the local demo adapter.
+//! After the effect, the path is resolved again from the root and must reach
+//! the directory the effect used, holding the expected entry. Only then is
+//! the report `Confirmed`. Otherwise it is `Executed` and the output names
+//! why in `unconfirmed` (`parent_not_at_path`: the directory was moved or
+//! left the root meanwhile; `entry_mismatch`; `directory_sync_failed`).
+//!
+//! Residual risks (documented, not solved here): a process the directory
+//! rule admits (the gateway user itself, or root) can still move an already
+//! opened directory out of the root while a single operation is in flight;
+//! the effect then lands in the moved directory and is reported `Executed`
+//! with `unconfirmed`, never `Confirmed`. A hard link created by such a
+//! process after the checks is not detected (it cannot redirect
+//! `fs:write_file`, which replaces the entry by rename, nor make
+//! `fs:delete_file` remove anything but the inside name); there is no quota
+//! on the number of files; and idempotency/reconciliation records are kept
+//! in memory and are lost on restart, like the local demo adapter.
 
 use crate::{
     ActionDispatcher, DispatchError, DispatchRefused, DispatchReport, ExecutionKey,
     ReconciliationReport, local_demo::LocalDemoDispatcher,
 };
-use praetore_core::{Action, Authority};
+// `is_invisible`: the workspace's one rule for characters that render
+// invisibly or reorder text (G7), shared with the supervisor's path check.
+use praetore_core::{Action, Authority, display::is_invisible};
 // `is_temp_name`: TEMP_PREFIX compared ASCII case-insensitively, shared with
 // praetore-sandbox-fs (which also refuses such paths on its own).
-use praetore_sandbox_fs::{ConfineError, Openat2Status, Removed, Resolver, Root, is_temp_name};
+use praetore_sandbox_fs::{
+    ConfineError, DirectoryCheck, Openat2Status, Removed, Resolver, Root, Unconfirmed, is_temp_name,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     ffi::CString,
     io,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 use thiserror::Error;
 
@@ -272,7 +292,13 @@ impl SandboxDispatcher {
         // Temporary files left by an interrupted write are never the target
         // of an action; remove them (best effort, never following links).
         sweep_temp_files(root_fd.as_raw_fd(), root_dev, 0);
-        let root_fd = Root::from_fd(root_fd).map_err(|_| SandboxConfigError::NotDirectory)?;
+        // Every directory between the root and a target's parent must
+        // satisfy the rule the root satisfies; the crate applies it on each
+        // resolution (`insecure_directory_in_path`).
+        let directory_check: DirectoryCheck = Arc::new(directory_is_secure);
+        let root_fd = Root::from_fd(root_fd)
+            .map_err(|_| SandboxConfigError::NotDirectory)?
+            .with_directory_check(directory_check);
         // Records (and logs once, if unavailable or denied) what this kernel
         // offers, so the startup log below states the resolution in use.
         praetore_sandbox_fs::probe_openat2(&root_fd);
@@ -469,11 +495,7 @@ impl SandboxDispatcher {
                     "bytes": content.len(),
                     "sha256": hex::encode(Sha256::digest(content.as_bytes())),
                 });
-                Ok(if written.confirmed {
-                    DispatchReport::Confirmed(output)
-                } else {
-                    DispatchReport::Executed(output)
-                })
+                Ok(report(output, written.unconfirmed))
             }
             FsOp::Delete { path } => {
                 // The steps of `Root::remove_file`. Resolving the parent and
@@ -486,14 +508,37 @@ impl SandboxDispatcher {
                 parent
                     .check_entry(name, false)
                     .map_err(|error| before(refusal(error)))?;
-                let removed = unlink(&parent, name)?;
+                let removed = self.unlink(path, &parent, name)?;
                 let output = json!({"action": DELETE_ACTION, "path": path});
-                Ok(if removed.confirmed {
-                    DispatchReport::Confirmed(output)
-                } else {
-                    DispatchReport::Executed(output)
-                })
+                Ok(report(output, removed.unconfirmed))
             }
+        }
+    }
+
+    /// The `unlinkat` of a checked delete, then the confirmation through the
+    /// root. Its error does not prove that the entry was not removed
+    /// (`ENOENT`, for example, does not say who removed it), so any error is
+    /// `effect_failed`, never `no_effect`.
+    fn unlink(
+        &self,
+        path: &str,
+        parent: &praetore_sandbox_fs::Dir,
+        name: &str,
+    ) -> Result<Removed, PerformFailure> {
+        self.root_fd
+            .unlink_in(path, parent, name)
+            .map_err(|error| PerformFailure::EffectFailed(refusal(error).reason()))
+    }
+}
+
+/// `Confirmed` only when the effect was confirmed through the root;
+/// otherwise `Executed`, with the reason in the signed output.
+fn report(mut output: Value, unconfirmed: Option<Unconfirmed>) -> DispatchReport {
+    match unconfirmed {
+        None => DispatchReport::Confirmed(output),
+        Some(reason) => {
+            output["unconfirmed"] = Value::String(reason.as_str().to_owned());
+            DispatchReport::Executed(output)
         }
     }
 }
@@ -616,23 +661,15 @@ impl ActionDispatcher for SandboxDispatcher {
     }
 }
 
-/// The `unlinkat` of a checked delete. Its error does not prove that the
-/// entry was not removed (`ENOENT`, for example, does not say who removed
-/// it), so any error is `effect_failed`, never `no_effect`.
-fn unlink(parent: &praetore_sandbox_fs::Dir, name: &str) -> Result<Removed, PerformFailure> {
-    parent
-        .unlink_file(name)
-        .map_err(|error| PerformFailure::EffectFailed(refusal(error).reason()))
-}
-
 /// Accepts only `name(/name)*` with each name a normal, non-empty component.
 /// Rejects absolute paths, `.`/`..`, empty components (`a//b`, trailing `/`),
-/// NUL and control characters (C0, DEL, C1), backslashes, Unicode
-/// bidirectional and zero-width format characters (which could make the path
-/// shown to an approver differ from the one written), names starting with
-/// [`TEMP_PREFIX`], and excessive length or depth. This is lexical only:
-/// visually confusable names (for example Cyrillic `а` for Latin `a`) are
-/// distinct, ordinary file names and are not detected.
+/// NUL and control characters (C0, DEL, C1), backslashes, every character
+/// [`is_invisible`] names (format and bidirectional characters, tag
+/// characters, zero-width characters, every space other than U+0020: they
+/// could make the path shown to an approver differ from the one written),
+/// names starting with [`TEMP_PREFIX`], and excessive length or depth. This
+/// is lexical only: visually confusable names (for example Cyrillic `а` for
+/// Latin `a`) are distinct, ordinary file names and are not detected.
 pub fn validate_relative_path(path: &str) -> Result<(), DispatchRefused> {
     if path.is_empty() {
         return Err(DispatchRefused::terminal("empty_path"));
@@ -645,7 +682,7 @@ pub fn validate_relative_path(path: &str) -> Result<(), DispatchRefused> {
     }
     if path
         .chars()
-        .any(|c| c.is_control() || c == '\\' || is_format_char(c))
+        .any(|c| c.is_control() || c == '\\' || is_invisible(c))
     {
         return Err(DispatchRefused::terminal("invalid_path_character"));
     }
@@ -682,17 +719,36 @@ enum RootProblem {
 /// show. On Linux, POSIX ACL entries are bounded by the ACL mask, which is
 /// reported as the group mode bits, so the mode check covers them.
 fn root_security(fd: RawFd, stat: &libc::stat) -> Result<(), RootProblem> {
+    directory_security(fd, stat.st_uid, stat.st_mode & 0o022 != 0)
+}
+
+/// The rule of [`root_security`] for one directory: `uid` its owner,
+/// `group_or_other_writable` its mode bits `0o022`.
+fn directory_security(
+    fd: RawFd,
+    uid: libc::uid_t,
+    group_or_other_writable: bool,
+) -> Result<(), RootProblem> {
     // SAFETY: geteuid has no preconditions.
-    if stat.st_uid != unsafe { libc::geteuid() } {
+    if uid != unsafe { libc::geteuid() } {
         return Err(RootProblem::NotOwned);
     }
-    if stat.st_mode & 0o022 != 0 {
+    if group_or_other_writable {
         return Err(RootProblem::Writable);
     }
     if has_extended_acl(fd) {
         return Err(RootProblem::Acl);
     }
     Ok(())
+}
+
+/// The [`praetore_sandbox_fs::DirectoryCheck`] of the dispatcher: the rule
+/// of [`root_security`], applied by the crate to every directory between the
+/// root and a target's parent.
+fn directory_is_secure(fd: BorrowedFd<'_>, stat: &rustix::fs::Stat) -> bool {
+    let writable = rustix::fs::Mode::from_raw_mode(stat.st_mode)
+        .intersects(rustix::fs::Mode::WGRP | rustix::fs::Mode::WOTH);
+    directory_security(fd.as_raw_fd(), stat.st_uid, writable).is_ok()
 }
 
 #[cfg(target_os = "macos")]
@@ -783,22 +839,6 @@ fn sweep_temp_files(dirfd: RawFd, root_dev: libc::dev_t, depth: usize) {
     }
 }
 
-/// Invisible or direction-changing format characters.
-fn is_format_char(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00AD}'
-            | '\u{061C}'
-            | '\u{180E}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{2028}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{206F}'
-            | '\u{FEFF}'
-            | '\u{FFF9}'..='\u{FFFB}'
-    )
-}
-
 fn unlink_quietly(dirfd: RawFd, name: &CString) {
     // SAFETY: valid dirfd and NUL-terminated name.
     unsafe { libc::unlinkat(dirfd, name.as_ptr(), 0) };
@@ -857,6 +897,11 @@ fn refusal(error: ConfineError) -> DispatchRefused {
         ConfineError::HardLinked => DispatchRefused::terminal("hard_link_not_allowed"),
         ConfineError::NotFound => DispatchRefused::terminal("file_not_found"),
         ConfineError::AlreadyExists => DispatchRefused::terminal("file_exists"),
+        // A directory on the way to the target fails the owner/mode/ACL rule
+        // of the root, or the parent is not beneath the root. Properties of
+        // the tree, like a symlink in the path: terminal.
+        ConfineError::InsecureDirectory => DispatchRefused::terminal("insecure_directory_in_path"),
+        ConfineError::NotBeneathRoot => DispatchRefused::terminal("parent_directory_outside_root"),
         // Permanent: openat2 was required and is missing, or seccomp/LSM
         // denies it. Retrying cannot succeed.
         ConfineError::Openat2Unavailable => DispatchRefused::terminal("openat2_unavailable"),
@@ -875,6 +920,7 @@ fn refusal(error: ConfineError) -> DispatchRefused {
 mod tests {
     use super::*;
     use praetore_core::AgentId;
+    use std::fs::Permissions;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::Arc;
     use uuid::Uuid;
@@ -1511,6 +1557,10 @@ mod tests {
     fn unicode_is_lexical_format_characters_are_refused() {
         let dirs = dirs();
         let d = SandboxDispatcher::open(&dirs.root).unwrap();
+        // Including the characters outside the old local list: TAG (U+E0041,
+        // invisible in most renderers), ARABIC NUMBER SIGN (U+0600), KAITHI
+        // NUMBER SIGN (U+110BD) and NO-BREAK SPACE: the rule is
+        // `praetore_core::display::is_invisible`, shared with the supervisor.
         for path in [
             "evil\u{202E}txt.exe",
             "a\u{200B}b",
@@ -1518,6 +1568,10 @@ mod tests {
             "bom\u{FEFF}",
             "c1\u{0085}",
             "del\u{7F}",
+            "report\u{E0041}.txt",
+            "a\u{0600}b",
+            "x\u{110BD}y",
+            "nb\u{00A0}sp",
         ] {
             assert_eq!(
                 d.preflight(&authority(), &write(path, "x")),
@@ -1787,7 +1841,7 @@ mod tests {
         parent.check_entry(name, false).unwrap();
         std::fs::remove_file(dirs.root.join("gone.txt")).unwrap();
         assert!(matches!(
-            unlink(&parent, name),
+            d.unlink("gone.txt", &parent, name),
             Err(PerformFailure::EffectFailed("file_not_found"))
         ));
     }
@@ -2217,6 +2271,241 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dirs.outside.join("victim")).unwrap(),
             "original"
+        );
+    }
+
+    /// Every directory between the root and the target's parent must satisfy
+    /// the root's owner/mode rule. A group- or world-writable `a` refuses
+    /// `a/b/f.txt`, `a/b/keep.txt` and `a/f.txt` (write and delete) at
+    /// preflight and at dispatch, before any effect, with the terminal code
+    /// `insecure_directory_in_path`; the parent itself (`b`) is checked too;
+    /// restoring the modes admits the same actions. Another owner can only be
+    /// arranged as root: then `a` is handed to uid 1 and must be refused;
+    /// otherwise that case is reported as skipped.
+    #[test]
+    fn insecure_intermediate_directory_is_refused_before_any_effect() {
+        let dirs = dirs();
+        let (a, b) = (dirs.root.join("a"), dirs.root.join("a/b"));
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(b.join("keep.txt"), "keep").unwrap();
+        let d = open_as_gateway(&dirs.root);
+        let mut n = 0u128;
+        let mut refuse_all = |label: &str| {
+            for action in [
+                write("a/b/f.txt", "x"),
+                delete("a/b/keep.txt"),
+                write("a/f.txt", "x"),
+            ] {
+                n += 1;
+                assert_eq!(
+                    d.preflight(&authority(), &action),
+                    Err(DispatchRefused::terminal("insecure_directory_in_path")),
+                    "{label}: {}",
+                    action.action_type
+                );
+                assert!(not_applied(run(&d, n, &action)), "{label}");
+                assert_eq!(
+                    d.not_applied_reason(key(n)),
+                    Some("insecure_directory_in_path"),
+                    "{label}"
+                );
+            }
+            assert!(!b.join("f.txt").exists(), "{label}");
+            assert!(!a.join("f.txt").exists(), "{label}");
+            assert_eq!(
+                std::fs::read_to_string(b.join("keep.txt")).unwrap(),
+                "keep",
+                "{label}"
+            );
+        };
+        for mode in [0o777, 0o770, 0o707, 0o1777] {
+            std::fs::set_permissions(&a, Permissions::from_mode(mode)).unwrap();
+            refuse_all(&format!("a mode {mode:o}"));
+        }
+        std::fs::set_permissions(&a, Permissions::from_mode(0o755)).unwrap();
+        // `b` is the parent of `a/b/f.txt` and `a/b/keep.txt`; `a/f.txt`
+        // has `a` as parent and is admitted, so only the first two refuse.
+        std::fs::set_permissions(&b, Permissions::from_mode(0o777)).unwrap();
+        for action in [write("a/b/f.txt", "x"), delete("a/b/keep.txt")] {
+            assert_eq!(
+                d.preflight(&authority(), &action),
+                Err(DispatchRefused::terminal("insecure_directory_in_path")),
+                "b mode 777: {}",
+                action.action_type
+            );
+        }
+        assert!(d.preflight(&authority(), &write("a/f.txt", "x")).is_ok());
+        std::fs::set_permissions(&b, Permissions::from_mode(0o755)).unwrap();
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            std::os::unix::fs::chown(&a, Some(1), None).unwrap();
+            refuse_all("a owned by uid 1");
+            std::os::unix::fs::chown(&a, Some(0), None).unwrap();
+        } else {
+            eprintln!("skipped: the other-owner case needs root to chown a directory");
+        }
+        // Restored: admitted and confirmed, inside the root.
+        n += 1;
+        assert!(matches!(
+            run(&d, n, &write("a/b/f.txt", "x")),
+            Ok(DispatchReport::Confirmed(_))
+        ));
+        n += 1;
+        assert!(matches!(
+            run(&d, n, &delete("a/b/keep.txt")),
+            Ok(DispatchReport::Confirmed(_))
+        ));
+        assert!(b.join("f.txt").is_file() && !b.join("keep.txt").exists());
+        assert!(outside_is_empty(&dirs));
+    }
+
+    /// The race of the 2026-11-26 audit: a process that owns `a` (admitted
+    /// by the directory rule, like this test) moves `a/b` out of the root as
+    /// soon as the gateway's temporary file appears in it (it is visible to
+    /// `readdir`), so the `renameat` of `fs:write_file` lands outside. The
+    /// delete leg moves a directory holding the victim in, lets the checks
+    /// pass and moves it out before the `unlinkat`. Such an effect cannot be
+    /// prevented for a process the rule admits, but it must never be
+    /// reported `Confirmed`: a write or delete whose directory left the root
+    /// is `Executed` with `unconfirmed: parent_not_at_path`.
+    ///
+    /// Order is established by the swapper itself, right after its rename:
+    /// a target still absent (write) or a victim still present (delete) in
+    /// the moved directory proves that the effect, if it then happens,
+    /// happens outside. A round where the effect came first is benign and
+    /// not counted; this errs on the side of counting fewer escapes, never
+    /// of flagging a legitimate `Confirmed`. The write leg's signal is
+    /// deterministic enough for the test to require at least one escape;
+    /// the delete leg (timing only) reports how many it produced.
+    #[test]
+    fn race_intermediate_directory_moved_out_of_root_is_never_confirmed() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dirs = dirs();
+        let d = open_as_gateway(&dirs.root);
+        let slot = dirs.root.join("a/b");
+        std::fs::create_dir_all(&slot).unwrap();
+        let temp_present = |dir: &Path| {
+            std::fs::read_dir(dir).is_ok_and(|entries| {
+                entries
+                    .flatten()
+                    .any(|entry| is_temp_name(entry.file_name().as_bytes()))
+            })
+        };
+        let unconfirmed_reason = |output: &Value| {
+            output["unconfirmed"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| "absent".into())
+        };
+        let mut n = 0u128;
+        let (mut escaped, mut confirmed_outside, mut benign, mut refused) =
+            (0u32, 0u32, 0u32, 0u32);
+        let mut reasons = std::collections::BTreeMap::<String, u32>::new();
+        for round in 0..40u32 {
+            let out = dirs.outside.join(format!("w{round}"));
+            let target = format!("esc{round}.txt");
+            let done = AtomicBool::new(false);
+            n += 1;
+            let action = write(&format!("a/b/{target}"), "approved content");
+            // `moved_before_effect`: the directory was moved and the target
+            // was not yet in it right after the move.
+            let (result, moved_before_effect) = std::thread::scope(|scope| {
+                let swapper = scope.spawn(|| {
+                    while !done.load(Ordering::Relaxed) {
+                        if temp_present(&slot) {
+                            return std::fs::rename(&slot, &out).is_ok()
+                                && !out.join(&target).exists();
+                        }
+                    }
+                    false
+                });
+                let result = run(&d, n, &action);
+                done.store(true, Ordering::Relaxed);
+                (result, swapper.join().unwrap())
+            });
+            let landed_outside = moved_before_effect && out.join(&target).is_file();
+            match (&result, landed_outside) {
+                (Ok(DispatchReport::Confirmed(_)), true) => confirmed_outside += 1,
+                (Ok(DispatchReport::Executed(output)), true) => {
+                    escaped += 1;
+                    *reasons.entry(unconfirmed_reason(output)).or_default() += 1;
+                }
+                (Ok(_), false) => benign += 1,
+                (Err(_), _) => refused += 1,
+            }
+            if !slot.exists() {
+                std::fs::create_dir_all(&slot).unwrap();
+            }
+        }
+        eprintln!(
+            "moved-directory write race: escaped={escaped} confirmed_outside={confirmed_outside} \
+             benign={benign} refused={refused} unconfirmed={reasons:?} path_resolution={:?}",
+            d.path_resolution()
+        );
+        assert_eq!(
+            confirmed_outside, 0,
+            "a write outside the root was Confirmed"
+        );
+        assert!(escaped > 0, "race not exercised: no write landed outside");
+        assert_eq!(
+            reasons.keys().collect::<Vec<_>>(),
+            vec!["parent_not_at_path"],
+            "{reasons:?}"
+        );
+
+        // Delete leg: `victim.txt` lives in a directory outside; it is moved
+        // into the slot, the action targets it, and the directory is moved
+        // out again while the dispatch runs.
+        let (mut deleted_outside, mut confirmed_deleted_outside, mut benign, mut refused) =
+            (0u32, 0u32, 0u32, 0u32);
+        let mut reasons = std::collections::BTreeMap::<String, u32>::new();
+        for round in 0..40u32 {
+            let out = dirs.outside.join(format!("d{round}"));
+            std::fs::create_dir_all(&out).unwrap();
+            std::fs::write(out.join("victim.txt"), "victim").unwrap();
+            let _ = std::fs::remove_dir_all(&slot);
+            std::fs::rename(&out, &slot).unwrap();
+            n += 1;
+            let action = delete("a/b/victim.txt");
+            // `moved_before_effect`: the directory was moved with the victim
+            // still in it.
+            let (result, moved_before_effect) = std::thread::scope(|scope| {
+                let swapper = scope.spawn(|| {
+                    // The attacker's timing ramp (no marker exists for a
+                    // delete): from "before the checks" to "after the
+                    // unlinkat"; the rounds in between hit the window.
+                    std::thread::sleep(std::time::Duration::from_micros(u64::from(round) * 5));
+                    std::fs::rename(&slot, &out).is_ok() && out.join("victim.txt").exists()
+                });
+                let result = run(&d, n, &action);
+                (result, swapper.join().unwrap())
+            });
+            let _ = std::fs::rename(&slot, &out);
+            std::fs::create_dir_all(&slot).unwrap();
+            let victim_gone_outside = moved_before_effect && !out.join("victim.txt").exists();
+            match (&result, victim_gone_outside) {
+                (Ok(DispatchReport::Confirmed(_)), true) => confirmed_deleted_outside += 1,
+                (Ok(DispatchReport::Executed(output)), true) => {
+                    deleted_outside += 1;
+                    *reasons.entry(unconfirmed_reason(output)).or_default() += 1;
+                }
+                (Ok(_), false) => benign += 1,
+                (Err(_), _) => refused += 1,
+            }
+        }
+        eprintln!(
+            "moved-directory delete race: deleted_outside={deleted_outside} \
+             confirmed_deleted_outside={confirmed_deleted_outside} benign={benign} \
+             refused={refused} unconfirmed={reasons:?}"
+        );
+        assert_eq!(
+            confirmed_deleted_outside, 0,
+            "a delete outside the root was Confirmed"
+        );
+        assert!(
+            reasons.keys().all(|reason| reason == "parent_not_at_path"),
+            "{reasons:?}"
         );
     }
 }

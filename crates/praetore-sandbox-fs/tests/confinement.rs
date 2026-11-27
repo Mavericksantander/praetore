@@ -421,3 +421,114 @@ fn openat2_is_reported_correctly_for_the_platform() {
         );
     }
 }
+
+/// With a directory check (here: not group/other-writable, the rule the
+/// gateway applies to its root), a world-writable intermediate directory
+/// refuses every effect through it, with every resolver, and nothing is
+/// created on the way. Without the check the crate holds no policy and
+/// admits it.
+#[test]
+fn insecure_intermediate_directory_is_refused_with_a_directory_check() {
+    use praetore_sandbox_fs::DirectoryCheck;
+    use rustix::fs::Mode;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+    let tree = Tree::new("dircheck");
+    std::fs::create_dir_all(tree.root.join("a/b")).unwrap();
+    std::fs::write(tree.root.join("a/b/g"), "keep").unwrap();
+    let strict: DirectoryCheck =
+        Arc::new(|_, stat| !Mode::from_raw_mode(stat.st_mode).intersects(Mode::WGRP | Mode::WOTH));
+    for mode in [0o777, 0o770, 0o707] {
+        std::fs::set_permissions(tree.root.join("a"), std::fs::Permissions::from_mode(mode))
+            .unwrap();
+        for root in roots(&tree.root) {
+            let root = root.with_directory_check(strict.clone());
+            assert_err!(
+                root.write_file("a/b/f", b"x", 0o600),
+                ConfineError::InsecureDirectory,
+                root
+            );
+            assert_err!(
+                root.remove_file("a/b/g"),
+                ConfineError::InsecureDirectory,
+                root
+            );
+            // The parent itself is checked too, not only the way to it.
+            assert_err!(
+                root.write_file("a/f", b"x", 0o600),
+                ConfineError::InsecureDirectory,
+                root
+            );
+            assert!(!tree.root.join("a/b/f").exists(), "{mode:o}");
+            assert_eq!(
+                std::fs::read_to_string(tree.root.join("a/b/g")).unwrap(),
+                "keep"
+            );
+        }
+    }
+    std::fs::set_permissions(tree.root.join("a"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    for root in roots(&tree.root) {
+        let root = root.with_directory_check(strict.clone());
+        let written = root.write_file("a/b/f", b"x", 0o600).unwrap();
+        assert!(written.confirmed(), "{:?}: {written:?}", root.resolver());
+        let removed = root.remove_file("a/b/f").unwrap();
+        assert!(removed.confirmed(), "{:?}: {removed:?}", root.resolver());
+    }
+}
+
+/// A directory moved out of the root after it was resolved: the effect
+/// lands in the moved directory (the descriptor still names it) and the
+/// result says so with `ParentNotAtPath`; it is never confirmed. Exercised
+/// at the seam between resolving and acting, which is where a racing
+/// process would strike.
+#[test]
+fn an_effect_whose_directory_left_the_root_is_reported_unconfirmed() {
+    use praetore_sandbox_fs::Unconfirmed;
+    use std::io::Write as _;
+    for root in roots_for_moves() {
+        let tree = Tree::new("moved");
+        std::fs::create_dir_all(tree.root.join("a/b")).unwrap();
+        std::fs::write(tree.root.join("a/b/victim"), "victim").unwrap();
+        let root = Root::open(&tree.root).unwrap().with_resolver(root);
+        let (dir, name) = root.open_parent("a/b/f").unwrap();
+        let (vdir, vname) = root.open_parent("a/b/victim").unwrap();
+        vdir.check_entry(vname, false).unwrap();
+        // The attacker's rename, between the checks and the effect.
+        std::fs::rename(tree.root.join("a/b"), tree.outside.join("b")).unwrap();
+        // Write primitive: the file is created through the held descriptor.
+        let mut file = dir.create_new(name, 0o600).unwrap();
+        file.write_all(b"x").unwrap();
+        let stat = rustix::fs::fstat(&file).unwrap();
+        assert_eq!(
+            root.verify_entry("a/b/f", &dir, Some(&stat)),
+            Err(Unconfirmed::ParentNotAtPath),
+            "{:?}",
+            root.resolver()
+        );
+        assert!(tree.outside.join("b/f").exists());
+        // Delete through the root: the effect happens, the result is not
+        // confirmed and names why.
+        let removed = root.unlink_in("a/b/victim", &vdir, vname).unwrap();
+        assert_eq!(
+            removed.unconfirmed,
+            Some(Unconfirmed::ParentNotAtPath),
+            "{:?}",
+            root.resolver()
+        );
+        assert!(!removed.confirmed());
+        assert!(!tree.outside.join("b/victim").exists());
+        // Put it back: the same checks confirm.
+        std::fs::rename(tree.outside.join("b"), tree.root.join("a/b")).unwrap();
+        assert_eq!(root.verify_entry("a/b/f", &dir, Some(&stat)), Ok(()));
+        assert_eq!(root.verify_entry("a/b/victim", &vdir, None), Ok(()));
+    }
+}
+
+fn roots_for_moves() -> Vec<Resolver> {
+    let probe = Tree::new("probe");
+    let mut resolvers = vec![Resolver::Auto, Resolver::Walk];
+    if praetore_sandbox_fs::openat2_available(&Root::open(&probe.root).unwrap()) {
+        resolvers.push(Resolver::Openat2);
+    }
+    resolvers
+}
