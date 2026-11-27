@@ -4,6 +4,18 @@
 
 ### Fixed
 
+- **praetore: the key and token files of a demo directory are read from one
+  open descriptor.** `read_secret` (`issuer.key`, `evidence-attester.key`,
+  `execution-attester.key`, `approver.key` and the two API token files)
+  checked the path with `metadata`, which follows a symbolic link, did not
+  check the owner, and then read the file again by path. It now uses the
+  reader of the safety namespace key and of the gateway service: the file
+  is opened with `O_NOFOLLOW`, checked on that descriptor (a regular file
+  owned by the current user, mode `0600` or `0400`, at most 128 bytes) and
+  read through it. A symbolic link at a key's name is refused with a
+  message that names the file and the cause. `config.json`, `policy.json`,
+  `issuer-pin.json` and `approver-pin.json` are read through one
+  descriptor too, with their size limit enforced while reading.
 - **praetore-mcp: the journal and approval locks wait at most 10 s.** A
   process that kept `receipts/.journal.lock` or `approvals/.lock` left
   every call waiting with no reply. After 10 s the wait ends with an error
