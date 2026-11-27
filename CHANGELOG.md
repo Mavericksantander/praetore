@@ -27,6 +27,18 @@
 
 ### Fixed
 
+- **praetore-core: three input bounds found by the 2026-11-26 audit.** A
+  `journal --range` anchor whose `seq` sat next to `u64::MAX` overflowed
+  the chain counter (a panic with overflow checks, a wrapped entry count
+  without them); the anchor is now refused as malformed unless a full range
+  of `MAX_CHAIN_ENTRIES` fits after it, and every increment is checked. A
+  delegation document between 64 KiB and its documented 1 MiB was refused
+  as invalid, because it was parsed under the limits of a single signed
+  value; it is parsed under its own limits (`JsonLimits`) and a document
+  of 600 roots loads. Unknown fields inside a `Recover` effect were
+  accepted and ignored, so two different policy files shared one digest;
+  `PolicyEffect` now refuses them, as the rest of the policy already did.
+  Pinned by `crates/praetore-core/tests/input_bounds_hardening.rs`.
 - **praetore-mcp: a receipts journal line is read only in the byte form
   `wrap` writes.** Integrity and the chain link are computed over the
   canonical evidence, so a line written again with other spacing, another
