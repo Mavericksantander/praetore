@@ -678,6 +678,26 @@ fn receipt_line(seq: u64, prev: &ChainLink, evidence: &Evidence) -> Result<Strin
     ))
 }
 
+/// `text` (one line, without its newline) must be exactly the line
+/// [`receipt_line`] writes for `evidence` at `seq` after `prev`. Integrity,
+/// signature and link are computed over the canonical evidence, so the same
+/// JSON in another byte form would otherwise verify while a reader of the
+/// text sees other bytes. praetore-mcp's receipts journal requires the same
+/// bytes (`journal::parse_line`).
+fn require_canonical(
+    seq: u64,
+    text: &str,
+    prev: &ChainLink,
+    evidence: &Evidence,
+) -> Result<(), ChainError> {
+    let expected = receipt_line(seq, prev, evidence)?;
+    if expected.strip_suffix('\n') == Some(text) {
+        Ok(())
+    } else {
+        Err(ChainError::NotCanonical { line: seq })
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Entry<'a> {
@@ -837,6 +857,7 @@ pub fn verify_journal_range(
         line: entry.seq,
         error,
     })?;
+    require_canonical(entry.seq, anchor_line, &prev, &evidence)?;
     let mut state = ChainState::new(attesters, policy);
     state.resume(entry.seq, prev, &evidence)?;
     let anchor = state.prev;
@@ -903,6 +924,7 @@ fn verify_lines(
             (Some(evidence), None, None) => {
                 let evidence = Evidence::from_json(evidence.get())
                     .map_err(|error| ChainError::Evidence { line, error })?;
+                require_canonical(line, current, &prev, &evidence)?;
                 state.append(&evidence)?;
                 if let Some(receipts) = receipts.as_mut() {
                     receipts.push(evidence);

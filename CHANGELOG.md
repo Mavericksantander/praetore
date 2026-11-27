@@ -17,6 +17,16 @@
   every receipt line before it forwards on an approval, so the call is
   held. Lines written by praetore-mcp 0.3.4 and later are already in that
   form.
+- **praetore-verify journal: a receipt line is accepted only in the byte
+  form the exporter writes**, `{"seq":N,"prev":"<hex>","evidence":<canonical
+  evidence>}`, also for a range's anchor. As in praetore-mcp above, the same
+  JSON in another byte form (spacing, key order, a JSON escape) verified,
+  also with `--expected-head`; it now fails with `JOURNAL_CHAIN_FAIL`
+  (`not in canonical form`). Lines written by `praetore journal-export` and
+  by praetore-mcp 0.3.4 and later are already in that form; the repository's
+  journal fixtures verify unchanged. **Action:** a tool that writes its own
+  chain lines must write exactly those bytes (`Evidence::to_json` for the
+  evidence, no spaces, members in that order).
 - **praetore-mcp: the journal and approval locks wait at most 10 s.** A
   process that kept `receipts/.journal.lock` or `approvals/.lock` left
   every call waiting with no reply. After 10 s the wait ends with an error

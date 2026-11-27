@@ -141,6 +141,16 @@ impl Fixture {
     }
 }
 
+/// The bytes the exporter writes for a receipt line:
+/// `{"seq":N,"prev":"<hex>","evidence":<Evidence::to_json>}`. A line in any
+/// other byte form fails with JOURNAL_CHAIN_FAIL (not in canonical form).
+fn canonical_line(seq: u64, prev: &str, evidence: &Evidence) -> String {
+    format!(
+        "{{\"seq\":{seq},\"prev\":\"{prev}\",\"evidence\":{}}}",
+        evidence.to_json().unwrap()
+    )
+}
+
 fn join(lines: &[String]) -> String {
     lines.iter().map(|line| format!("{line}\n")).collect()
 }
@@ -258,12 +268,28 @@ fn altered_receipt_is_rejected() {
     let mut text = String::new();
     let mut prev = "0".repeat(64);
     for (seq, evidence) in forged.iter().enumerate() {
-        let evidence_json: Value = serde_json::from_str(&evidence.to_json().unwrap()).unwrap();
-        text.push_str(&json!({ "seq": seq, "prev": prev, "evidence": evidence_json }).to_string());
+        text.push_str(&canonical_line(seq as u64, &prev, evidence));
         text.push('\n');
         prev = link_for_test(seq as u64, &prev, evidence);
     }
     assert_rejected(&fx.verify(&text, None), "AUTH_FAIL");
+}
+
+/// A receipt line in another byte form (same JSON) fails for a third party
+/// too, also with the expected head.
+#[test]
+fn a_receipt_line_in_another_byte_form_fails_with_the_expected_head() {
+    let fx = Fixture::new();
+    let mut lines = fx.lines();
+    assert!(lines[1].starts_with("{\"seq\":1,"));
+    lines[1] = lines[1].replacen("{\"seq\":1,", "{\"seq\": 1,", 1);
+    let output = fx.verify(&join(&lines), Some(&fx.expected()));
+    assert_rejected(&output, "JOURNAL_CHAIN_FAIL");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("not in canonical form"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -273,8 +299,7 @@ fn duplicate_evidence_id_is_rejected_even_when_correctly_linked() {
     let mut text = String::new();
     let mut prev = "0".repeat(64);
     for (seq, evidence) in receipts.iter().enumerate() {
-        let evidence_json: Value = serde_json::from_str(&evidence.to_json().unwrap()).unwrap();
-        text.push_str(&json!({ "seq": seq, "prev": prev, "evidence": evidence_json }).to_string());
+        text.push_str(&canonical_line(seq as u64, &prev, evidence));
         text.push('\n');
         prev = link_for_test(seq as u64, &prev, evidence);
     }
@@ -853,10 +878,7 @@ fn tenant_chain_reports_its_tenant_and_refuses_a_second_one() {
         let mut text = String::new();
         let mut prev = "0".repeat(64);
         for (seq, evidence) in mixed.iter().enumerate() {
-            let evidence_json: Value = serde_json::from_str(&evidence.to_json().unwrap()).unwrap();
-            text.push_str(
-                &json!({ "seq": seq, "prev": prev, "evidence": evidence_json }).to_string(),
-            );
+            text.push_str(&canonical_line(seq as u64, &prev, evidence));
             text.push('\n');
             prev = link_for_test(seq as u64, &prev, evidence);
         }
@@ -1113,10 +1135,7 @@ fn a_range_whose_anchor_is_of_another_tenant_fails() {
     let mut text = String::new();
     let entries = std::iter::once((1u64, &anchor)).chain((2u64..).zip(&receipts));
     for (seq, evidence) in entries {
-        let evidence_json: Value = serde_json::from_str(&evidence.to_json().unwrap()).unwrap();
-        text.push_str(
-            &json!({ "seq": seq, "prev": prev.to_hex(), "evidence": evidence_json }).to_string(),
-        );
+        text.push_str(&canonical_line(seq, &prev.to_hex(), evidence));
         text.push('\n');
         prev = receipt_link(seq, &prev, evidence).unwrap();
     }
@@ -1132,10 +1151,7 @@ fn a_range_whose_anchor_is_of_another_tenant_fails() {
     let mut text = String::new();
     let entries = std::iter::once((1u64, &own)).chain((2u64..).zip(&receipts));
     for (seq, evidence) in entries {
-        let evidence_json: Value = serde_json::from_str(&evidence.to_json().unwrap()).unwrap();
-        text.push_str(
-            &json!({ "seq": seq, "prev": prev.to_hex(), "evidence": evidence_json }).to_string(),
-        );
+        text.push_str(&canonical_line(seq, &prev.to_hex(), evidence));
         text.push('\n');
         prev = receipt_link(seq, &prev, evidence).unwrap();
     }

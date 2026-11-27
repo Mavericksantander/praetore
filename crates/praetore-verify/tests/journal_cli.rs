@@ -97,9 +97,13 @@ fn link(seq: u64, prev: &str, evidence: &Evidence) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// The bytes the exporter writes for a receipt line (any other byte form
+/// fails with JOURNAL_CHAIN_FAIL).
 fn entry(seq: u64, prev: &str, evidence: &Evidence) -> String {
-    let evidence: Value = serde_json::from_str(&evidence.to_json().unwrap()).unwrap();
-    json!({ "seq": seq, "prev": prev, "evidence": evidence }).to_string()
+    format!(
+        "{{\"seq\":{seq},\"prev\":\"{prev}\",\"evidence\":{}}}",
+        evidence.to_json().unwrap()
+    )
 }
 
 fn journal(receipts: &[Evidence]) -> Vec<String> {
