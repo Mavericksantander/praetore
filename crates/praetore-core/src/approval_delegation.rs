@@ -23,7 +23,7 @@
 
 use crate::{
     AgentKeyPair, VerifiedPublicKey,
-    canonical::{canonicalize_json, parse_json_rejecting_duplicates},
+    canonical::{JsonLimits, canonicalize_json, parse_json_strict_with},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -45,6 +45,14 @@ pub const MAX_DELEGATION_ACTION_TYPES: usize = 64;
 pub const MAX_DELEGATION_DOCUMENT_BYTES: usize = 1_048_576;
 /// Most roots, delegations or revocations in one document.
 pub const MAX_DELEGATION_ENTRIES: usize = 4096;
+/// Structural limits of the delegation document: its byte cap, room for
+/// every entry (a delegation has about 12 values with its scope), and the
+/// usual nesting depth.
+const DELEGATION_DOCUMENT_LIMITS: JsonLimits = JsonLimits {
+    bytes: MAX_DELEGATION_DOCUMENT_BYTES,
+    nodes: 3 * MAX_DELEGATION_ENTRIES * 32,
+    depth: JsonLimits::DEFAULT.depth,
+};
 const MAX_KEY_ID_BYTES: usize = 256;
 const MAX_ACTION_TYPE_BYTES: usize = 128;
 
@@ -429,7 +437,13 @@ impl DelegationConfig {
         if document.len() > MAX_DELEGATION_DOCUMENT_BYTES {
             return Err(DelegationError::InvalidDocument);
         }
-        let value = parse_json_rejecting_duplicates(document)
+        // The document is a container of up to 3 * MAX_DELEGATION_ENTRIES
+        // signed records, so it is parsed under its own limits: the default
+        // 64 KiB / 16 384 nodes of a single signed value would refuse a
+        // valid document of about 90 delegations and leave every tenant of
+        // the gateway without delegated approvals (fail closed, but for a
+        // reason the operator cannot fix without splitting the document).
+        let value = parse_json_strict_with(document, &DELEGATION_DOCUMENT_LIMITS)
             .map_err(|_| DelegationError::InvalidDocument)?;
         let file: DelegationDocument =
             serde_json::from_value(value).map_err(|_| DelegationError::InvalidDocument)?;

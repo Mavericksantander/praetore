@@ -2,8 +2,43 @@
 
 ## Unreleased
 
+### Breaking
+
+- **praetore-mcp: observe refuses a call it cannot record, like enforce.**
+  When the receipts journal could not take the receipt (a blank or cut last
+  line, a whitespace-only later daily file, `receipts/` or the daily file
+  replaced by a symlink, a read-only daily file, `.journal.lock` held by
+  another process for more than 10 s, a full disk), observe forwarded the
+  `tools/call` with a stderr warning and no receipt. The journal still read
+  back intact, so `verify --expected-head` with the head kept earlier said
+  OK and nothing showed that calls had run. The same happened when a call
+  could not be evaluated after startup (clock, replay guard), and for an
+  ambiguous line whose `tools/call` reading could not be recorded. All of
+  these are now refused in observe as in enforce: the client gets an MCP
+  tool error saying that no receipt could be recorded (with the evidence id
+  when there is one) and stderr says `REFUSED (observe, ...)`. Observe
+  still never blocks because of a policy decision: a DENY or
+  REQUIRE_APPROVAL is forwarded with its receipt, as before. Unparseable client lines in
+  observe are unchanged (no receipt). **Action:** if you run observe, a home
+  that cannot record (full disk, a lock held by another process, a
+  read-only or damaged journal) now stops tool calls instead of letting
+  them run unrecorded; the client shows the error. Fix the journal (the
+  troubleshooting table in the GUIDE lists each message) to resume.
+
 ### Fixed
 
+- **praetore-core: three input bounds found by the 2026-11-26 audit.** A
+  `journal --range` anchor whose `seq` sat next to `u64::MAX` overflowed
+  the chain counter (a panic with overflow checks, a wrapped entry count
+  without them); the anchor is now refused as malformed unless a full range
+  of `MAX_CHAIN_ENTRIES` fits after it, and every increment is checked. A
+  delegation document between 64 KiB and its documented 1 MiB was refused
+  as invalid, because it was parsed under the limits of a single signed
+  value; it is parsed under its own limits (`JsonLimits`) and a document
+  of 600 roots loads. Unknown fields inside a `Recover` effect were
+  accepted and ignored, so two different policy files shared one digest;
+  `PolicyEffect` now refuses them, as the rest of the policy already did.
+  Pinned by `crates/praetore-core/tests/input_bounds_hardening.rs`.
 - **praetore-verify: `--require-anchored` is accepted by `outcomes` and
   `safety-journal`, and on a range it needs `--expected-anchor` too.**
   Both commands verified without `--expected-head` and printed OK with
@@ -37,8 +72,8 @@
 - **praetore-mcp: the journal and approval locks wait at most 10 s.** A
   process that kept `receipts/.journal.lock` or `approvals/.lock` left
   every call waiting with no reply. After 10 s the wait ends with an error
-  naming the lock: the receipt is not written, so enforce refuses the call
-  and observe warns.
+  naming the lock: the receipt is not written, so the call is refused
+  (in both modes, see Breaking).
 - **praetore-mcp: the `-32700` for a refused line carries its `id`** when
   the line has one complete top-level `id`. Otherwise the `id` is `null`,
   as before.

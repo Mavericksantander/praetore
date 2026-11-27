@@ -16,6 +16,7 @@ use crate::{
     proxy::{handle_client_line, oversized_line_response},
     report::{self, SessionLog, SessionMeta},
     store::Home,
+    unparsed::UnparsedLine,
 };
 use serde_json::Value;
 use std::{
@@ -53,6 +54,15 @@ impl Evaluator for GateOrError {
             ))),
         }
     }
+
+    fn record_unparsed(&mut self, server: &str, line: &UnparsedLine) -> Result<Verdict, GateError> {
+        match &mut self.0 {
+            Ok(gate) => gate.record_unparsed(server, line),
+            Err(error) => Err(GateError::Failed(format!(
+                "praetore-mcp is not ready: {error}"
+            ))),
+        }
+    }
 }
 
 /// Records which receipts this session journaled, for the session report.
@@ -65,6 +75,14 @@ struct Recording<E> {
 impl<E: Evaluator> Evaluator for Recording<E> {
     fn evaluate(&mut self, server: &str, params: &Value) -> Result<Verdict, GateError> {
         let verdict = self.inner.evaluate(server, params)?;
+        if verdict.journaled.is_ok() {
+            self.log.record(&verdict.evidence_id);
+        }
+        Ok(verdict)
+    }
+
+    fn record_unparsed(&mut self, server: &str, line: &UnparsedLine) -> Result<Verdict, GateError> {
+        let verdict = self.inner.record_unparsed(server, line)?;
         if verdict.journaled.is_ok() {
             self.log.record(&verdict.evidence_id);
         }

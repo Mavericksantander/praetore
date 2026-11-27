@@ -1,0 +1,14 @@
+diff --git a/crates/praetore-mcp/src/proxy.rs b/crates/praetore-mcp/src/proxy.rs
+index 3ae1c2b..03aa4c1 100644
+--- a/crates/praetore-mcp/src/proxy.rs
++++ b/crates/praetore-mcp/src/proxy.rs
+@@ -394,6 +394,9 @@ fn decide(
+         // It is refused in both modes: observe records decisions, and a call
+         // forwarded without one would run with nothing to record.
+         Err(error) => {
++            if matches!(mode, Mode::Observe) {
++                return CallDecision::Forward; // MUTANT M2
++            }
+             warnings.push(format!(
+                 "praetore-mcp: ERROR evaluating {server_shown}/{tool}: {error}; call REFUSED ({}, fail closed: no receipt could be recorded)",
+                 mode.as_str()
