@@ -88,6 +88,10 @@ trigger), signed with the evidence attester key that the binary passes in
 - **Unanchored head (T-016).** Without `--expected-head` the verifier reports
   the `head_not_anchored` warning (stderr and `details.warnings`);
   `--require-anchored` turns it into a failure (`JOURNAL_NOT_ANCHORED`).
+  `praetore-verify outcomes` takes the same flag with the same code. On a
+  range, `--require-anchored` also needs `--expected-anchor`
+  (`JOURNAL_RANGE_NOT_ANCHORED` otherwise), and `range_start` is reported
+  only when the anchor was checked.
 - **Attester key rotation.** Records and receipts keep the signature of the
   key that was current when they were written; nothing is re-signed (the
   table is append-only). `praetore journal-export` and `praetore-verify

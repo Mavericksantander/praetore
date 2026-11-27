@@ -1574,6 +1574,9 @@ fn an_execution_or_approver_pin_that_verified_nothing_is_left_out_and_counted() 
     let approver = setup.key_pin("approver.json", &approver_pin());
     let spare = setup.key_pin("spare.json", &key_pin([0x66; 32], "spare"));
     let third = setup.key_pin("third.json", &key_pin([0x67; 32], "third"));
+    // A human pin is never a gateway key (OUTCOME_PIN_SAME_KEY), so the
+    // unused approver is a key of its own, not `spare` again.
+    let fourth = setup.key_pin("fourth.json", &key_pin([0x68; 32], "fourth"));
     let (receipts, outcomes) = held_set();
     let pack = |execution: Vec<PathBuf>, approvers: Vec<PathBuf>, outcomes: Vec<Outcome>| {
         unpack(
@@ -1624,8 +1627,8 @@ fn an_execution_or_approver_pin_that_verified_nothing_is_left_out_and_counted() 
     // The second execution pin and the first and third approver pins signed
     // nothing: only the ones that did go in, numbered from one.
     let files = pack(
-        vec![execution, spare.clone()],
-        vec![spare, approver, third],
+        vec![execution, spare],
+        vec![fourth, approver, third],
         outcomes,
     );
     assert_eq!(
