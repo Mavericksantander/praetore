@@ -517,11 +517,31 @@ cp examples/claude-code-hook/agents/*.md <proyecto>/.claude/agents/   # opcional
 Después, registrar el hook en `<proyecto>/.claude/settings.local.json`:
 
 ```json
-{ "hooks": { "PreToolUse": [ { "matcher": "*", "hooks": [
+{ "disableAllHooks": false,
+  "hooks": { "PreToolUse": [ { "matcher": "*", "hooks": [
   { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/praetore-hook.sh",
     "timeout": 30, "onFailure": "block" }
 ] } ] } }
 ```
+
+`"disableAllHooks": false` es parte del registro, no un adorno. Claude Code
+lee ese valor después de aplicar la precedencia de settings (managed, luego
+`--settings`, luego `settings.local.json`, luego `settings.json` del
+proyecto, luego el de usuario), y un `true` en cualquier nivel apaga todos
+los hooks de los niveles inferiores sin dejar rastro en los recibos: el hook
+no corre, así que no hay recibo que falte. Un repositorio puede traer por
+`git clone` o `git pull` un `.claude/settings.json` con
+`"disableAllHooks": true`; en una sesión `-p` o del SDK Claude Code trata la
+carpeta como confiable y lo aplica sin preguntar. Con el `false` explícito en
+`settings.local.json`, que gana al `settings.json` compartido, ese archivo
+no apaga el hook (comprobado el 2026-11-26 con Claude Code 2.1.332: con el
+`false` el hook corre; sin él, no). Lo que sigue pudiendo apagarlo está por
+encima de `settings.local.json`: `claude --settings '{"disableAllHooks":
+true}'`, `--safe-mode`, `--restricted`, y los managed settings (archivo,
+plist, registro HKLM o HKCU en Windows, o `~/.claude/remote-settings.json`
+del servidor). Solo un hook declarado en managed settings, o
+`allowManagedHooksOnly`, queda fuera del alcance del usuario que lanza
+`claude`. Si ese es el riesgo, registrar el hook en managed settings.
 
 Luego reiniciar Claude Code. `"onFailure": "block"` (Claude Code 2.1.295 o
 posterior) es necesario: según la documentación de hooks, un hook que no
