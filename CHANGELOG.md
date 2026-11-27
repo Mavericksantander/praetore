@@ -39,8 +39,11 @@
   or without the heads. A daily file that exists but does not open for
   append right now (read-only) is a `WARNING journal:` line after the
   summary, not a failure, since permissions can change before the next
-  call. The dashboard shows the same failure. Pinned by
-  `crates/praetore-mcp/tests/journal_appendable.rs`.
+  call. `verify` sees either state only while the journal stays in it:
+  once the journal is repaired, `verify` with the heads kept earlier says
+  OK again. This check alone does not stop calls from running without a
+  receipt; observe refusing them does. The dashboard shows the same
+  failure. Pinned by `crates/praetore-mcp/tests/journal_appendable.rs`.
 - **praetore-mcp: the journal and approval locks wait at most 10 s.** A
   process that kept `receipts/.journal.lock` or `approvals/.lock` left
   every call waiting with no reply. After 10 s the wait ends with an error
