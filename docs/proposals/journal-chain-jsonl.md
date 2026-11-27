@@ -154,6 +154,14 @@ Cualquier fallo termina con exit distinto de 0, un código en stdout
 `POLICY_MISMATCH`, `INVALID_REQUEST`, `INPUT_TOO_LARGE`) y un mensaje en
 stderr que indica la entrada. El comportamiento es fail-closed.
 
+Sin `--expected-head` la verificación termina con exit 0 aunque la cadena
+esté cortada al final o reenlazada: solo se imprime el aviso
+`head_not_anchored`. Con `--require-anchored` (opcional, no es el default) ese
+caso falla con `JOURNAL_NOT_ANCHORED` (exit 1). `praetore-mcp verify` informa
+el mismo estado como `UNANCHORED`, con exit 3, que no es un éxito. Un script
+que solo mira el exit code debe pasar `--expected-head` o
+`--require-anchored`.
+
 ## Límites
 
 - 8 MiB por archivo.
