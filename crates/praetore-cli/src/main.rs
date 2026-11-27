@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     env, fs,
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration as StdDuration,
@@ -61,6 +61,12 @@ const AGENT_TOKEN_FILE: &str = "agent-api.token";
 /// Bearer token the human approver (`approve`/`reject`/`dispatch`) presents.
 const APPROVER_TOKEN_FILE: &str = "approver-api.token";
 const MAX_POLICY_BYTES: u64 = 1_048_576;
+/// A key or token file of the demo directory: 64 hex characters and a
+/// newline, with room for a trailing newline or two.
+const MAX_SECRET_FILE_BYTES: u64 = 128;
+const MAX_CONFIG_BYTES: u64 = 4096;
+const MAX_ISSUER_PIN_BYTES: u64 = 8192;
+const MAX_APPROVER_PIN_BYTES: u64 = 4096;
 const AUDIENCE: &str = "praetore-local-demo";
 const REQUIRED_DATABASE_TABLES: [&str; 6] = [
     "praetore.replay_claims",
@@ -651,64 +657,59 @@ fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
-fn load_config(directory: &Path) -> Result<LocalConfig, Box<dyn std::error::Error>> {
-    let path = directory.join(CONFIG_FILE);
-    let metadata = fs::metadata(&path)?;
-    if !metadata.is_file() || metadata.len() > 4096 {
-        return Err("config.json must be a regular file no larger than 4096 bytes".into());
+/// Reads a non-secret file of the demo directory (configuration, policy, a
+/// pin) through one open descriptor: a regular file of at most `max` bytes,
+/// checked on that descriptor and again while reading, so the entry cannot
+/// be swapped for a larger file between the check and the read.
+fn read_bounded_file(
+    path: &Path,
+    max: u64,
+    what: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let too_large = || format!("{what} must be a regular file no larger than {max} bytes");
+    let file = fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > max {
+        return Err(too_large().into());
     }
-    let config: LocalConfig = serde_json::from_slice(&fs::read(path)?)?;
+    let mut contents = Vec::with_capacity(metadata.len() as usize + 1);
+    file.take(max + 1).read_to_end(&mut contents)?;
+    if contents.len() as u64 > max {
+        return Err(too_large().into());
+    }
+    Ok(contents)
+}
+
+fn load_config(directory: &Path) -> Result<LocalConfig, Box<dyn std::error::Error>> {
+    let contents = read_bounded_file(&directory.join(CONFIG_FILE), MAX_CONFIG_BYTES, CONFIG_FILE)?;
+    let config: LocalConfig = serde_json::from_slice(&contents)?;
     if config.schema_version != 1 || config.tenant_id.is_nil() || config.port == 0 {
         return Err("unsupported or invalid local configuration".into());
     }
     Ok(config)
 }
 
+/// Reads a 32-byte key or token file of the demo directory
+/// (`secret_file::read_private_file`): opened once without following a
+/// symbolic link, checked on that descriptor to be a regular file owned by
+/// the current user with no group or other permission bits and at most
+/// [`MAX_SECRET_FILE_BYTES`], and read through it. The error names the file
+/// and the cause, never the contents.
 fn read_secret(directory: &Path, filename: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
     let path = directory.join(filename);
-    let metadata = fs::metadata(&path)?;
-    if !metadata.is_file() || metadata.len() > 128 {
-        return Err(format!("{filename} must be a regular file no larger than 128 bytes").into());
-    }
-    check_private_permissions(&path, &metadata)?;
-    let encoded = fs::read_to_string(path)?;
+    let encoded = secret_file::read_private_file(&path, MAX_SECRET_FILE_BYTES)
+        .map_err(|error| format!("secret file {filename} {error}"))?;
+    let encoded =
+        std::str::from_utf8(&encoded).map_err(|_| format!("{filename} is not UTF-8 text"))?;
     let bytes = hex::decode(encoded.trim())?;
     bytes
         .try_into()
         .map_err(|_| format!("{filename} must contain exactly 32 key bytes").into())
 }
 
-#[cfg(unix)]
-fn check_private_permissions(
-    path: &Path,
-    metadata: &fs::Metadata,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use std::os::unix::fs::PermissionsExt;
-    if metadata.permissions().mode() & 0o077 != 0 {
-        return Err(format!(
-            "secret file {} is accessible by group/others; set permissions to 600",
-            path.display()
-        )
-        .into());
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn check_private_permissions(
-    _path: &Path,
-    _metadata: &fs::Metadata,
-) -> Result<(), Box<dyn std::error::Error>> {
-    Err("secret file permissions cannot be verified on this platform".into())
-}
-
 fn load_policy(directory: &Path) -> Result<Policy, Box<dyn std::error::Error>> {
-    let path = directory.join(POLICY_FILE);
-    let metadata = fs::metadata(&path)?;
-    if !metadata.is_file() || metadata.len() > MAX_POLICY_BYTES {
-        return Err("policy.json must be a regular file no larger than 1 MiB".into());
-    }
-    let policy = Policy::from_json(&fs::read_to_string(path)?)?;
+    let contents = read_bounded_file(&directory.join(POLICY_FILE), MAX_POLICY_BYTES, POLICY_FILE)?;
+    let policy = Policy::from_json(std::str::from_utf8(&contents)?)?;
     if policy.semantics_version != 2 {
         return Err("the local gateway requires policy semantics version 2".into());
     }
@@ -716,13 +717,13 @@ fn load_policy(directory: &Path) -> Result<Policy, Box<dyn std::error::Error>> {
 }
 
 fn load_issuer_pin(directory: &Path) -> Result<TrustedAuthorityIssuer, Box<dyn std::error::Error>> {
-    let path = directory.join(ISSUER_PIN_FILE);
-    let metadata = fs::metadata(&path)?;
-    if !metadata.is_file() || metadata.len() > 8192 {
-        return Err("issuer-pin.json must be a regular file no larger than 8192 bytes".into());
-    }
-    Ok(TrustedAuthorityIssuer::from_pin_json(&fs::read_to_string(
-        path,
+    let contents = read_bounded_file(
+        &directory.join(ISSUER_PIN_FILE),
+        MAX_ISSUER_PIN_BYTES,
+        ISSUER_PIN_FILE,
+    )?;
+    Ok(TrustedAuthorityIssuer::from_pin_json(std::str::from_utf8(
+        &contents,
     )?)?)
 }
 
@@ -1564,18 +1565,20 @@ fn valid_approver_id(value: &str) -> bool {
 
 fn load_approver_pin(directory: &Path) -> Result<Option<ApproverPin>, Box<dyn std::error::Error>> {
     let path = directory.join(APPROVER_PIN_FILE);
+    // Absent means "no approver"; a symbolic link at the name is not a pin.
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    if !metadata.is_file() || metadata.len() > 4096 {
+    if !metadata.is_file() {
         return Err(format!(
-            "{APPROVER_PIN_FILE} must be a regular file no larger than 4096 bytes"
+            "{APPROVER_PIN_FILE} must be a regular file no larger than {MAX_APPROVER_PIN_BYTES} bytes"
         )
         .into());
     }
-    let pin: ApproverPin = serde_json::from_str(&fs::read_to_string(path)?)?;
+    let contents = read_bounded_file(&path, MAX_APPROVER_PIN_BYTES, APPROVER_PIN_FILE)?;
+    let pin: ApproverPin = serde_json::from_slice(&contents)?;
     if pin.schema_version != 1 || !valid_approver_id(&pin.key_id) {
         return Err(
             format!("{APPROVER_PIN_FILE} has an unsupported schema or invalid key_id").into(),
@@ -5823,7 +5826,84 @@ mod tests {
         let path = directory.join(ISSUER_KEY_FILE);
         fs::write(&path, hex::encode([1u8; 32])).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(read_secret(&directory, ISSUER_KEY_FILE).is_err());
+        let error = read_secret(&directory, ISSUER_KEY_FILE)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(ISSUER_KEY_FILE), "{error}");
+        assert!(error.contains("0600"), "{error}");
+        // The contents never appear in the message.
+        assert!(!error.contains(&hex::encode([1u8; 32])), "{error}");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A symbolic link at a key's name is refused even when its target is a
+    /// valid owner-only key: the file is opened with `O_NOFOLLOW` and checked
+    /// on that descriptor. A file owned by another user cannot be created in
+    /// a test without root; `secret_file::tests::refuses_a_file_owned_by_another_user`
+    /// covers that check by passing a foreign uid to the same reader.
+    #[test]
+    fn secret_files_behind_a_symbolic_link_are_rejected() {
+        let directory = env::temp_dir().join(format!("praetore-cli-test-{}", Uuid::new_v4()));
+        initialize(&directory, 8080).unwrap();
+        let target = directory.join("elsewhere.key");
+        fs::rename(directory.join(EVIDENCE_KEY_FILE), &target).unwrap();
+        symlink(&target, directory.join(EVIDENCE_KEY_FILE)).unwrap();
+        // The target itself is a readable owner-only key, so a check that
+        // followed the link would accept it.
+        assert_eq!(
+            fs::metadata(directory.join(EVIDENCE_KEY_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(read_secret(&directory, "elsewhere.key").unwrap().len(), 32);
+
+        let error = read_secret(&directory, EVIDENCE_KEY_FILE)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(EVIDENCE_KEY_FILE), "{error}");
+        assert!(error.contains("symbolic link"), "{error}");
+        let error = export_attester_pin(&directory).unwrap_err().to_string();
+        assert!(error.contains("symbolic link"), "{error}");
+
+        // The API token files are read by the same function.
+        let token_target = directory.join("elsewhere.token");
+        fs::rename(directory.join(AGENT_TOKEN_FILE), &token_target).unwrap();
+        symlink(&token_target, directory.join(AGENT_TOKEN_FILE)).unwrap();
+        let error = read_api_token(&directory, AGENT_TOKEN_FILE)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(AGENT_TOKEN_FILE), "{error}");
+        assert!(error.contains("symbolic link"), "{error}");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The non-secret files are read through one descriptor with their size
+    /// limit enforced while reading, so a file that grows after the check
+    /// is still refused.
+    #[test]
+    fn demo_directory_files_are_read_within_their_size_limits() {
+        let directory = env::temp_dir().join(format!("praetore-cli-test-{}", Uuid::new_v4()));
+        initialize(&directory, 8080).unwrap();
+        assert!(load_config(&directory).is_ok());
+        assert!(load_policy(&directory).is_ok());
+        assert!(load_issuer_pin(&directory).is_ok());
+        assert!(load_approver_pin(&directory).unwrap().is_some());
+
+        let config = directory.join(CONFIG_FILE);
+        let mut padded = fs::read(&config).unwrap();
+        padded.extend(vec![b' '; MAX_CONFIG_BYTES as usize]);
+        fs::write(&config, &padded).unwrap();
+        let error = load_config(&directory).unwrap_err().to_string();
+        assert!(error.contains(CONFIG_FILE), "{error}");
+        assert!(error.contains(&MAX_CONFIG_BYTES.to_string()), "{error}");
+
+        let error = read_bounded_file(&directory, 16, "a directory")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("regular file"), "{error}");
         fs::remove_dir_all(directory).unwrap();
     }
 }

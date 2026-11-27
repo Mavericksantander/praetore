@@ -16,9 +16,9 @@
 //! already refuses it. Other platforms are not checked for ACLs.
 //!
 //! The safety namespace key uses it, and so do the gateway service's
-//! attester key files (`praetore-gateway-demo` includes this file by path).
-//! `read_secret` in `main.rs` (the local demo keys) still checks by path;
-//! moving it here is a follow-up.
+//! attester key files (`praetore-gateway-demo` includes this file by path)
+//! and `read_secret` in `main.rs` (the keys and API token files of a
+//! `praetore init` directory).
 
 use std::{fmt, io::Read, path::Path};
 

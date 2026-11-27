@@ -102,7 +102,11 @@ The key id in each signed attestation names the public key it claims, so a
 pin taken from there shows consistency with that key, not that it is this
 gateway's. For `praetore run`, `praetore init` writes `execution-pin.json`
 (key id `local-demo-<public key hex>`); `praetore execution-pin <directory>`
-writes it for a directory initialized before.
+writes it for a directory initialized before. The key files of that
+directory (`issuer.key`, `evidence-attester.key`, `execution-attester.key`,
+`approver.key`) and its API token files are read the same way as the
+service's: opened without following a symbolic link, a regular file owned by
+the current user with no group or other permission bits, at most 128 bytes.
 Generate each key with a CSPRNG, for example
 `umask 077 && openssl rand -hex 32 > evidence-attester.key`, and deliver the
 files through the secret manager of the gateway workload.
