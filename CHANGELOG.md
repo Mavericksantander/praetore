@@ -4,6 +4,17 @@
 
 ### Fixed
 
+- **claude-code-hook: the registration snippet pins `"disableAllHooks":
+  false`.** A `.claude/settings.json` that arrives with a `git clone` or
+  `git pull` and sets `"disableAllHooks": true` disabled the hook
+  registered in `settings.local.json`, with nothing in the receipts: the
+  hook never ran. Claude Code reads the value left after settings
+  precedence, and `settings.local.json` wins over the shared project file,
+  so the explicit `false` in the registration keeps the hook on (checked
+  with Claude Code 2.1.332). `--settings`, `--safe-mode`, `--restricted`
+  and managed settings sit above it and can still turn hooks off; the
+  README says so. A test reads the README snippet and fails if the key is
+  removed.
 - **praetore-mcp: a receipts journal line is read only in the byte form
   `wrap` writes.** Integrity and the chain link are computed over the
   canonical evidence, so a line written again with other spacing, another
