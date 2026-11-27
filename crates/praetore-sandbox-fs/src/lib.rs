@@ -59,14 +59,42 @@
 //!   again on the opened descriptor; `O_NONBLOCK` keeps a FIFO swapped in
 //!   between those two steps from blocking the caller).
 //!
+//! # Directories between the root and the target
+//!
+//! A process that can rename a directory inside the root *and* write to a
+//! directory outside it on the same filesystem can move a directory that
+//! this crate has already opened out of the root while one operation is in
+//! flight; the effect then lands in the moved directory (the temporary file
+//! of [`Root::write_file`] is visible to `readdir`, which gives such a
+//! process an exact signal). Two measures bound this:
+//!
+//! - **Directory check** ([`Root::with_directory_check`]). The caller
+//!   supplies the ownership and mode rule it already applies to the root;
+//!   this crate applies it to every directory between the root and the
+//!   target's parent, both included. In the portable walk each component is
+//!   `fstat`ed as it is opened; after `openat2` the parent is walked back up
+//!   with `openat(fd, "..", O_DIRECTORY | O_NOFOLLOW)` exactly as many steps
+//!   as the path has directories, checking each one, and the walk must end
+//!   at the root's `(st_dev, st_ino)` ([`ConfineError::NotBeneathRoot`]
+//!   otherwise). A directory that fails the rule is
+//!   [`ConfineError::InsecureDirectory`]. With a rule such as "owned by this
+//!   user and not group/other-writable", no other local user can rename
+//!   anything on the way to the target.
+//! - **Confirmation after the effect.** Once the `renameat` or `unlinkat`
+//!   has happened, the path is resolved again from the root and the parent
+//!   reached must be the directory the effect used (same `st_dev`/`st_ino`)
+//!   and hold the expected entry. A write or delete whose directory was
+//!   moved out of the root meanwhile is reported with
+//!   [`Unconfirmed::ParentNotAtPath`], never as confirmed. The effect is not
+//!   undone; the result says so.
+//!
 //! Not prevented (documented residual risks):
 //!
-//! - **Rename out of the root.** A process that can rename directories
-//!   inside the root *and* has write access to a directory outside it on the
-//!   same filesystem can move a directory that this crate has already opened
-//!   out of the root while one operation is in flight; the effect then lands
-//!   in the moved directory. Descriptors cannot detect this without a
-//!   further (racy) check.
+//! - **Rename out of the root by a process the directory check admits.**
+//!   The directory check is the caller's rule; a process it does not
+//!   exclude (the same user, or root) can still move an opened directory
+//!   out between the check and the effect. The result is then
+//!   unconfirmed, as above.
 //! - **Hard links created later.** A hard link to a file inside the root
 //!   created *after* the `fstat` check, by a process with write access
 //!   outside the root, makes later writes to that inode visible outside.
@@ -79,9 +107,9 @@
 //!   [`Root::write_file`] is visible to `readdir`. A process with write
 //!   access to the root can replace it with a symlink before `renameat`; the
 //!   target then becomes that symlink (the rename moves the link, it never
-//!   follows it) and the call returns `Written { confirmed: false }`. No
-//!   file outside the root is written; that process could have created the
-//!   same symlink directly.
+//!   follows it) and the call returns a [`Written`] with
+//!   [`Unconfirmed::EntryMismatch`]. No file outside the root is written;
+//!   that process could have created the same symlink directly.
 //! - **Quotas, permissions and contents.** No limit on file count or size,
 //!   no check of what is written.
 
@@ -95,8 +123,15 @@ use std::io::{self, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use thiserror::Error;
+
+/// The caller's rule for every directory between the root and the target's
+/// parent (both included): `true` admits the directory. It receives the
+/// directory's descriptor (for checks the `Stat` does not show, such as
+/// extended ACL entries) and its `fstat`. See [`Root::with_directory_check`].
+pub type DirectoryCheck = Arc<dyn Fn(BorrowedFd<'_>, &Stat) -> bool + Send + Sync>;
 
 /// Longest accepted path component, in bytes.
 pub const MAX_COMPONENT_BYTES: usize = 255;
@@ -240,6 +275,15 @@ pub enum ConfineError {
     AlreadyExists,
     #[error("the final component does not exist")]
     NotFound,
+    /// A directory between the root and the target's parent fails the
+    /// caller's [`DirectoryCheck`].
+    #[error("a directory on the path fails the directory check")]
+    InsecureDirectory,
+    /// Walking up from the parent directory with `..` did not reach the
+    /// root in as many steps as the path has directories: the parent is not
+    /// (or no longer) beneath the root.
+    #[error("the parent directory is not beneath the root")]
+    NotBeneathRoot,
     #[error("openat2 is not available")]
     Openat2Unavailable,
     /// `openat2` returned `EPERM` (seccomp or an LSM). Permanent: retrying
@@ -274,23 +318,65 @@ pub enum Access {
     Write,
 }
 
+/// Why an effect that did happen is not confirmed. The effect is not undone;
+/// the caller reports it as executed, never as confirmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unconfirmed {
+    /// `fsync` of the parent directory failed.
+    DirectorySyncFailed,
+    /// Resolving the path again from the root did not reach the directory
+    /// the effect used: it was moved, replaced or left the root meanwhile.
+    ParentNotAtPath,
+    /// The parent is the same directory but the entry is not what the
+    /// effect left there (a write: another inode or size; a delete: an
+    /// entry is present).
+    EntryMismatch,
+}
+
+impl Unconfirmed {
+    /// Stable code for results and receipts.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectorySyncFailed => "directory_sync_failed",
+            Self::ParentNotAtPath => "parent_not_at_path",
+            Self::EntryMismatch => "entry_mismatch",
+        }
+    }
+}
+
 /// Result of [`Root::write_file`]. Returned only once the target entry was
 /// replaced; any `Err` means the target directory entry was not changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Written {
     pub bytes: usize,
-    /// The directory was `fsync`ed and the entry now names the new inode.
-    pub confirmed: bool,
+    /// `None`: the directory was `fsync`ed and, resolved again from the
+    /// root, the path names this directory and the entry names the new
+    /// inode.
+    pub unconfirmed: Option<Unconfirmed>,
 }
 
-/// Result of [`Root::remove_file`] and [`Dir::unlink_file`]. Returned only
-/// once the entry was unlinked. An `Err` before the `unlinkat` call (a path
-/// or entry check) means nothing was removed; an `Err` from the call itself
-/// does not prove that.
+impl Written {
+    pub fn confirmed(&self) -> bool {
+        self.unconfirmed.is_none()
+    }
+}
+
+/// Result of [`Root::remove_file`], [`Root::unlink_in`] and
+/// [`Dir::unlink_file`]. Returned only once the entry was unlinked. An `Err`
+/// before the `unlinkat` call (a path or entry check) means nothing was
+/// removed; an `Err` from the call itself does not prove that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Removed {
-    /// The directory was `fsync`ed and the entry is gone.
-    pub confirmed: bool,
+    /// `None`: the directory was `fsync`ed and the entry is gone (through
+    /// [`Root`], also: resolved again from the root, the path names this
+    /// directory).
+    pub unconfirmed: Option<Unconfirmed>,
+}
+
+impl Removed {
+    pub fn confirmed(&self) -> bool {
+        self.unconfirmed.is_none()
+    }
 }
 
 /// An open directory descriptor that every effect is relative to.
@@ -298,6 +384,7 @@ pub struct Root {
     fd: OwnedFd,
     stat: Stat,
     resolver: Resolver,
+    directory_check: Option<DirectoryCheck>,
 }
 
 impl std::fmt::Debug for Root {
@@ -305,8 +392,13 @@ impl std::fmt::Debug for Root {
         f.debug_struct("Root")
             .field("fd", &self.fd)
             .field("resolver", &self.resolver)
+            .field("directory_check", &self.directory_check.is_some())
             .finish_non_exhaustive()
     }
+}
+
+fn same_inode(left: &Stat, right: &Stat) -> bool {
+    left.st_dev == right.st_dev && left.st_ino == right.st_ino
 }
 
 impl Root {
@@ -334,19 +426,84 @@ impl Root {
             fd,
             stat,
             resolver: Resolver::Auto,
+            directory_check: None,
         })
     }
 
-    /// A second handle on the same root directory with another resolver.
+    /// A second handle on the same root directory with another resolver
+    /// (same directory check).
     pub fn clone_with(&self, resolver: Resolver) -> Result<Self, ConfineError> {
         let fd = rustix::io::fcntl_dupfd_cloexec(&self.fd, 0)
             .map_err(|errno| ConfineError::RootUnavailable(errno.into()))?;
-        Ok(Self::from_fd(fd)?.with_resolver(resolver))
+        let mut root = Self::from_fd(fd)?.with_resolver(resolver);
+        root.directory_check = self.directory_check.clone();
+        Ok(root)
     }
 
     pub fn with_resolver(mut self, resolver: Resolver) -> Self {
         self.resolver = resolver;
         self
+    }
+
+    /// Applies `check` to every directory between the root and the target's
+    /// parent, both included, on every path resolution (see the crate
+    /// documentation). Without it, only the root's identity is checked.
+    pub fn with_directory_check(mut self, check: DirectoryCheck) -> Self {
+        self.directory_check = Some(check);
+        self
+    }
+
+    pub fn set_directory_check(&mut self, check: Option<DirectoryCheck>) {
+        self.directory_check = check;
+    }
+
+    pub fn has_directory_check(&self) -> bool {
+        self.directory_check.is_some()
+    }
+
+    fn check_directory(&self, fd: BorrowedFd<'_>, stat: &Stat) -> Result<(), ConfineError> {
+        match &self.directory_check {
+            Some(check) if !check(fd, stat) => Err(ConfineError::InsecureDirectory),
+            _ => Ok(()),
+        }
+    }
+
+    /// After a single `openat2` resolution: `dir` must be exactly `depth`
+    /// directories below the root. Each `..` step is checked with the
+    /// directory check and must stay on the root's device; the walk must
+    /// end at the root's inode.
+    fn verify_lineage(&self, dir: &Dir, depth: usize) -> Result<(), ConfineError> {
+        self.check_directory(dir.fd.as_fd(), &dir.stat)?;
+        let mut current = rustix::io::fcntl_dupfd_cloexec(&dir.fd, 0)
+            .map_err(|errno| ConfineError::ParentUnavailable(errno.into()))?;
+        let mut stat = dir.stat;
+        for _ in 0..depth {
+            if same_inode(&stat, &self.stat) {
+                // The root was reached too early: `dir` is not where the
+                // path says.
+                return Err(ConfineError::NotBeneathRoot);
+            }
+            let parent = rustix::fs::openat(
+                &current,
+                "..",
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(directory_error)?;
+            let parent_stat = rustix::fs::fstat(&parent)
+                .map_err(|errno| ConfineError::ParentUnavailable(errno.into()))?;
+            if parent_stat.st_dev != self.stat.st_dev {
+                return Err(ConfineError::CrossesBoundary);
+            }
+            self.check_directory(parent.as_fd(), &parent_stat)?;
+            current = parent;
+            stat = parent_stat;
+        }
+        if same_inode(&stat, &self.stat) {
+            Ok(())
+        } else {
+            Err(ConfineError::NotBeneathRoot)
+        }
     }
 
     pub fn set_resolver(&mut self, resolver: Resolver) {
@@ -368,7 +525,9 @@ impl Root {
         let dir = if directories.is_empty() {
             let fd = rustix::io::fcntl_dupfd_cloexec(&self.fd, 0)
                 .map_err(|errno| ConfineError::RootUnavailable(errno.into()))?;
-            self.dir_from(fd)?
+            let dir = self.dir_from(fd)?;
+            self.check_directory(dir.fd.as_fd(), &dir.stat)?;
+            dir
         } else {
             let prefix = &path[..path.len() - name.len() - 1];
             self.open_directories(prefix, &directories)?
@@ -423,7 +582,9 @@ impl Root {
         match result {
             Ok(fd) => {
                 state.record(Openat2Status::Available);
-                self.dir_from(fd)
+                let dir = self.dir_from(fd)?;
+                self.verify_lineage(&dir, components.len())?;
+                Ok(dir)
             }
             Err(errno) if errno == Errno::NOSYS => {
                 if state.record(Openat2Status::Unavailable) {
@@ -471,6 +632,7 @@ impl Root {
             if stat.st_dev != self.stat.st_dev {
                 return Err(ConfineError::CrossesBoundary);
             }
+            self.check_directory(next.as_fd(), &stat)?;
             current = next;
         }
         self.dir_from(current)
@@ -530,16 +692,59 @@ impl Root {
             dir.unlink_quietly(&temp);
             return Err(final_error(errno));
         }
-        let synced = rustix::fs::fsync(&dir.fd).is_ok();
-        let confirmed = synced
-            && dir.stat_entry(name).ok().flatten().is_some_and(|stat| {
-                stat.st_dev == temp_stat.st_dev
-                    && stat.st_ino == temp_stat.st_ino
-                    && stat.st_size == temp_stat.st_size
-            });
+        let unconfirmed = if rustix::fs::fsync(&dir.fd).is_err() {
+            Some(Unconfirmed::DirectorySyncFailed)
+        } else {
+            self.verify_entry(path, &dir, Some(&temp_stat)).err()
+        };
         Ok(Written {
             bytes: content.len(),
-            confirmed,
+            unconfirmed,
+        })
+    }
+
+    /// Resolves `path` again from the root (directory check included) and
+    /// confirms that its parent is `parent` (same `st_dev`/`st_ino`) and
+    /// that the entry is `expected`: the same inode and size when `Some`,
+    /// absent when `None`. This is the confirmation step of
+    /// [`Root::write_file`] and [`Root::unlink_in`].
+    pub fn verify_entry(
+        &self,
+        path: &str,
+        parent: &Dir,
+        expected: Option<&Stat>,
+    ) -> Result<(), Unconfirmed> {
+        let (resolved, name) = self
+            .open_parent(path)
+            .map_err(|_| Unconfirmed::ParentNotAtPath)?;
+        if !same_inode(&resolved.stat, &parent.stat) {
+            return Err(Unconfirmed::ParentNotAtPath);
+        }
+        let entry = resolved
+            .stat_entry(name)
+            .map_err(|_| Unconfirmed::EntryMismatch)?;
+        match (entry, expected) {
+            (None, None) => Ok(()),
+            (Some(entry), Some(expected))
+                if same_inode(&entry, expected) && entry.st_size == expected.st_size =>
+            {
+                Ok(())
+            }
+            _ => Err(Unconfirmed::EntryMismatch),
+        }
+    }
+
+    /// The `unlinkat(parent, name, 0)` of a checked delete, then the
+    /// confirmation of [`Root::verify_entry`]. `parent` and `name` come from
+    /// [`Root::open_parent`] on the same `path`, so a caller can keep its
+    /// own checks between resolving and unlinking.
+    pub fn unlink_in(&self, path: &str, parent: &Dir, name: &str) -> Result<Removed, ConfineError> {
+        let removed = parent.unlink_file(name)?;
+        if removed.unconfirmed.is_some() {
+            return Ok(removed);
+        }
+        Ok(Removed {
+            unconfirmed: self.verify_entry(path, parent, None).err(),
         })
     }
 
@@ -562,7 +767,7 @@ impl Root {
     pub fn remove_file(&self, path: &str) -> Result<Removed, ConfineError> {
         let (dir, name) = self.open_parent(path)?;
         dir.check_entry(name, false)?;
-        dir.unlink_file(name)
+        self.unlink_in(path, &dir, name)
     }
 }
 
@@ -628,10 +833,19 @@ impl Dir {
                 final_error(errno)
             }
         })?;
-        let synced = rustix::fs::fsync(&self.fd).is_ok();
-        Ok(Removed {
-            confirmed: synced && matches!(self.stat_entry(name), Ok(None)),
-        })
+        let unconfirmed = if rustix::fs::fsync(&self.fd).is_err() {
+            Some(Unconfirmed::DirectorySyncFailed)
+        } else if matches!(self.stat_entry(name), Ok(None)) {
+            None
+        } else {
+            Some(Unconfirmed::EntryMismatch)
+        };
+        Ok(Removed { unconfirmed })
+    }
+
+    /// This directory's `fstat`, taken when it was opened.
+    pub fn stat(&self) -> &Stat {
+        &self.stat
     }
 
     /// `openat(O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW)`, then `fchmod` to
@@ -925,6 +1139,81 @@ mod tests {
                 .is_transient()
         );
         assert_eq!(state.get(), Openat2Status::Unknown);
+    }
+
+    /// The `..` walk after `openat2`, exercised directly so it is tested on
+    /// every platform: it reaches the root in exactly `depth` steps from a
+    /// parent that is where the path says, and reports `NotBeneathRoot`
+    /// once that parent has been moved out of the root.
+    #[test]
+    fn lineage_walk_reaches_the_root_and_detects_a_parent_moved_out() {
+        let tree = temp_root();
+        std::fs::create_dir_all(tree.0.join("d/e")).unwrap();
+        let outside = tree.0.parent().unwrap().join(format!(
+            "praetore-sandbox-fs-unit-outside-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&outside).unwrap();
+        let root = Root::open(&tree.0).unwrap().with_resolver(Resolver::Walk);
+        let (dir, name) = root.open_parent("d/e/f").unwrap();
+        assert_eq!(name, "f");
+        root.verify_lineage(&dir, 2).unwrap();
+        // Wrong depth: the walk ends above or below the root.
+        assert!(matches!(
+            root.verify_lineage(&dir, 1),
+            Err(ConfineError::NotBeneathRoot)
+        ));
+        assert!(matches!(
+            root.verify_lineage(&dir, 3),
+            Err(ConfineError::NotBeneathRoot)
+        ));
+        // Depth 0 is the root itself.
+        let (top, _) = root.open_parent("f").unwrap();
+        root.verify_lineage(&top, 0).unwrap();
+        // Moved out: the descriptor is still open, the lineage is not.
+        std::fs::rename(tree.0.join("d/e"), outside.join("e")).unwrap();
+        assert!(matches!(
+            root.verify_lineage(&dir, 2),
+            Err(ConfineError::NotBeneathRoot)
+        ));
+        // And the confirmation step says so for a write that used it.
+        assert_eq!(
+            root.verify_entry("d/e/f", &dir, None),
+            Err(Unconfirmed::ParentNotAtPath)
+        );
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// The directory check runs on each `..` step of the lineage walk and on
+    /// the parent itself; the directory that fails it is refused as
+    /// `InsecureDirectory` even when the lineage is otherwise right.
+    #[test]
+    fn lineage_walk_applies_the_directory_check_to_every_step() {
+        let tree = temp_root();
+        std::fs::create_dir_all(tree.0.join("d/e")).unwrap();
+        std::fs::set_permissions(tree.0.join("d"), Permissions::from_mode(0o777)).unwrap();
+        let strict: DirectoryCheck = Arc::new(|_, stat: &Stat| {
+            !Mode::from_raw_mode(stat.st_mode).intersects(Mode::WGRP | Mode::WOTH)
+        });
+        let root = Root::open(&tree.0)
+            .unwrap()
+            .with_resolver(Resolver::Walk)
+            .with_directory_check(strict);
+        // The walk itself refuses `d`.
+        assert!(matches!(
+            root.open_parent("d/e/f"),
+            Err(ConfineError::InsecureDirectory)
+        ));
+        // Through a root without the check, then the lineage walk with it.
+        let lax = Root::open(&tree.0).unwrap().with_resolver(Resolver::Walk);
+        let (dir, _) = lax.open_parent("d/e/f").unwrap();
+        assert!(matches!(
+            root.verify_lineage(&dir, 2),
+            Err(ConfineError::InsecureDirectory)
+        ));
+        std::fs::set_permissions(tree.0.join("d"), Permissions::from_mode(0o755)).unwrap();
+        root.verify_lineage(&dir, 2).unwrap();
+        assert!(root.open_parent("d/e/f").is_ok());
     }
 
     #[test]
