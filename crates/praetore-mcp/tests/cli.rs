@@ -21,6 +21,7 @@ fn every_subcommand_has_help_on_stdout_with_exit_zero() {
         "wrap",
         "install",
         "uninstall",
+        "doctor",
         "receipts",
         "verify",
         "dashboard",
@@ -108,6 +109,8 @@ fn usage_errors_exit_two() {
         &["wrap"],
         &["policy", "no-such-subcommand"],
         &["receipts", "--tail", "many"],
+        &["doctor", "--client", "cursor"],
+        &["doctor", "--mode", "loud"],
     ] {
         let out = run(args);
         assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");

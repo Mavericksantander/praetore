@@ -179,7 +179,8 @@ pub struct WrapTarget {
     pub mode: crate::gate::Mode,
 }
 
-fn command_line(entry: &JsonValue) -> String {
+/// The entry as one line, `command args...`, escaped for display.
+pub fn command_line(entry: &JsonValue) -> String {
     let mut parts = vec![
         entry
             .get("command")
@@ -222,7 +223,7 @@ fn is_praetore_command(command: &str) -> bool {
 
 /// A `praetore-mcp wrap -- <command>` entry, before checking which binary
 /// and home it points at.
-fn parsed_wrap(entry: &JsonValue) -> Option<WrappedArgs> {
+pub fn parsed_wrap(entry: &JsonValue) -> Option<WrappedArgs> {
     let command = entry.get("command").and_then(JsonValue::as_str)?;
     if !is_praetore_command(command) {
         return None;
@@ -233,7 +234,7 @@ fn parsed_wrap(entry: &JsonValue) -> Option<WrappedArgs> {
 
 /// The single value of `flag` in `options`, or `None` when it is absent or
 /// repeated.
-fn flag_once<'a>(options: &'a [String], flag: &str) -> Option<&'a str> {
+pub fn flag_once<'a>(options: &'a [String], flag: &str) -> Option<&'a str> {
     let mut value = None;
     let mut index = 0;
     while index < options.len() {
@@ -250,16 +251,33 @@ fn flag_once<'a>(options: &'a [String], flag: &str) -> Option<&'a str> {
     value
 }
 
+/// The running binary as `install` writes it into `command`: its canonical
+/// path, without a Windows verbatim prefix. `doctor` compares against the
+/// same string, so a wrap counts only when it runs this very binary.
+pub fn running_exe() -> Result<String, String> {
+    let exe = std::env::current_exe()
+        .and_then(|exe| exe.canonicalize())
+        .map_err(|e| format!("cannot locate the praetore-mcp executable: {e}"))?;
+    Ok(strip_verbatim_prefix(
+        exe.to_str()
+            .ok_or("praetore-mcp executable path is not UTF-8")?,
+    ))
+}
+
+/// True when `entry` runs exactly `exe` (a [`running_exe`] string). Another
+/// file named `praetore-mcp`, a relative path or a bare name on `PATH` is
+/// not this binary.
+pub fn runs_exe(entry: &JsonValue, exe: &str) -> bool {
+    entry.get("command").and_then(JsonValue::as_str) == Some(exe)
+}
+
 /// True only when `entry` is a wrap of this install: the command string is
 /// `target.exe` (the canonical binary) and `--dir` / `--mode` equal `target`.
 pub fn is_wrapped(entry: &JsonValue, target: &WrapTarget) -> bool {
-    let Some(command) = entry.get("command").and_then(JsonValue::as_str) else {
-        return false;
-    };
     let Some(parsed) = parsed_wrap(entry) else {
         return false;
     };
-    command == target.exe
+    runs_exe(entry, &target.exe)
         && flag_once(&parsed.options, "--dir") == Some(target.dir.as_str())
         && flag_once(&parsed.options, "--mode") == Some(target.mode.as_str())
 }

@@ -266,11 +266,12 @@ one the session reports name: `praetore-mcp 0.3.6` for a release build,
 | Exit code | Meaning |
 |---|---|
 | 0 | Success, including `--help` and `--version`. |
-| 1 | The command ran and found a problem: `verify` found a failed receipt, `policy check` found an invalid policy or engine, or `install`/`uninstall` could not read, parse or write a config, or the change was not confirmed (including when stdin is not a terminal and `--yes` was omitted). |
+| 1 | The command ran and found a problem: `verify` found a failed receipt, `policy check` found an invalid policy or engine, `doctor` found a governed server whose winning Claude Code definition is not a wrap for this home and mode (or has no definition), or `install`/`uninstall` could not read, parse or write a config, or the change was not confirmed (including when stdin is not a terminal and `--yes` was omitted). |
 | 2 | Usage error, or the command could not run (the reason is on stderr). |
 | `wrap` | The MCP server's own exit code; 127 if the server cannot be started; 1 if it was killed by a signal. |
 
-These codes are checked by `crates/praetore-mcp/tests/cli.rs`.
+These codes are checked by `crates/praetore-mcp/tests/cli.rs` and, for
+`doctor`, by `crates/praetore-mcp/tests/doctor.rs`.
 
 ## Supported clients
 
@@ -353,12 +354,14 @@ approve a wrapped `.mcp.json` server, a Claude Code already running while
 
 `install` rewrites config files. It does not see how a client resolves its
 servers at run time. `verify` checks the receipts in your home, not which
-servers a client runs, so it detects none of the cases below. The limits
-are open in this version. In each of them, what runs after `install` can
-differ from what `install` reported: a server that is not wrapped, a
-server wrapped for another home or mode, or a server wrapped under a name
-that your policy gives to another one.
-The first case below is reported with exit 1; the others are not.
+servers a client runs, so it detects none of the cases below. In each of
+them, what runs after `install` can differ from what `install` reported: a
+server that is not wrapped, a server wrapped for another home or mode, or a
+server wrapped under a name that your policy gives to another one.
+The first case below is reported by `install` with exit 1. For Claude Code,
+[`doctor`](#doctor) resolves the definition that wins in a project across
+managed, local, project and user scope and exits 1 when it is not a wrap
+for your home; each bullet says what it covers.
 
 - **An entry wrapped for another binary, home or mode.** A config file
   from someone else (for example the `.mcp.json` of a cloned repository)
@@ -376,17 +379,31 @@ The first case below is reported with exit 1; the others are not.
   `.mcp.json` of any directory other than the current one, `--mcp-config`
   files, servers declared in agent files, managed MCP configuration and
   claude.ai connectors. `install` does not name them and prints no warning
-  for them.
+  for them. `doctor` reads `managed-mcp.json` (when it exists, only its
+  servers load) and the `.mcp.json` of the project given with
+  `--project`; `--mcp-config`, agent files and connectors stay outside
+  both commands.
 - **The server identity is the config key.** `install` passes the key of
   the entry as `--name`, and policy rules and receipts identify a server
   only by that name. Nothing ties the name to the command it starts. An
   entry with the name of a server your policy allows gets those rules, and
   its receipts carry that name, whatever program it runs. The only
   same-name case `install` reports is a local-scope entry over a wrapped
-  user-scope entry (see above).
+  user-scope entry (see above). `doctor` reports every same-name case
+  across scopes for one project, and a wrap whose `--name` is not the key
+  it sits under.
 - **Local scope: a warning, and exit 0.** `install` reports local-scope
   servers and overrides (see above) and still exits 0, so a script or a CI
-  step that reads only the exit code does not see them.
+  step that reads only the exit code does not see them. `doctor` exits 1
+  when a raw local-scope entry is the winner.
+- **A project `.mcp.json` that shadows a wrapped user entry.** A repository
+  that ships `.mcp.json` with a raw entry named like a wrapped user-scope
+  server runs that raw entry, with no policy and no receipt, as soon as
+  the user approves the project's servers (`enabledMcpjsonServers` or
+  `enableAllProjectMcpServers`), and `verify` passes unchanged. `install`
+  run from that directory offers to wrap the `.mcp.json` entry and says
+  nothing about the shadow. `doctor` reports the approved entry as the
+  winner with exit 1, and an entry not approved yet as a warning.
 - **`CLAUDE_CONFIG_DIR`.** `install` does not follow it. With the variable
   set it prints a warning and still reads only `~/.claude.json` and, when
   it exists, `./.mcp.json`. Where Claude Code keeps its servers when the
@@ -400,11 +417,59 @@ The first case below is reported with exit 1; the others are not.
   `install --dry-run` again after you restart it: an entry that is still
   wrapped is listed as `skipped: already wrapped by praetore-mcp`.
 
-Apart from the exit 1 of the first case, none of these is closed by a
-check in this version. To see what a client
-runs, use the client's own listing (`claude mcp list` for Claude Code) and
-compare each command with the `praetore-mcp wrap --dir <your home>` line
-you expect.
+`CLAUDE_CONFIG_DIR`, another process that rewrites the file, plugin
+servers, `--mcp-config` and connectors are not closed by a check in this
+version. To see what a client runs, use the client's own listing
+(`claude mcp list` and `claude mcp get NAME` for Claude Code) and compare
+each command with the `praetore-mcp wrap --dir <your home>` line you
+expect.
+
+### doctor
+
+```sh
+praetore-mcp doctor [--dir DIR] [--client claude-code] [--project PATH]
+                    [--claude-config FILE] [--mode observe|enforce]
+```
+
+For each server the policy of DIR governs (the distinct `target` values of
+its rules, plus every entry wrapped for DIR in any scope), `doctor`
+resolves the definition Claude Code runs in the project (default: the
+current directory) and says whether it is a `wrap` for this home, mode and
+name. Claude Code runs the whole entry from the highest scope that defines
+the name, nothing is merged: `managed-mcp.json` (`/Library/Application
+Support/ClaudeCode/` on macOS, `/etc/claude-code/` on Linux; when it
+exists only its servers load), local scope
+(`projects["<project>"].mcpServers` in `~/.claude.json`), project scope
+(`<project>/.mcp.json`, once approved: `enabledMcpjsonServers` or
+`enableAllProjectMcpServers` in
+the project's state in `~/.claude.json` or in `~/.claude/settings.json`,
+`<project>/.claude/settings.json` or `.claude/settings.local.json`;
+`disabledMcpjsonServers` rejects it), then user scope (`mcpServers` in
+`~/.claude.json`).
+
+One line per server, `OK`, `FAIL` or `WARN` first, then the scope that
+wins, its file and its command:
+
+```text
+OK   filesystem: user scope (/Users/me/.claude.json) runs /usr/local/bin/praetore-mcp wrap --dir /Users/me/.praetore/mcp --name filesystem --mode observe -- npx -y @modelcontextprotocol/server-filesystem /tmp
+WARN filesystem: project scope (/Users/me/repo/.mcp.json, not approved yet) runs npx -y @modelcontextprotocol/server-filesystem /tmp: a raw definition; it wins over the wrapped one the moment the project's servers are approved
+FAIL git: local scope (/Users/me/.claude.json) runs uvx mcp-server-git: NOT governed (raw definition from local scope)
+     fix: claude mcp remove git -s local
+summary: 2 server(s): 1 governed, 1 not governed, 0 not defined, 1 warning(s)
+```
+
+`FAIL` is a raw definition, a wrap for another home, mode or name, or a
+policy target with no definition; each one ends with the command that
+fixes it (`claude mcp remove NAME -s SCOPE` when a wrap sits below it,
+otherwise the `install` line for that file). `WARN` is a raw definition
+below the winner, a `.mcp.json` entry not approved yet (it becomes the
+winner the moment the user approves it) and `enableAllProjectMcpServers`
+in any of the files above. Exit 0 when every winner is a wrap for DIR and
+`--mode` (default observe), 1 on any `FAIL`, 2 on a usage error or a file
+that is not strict JSON. `doctor` reads files and writes nothing.
+`--claude-config FILE` names the `~/.claude.json` to read (the tests use
+it; `CLAUDE_CONFIG_DIR` is not followed). `claude-code` is the only client
+in this version.
 
 ## What a receipt is
 
