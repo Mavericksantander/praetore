@@ -467,7 +467,7 @@ pub fn read_issuer_pins(path: &Path) -> Result<Vec<TrustedAuthorityIssuer>, Stri
 }
 
 pub fn load_policy(home: &Home) -> Result<Policy, String> {
-    Policy::from_json(&read(&home.policy())?).map_err(|e| {
+    let policy = Policy::from_json(&read(&home.policy())?).map_err(|e| {
         let hint = match e {
             praetore_core::PraetoreError::PolicyFormatUnsupported { found: 1, .. } => format!(
                 " (policy format 1, written before G7: add \"format_version\": 2 and \"action_classes\": {{\"{ACTION_TYPE}\": \"Mission\"}}, or run `praetore policy classify --policy {}` to propose the table)",
@@ -476,7 +476,10 @@ pub fn load_policy(home: &Home) -> Result<Policy, String> {
             _ => String::new(),
         };
         format!("{}: invalid policy: {e}{hint}", home.policy().shown())
-    })
+    })?;
+    crate::unparsed::refuse_reserved_type(&policy)
+        .map_err(|e| format!("{}: invalid policy: {e}", home.policy().shown()))?;
+    Ok(policy)
 }
 
 pub fn load(home: &Home) -> Result<LoadedHome, String> {

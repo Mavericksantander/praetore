@@ -124,7 +124,10 @@ pub fn render_validated(policy: &Policy) -> Result<String, String> {
     let text = serde_json::to_string_pretty(policy)
         .map(|text| text + "\n")
         .map_err(|e| format!("cannot serialize policy: {e}"))?;
-    Policy::from_json(&text).map_err(|e| format!("resulting policy is invalid: {e}"))?;
+    let parsed =
+        Policy::from_json(&text).map_err(|e| format!("resulting policy is invalid: {e}"))?;
+    crate::unparsed::refuse_reserved_type(&parsed)
+        .map_err(|e| format!("resulting policy is invalid: {e}"))?;
     Ok(text)
 }
 

@@ -4,6 +4,7 @@
 use crate::journal::{JournalError, VerifiedLine};
 use crate::shown::Show;
 use crate::store::{self, ACTION_TYPE, AUDIENCE, CAPABILITY, Home, LoadedHome};
+use crate::unparsed::{UNPARSED_LINE_ACTION_TYPE, UnparsedLine};
 use praetore_core::{
     Action, AgentIdentity, AgentKeyPair, Authority, AuthorizationRequest, ClassifiedAction,
     DecisionOutcome, Evidence, FreshnessError, FreshnessLease, FreshnessProvider,
@@ -155,6 +156,10 @@ pub fn action_type_of(params: &Value) -> String {
 /// this so it can be unit-tested without keys.
 pub trait Evaluator {
     fn evaluate(&mut self, server: &str, params: &Value) -> Result<Verdict, GateError>;
+    /// Signs and journals the receipt of a client line that does not parse
+    /// ([`crate::unparsed`]). The caller decides what happens to the line
+    /// from the mode alone; the verdict only reports the receipt.
+    fn record_unparsed(&mut self, server: &str, line: &UnparsedLine) -> Result<Verdict, GateError>;
 }
 
 /// Builds the action parameters for a `tools/call`.
@@ -1178,6 +1183,38 @@ impl Gate {
         self.engine.evaluate(request).map_err(failed)
     }
 
+    /// The signed DENY receipt of an unparseable client line, not journaled.
+    /// Its action type is never classified: the engine refuses it with the
+    /// unclassified-action guard, whatever the rules say. A policy that
+    /// declares the type gets an error here, never a decision.
+    pub fn unparsed_evidence(
+        &self,
+        server: &str,
+        line: &UnparsedLine,
+    ) -> Result<Evidence, GateError> {
+        let failed =
+            |e: praetore_core::PraetoreError| GateError::Failed(format!("{}: {e}", e.code()));
+        let action = Action::new(
+            UNPARSED_LINE_ACTION_TYPE,
+            Some(server.to_owned()),
+            line.parameters(server, self.mode),
+        )
+        .map_err(failed)?
+        .with_capability(CAPABILITY);
+        let action = self.engine.policy().unclassified(action).map_err(failed)?;
+        let request = self.signed(
+            AuthorizationRequest::new_unclassified(
+                self.agent.clone(),
+                self.authority.clone(),
+                action,
+            )
+            .map_err(failed)?,
+            None,
+            None,
+        )?;
+        self.engine.refuse_unclassified(request).map_err(failed)
+    }
+
     /// Adds the proxy context and signs the v2 intent with the agent key.
     fn signed<A: praetore_core::RequestAction>(
         &self,
@@ -1236,6 +1273,12 @@ fn unclassified_action_type(server: &str, params: &Value) -> String {
 pub const UNCLASSIFIED_TOOL_ACTION_TYPE: &str = "praetore-mcp unclassified tool name";
 
 impl Evaluator for Gate {
+    fn record_unparsed(&mut self, server: &str, line: &UnparsedLine) -> Result<Verdict, GateError> {
+        let evidence = self.unparsed_evidence(server, line)?;
+        let journaled = self.journal.record(&evidence);
+        Ok(verdict_from(&evidence, journaled))
+    }
+
     fn evaluate(&mut self, server: &str, params: &Value) -> Result<Verdict, GateError> {
         let evidence = self.evaluate_evidence(server, params)?;
         if self.mode != Mode::Enforce
