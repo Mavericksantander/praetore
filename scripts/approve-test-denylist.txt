@@ -54,6 +54,9 @@ praetore-mcp | --test evasion | runnable | the_ttl_env_var_of_wrap_does_not_set_
 praetore-mcp | --test evasion | runnable | the_ttl_seconds_file_in_the_home_stretches_new_approvals
 praetore-mcp | --test evasion | runnable | the_ttl_in_config_toml_stretches_new_approvals
 
+# crates/praetore-mcp/tests/canonical_receipt_lines.rs (1)
+praetore-mcp | --test canonical_receipt_lines | runnable | a_receipt_rewritten_to_hide_its_approval_id_holds_the_retry_and_fails_verify
+
 # crates/praetore-mcp/tests/dashboard.rs (3)
 praetore-mcp | --test dashboard | runnable | verification_status_matches_verify_with_an_expected_approval_head
 praetore-mcp | --test dashboard | runnable | cached_verification_is_redone_for_each_approval_and_issuer_file
