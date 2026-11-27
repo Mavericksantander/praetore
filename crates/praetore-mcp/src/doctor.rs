@@ -347,15 +347,19 @@ pub enum Verdict {
     Raw,
 }
 
-/// The target a wrap must match to be governed: this home and mode.
+/// The target a wrap must match to be governed: this binary, home and mode.
 #[derive(Debug, Clone)]
 pub struct Expected {
+    /// [`install::running_exe`]: the binary `install` writes.
+    pub exe: String,
     pub dir: String,
     pub mode: Mode,
 }
 
-/// Classifies one entry. The binary is any `praetore-mcp`; what matters
-/// is the home, the mode and the name the receipts carry.
+/// Classifies one entry. A wrap is governed only when it runs this very
+/// binary (the string `install` writes, [`install::runs_exe`]): any other
+/// file named `praetore-mcp`, such as one a repository ships, is not.
+/// Then the home, the mode and the name the receipts carry must match.
 pub fn classify(name: &str, entry: &JsonValue, expected: &Expected) -> Verdict {
     if install::is_claude_code_remote(entry) {
         return Verdict::Raw;
@@ -363,6 +367,17 @@ pub fn classify(name: &str, entry: &JsonValue, expected: &Expected) -> Verdict {
     let Some(parsed) = install::parsed_wrap(entry) else {
         return Verdict::Raw;
     };
+    if !install::runs_exe(entry, &expected.exe) {
+        return Verdict::OtherWrap(format!(
+            "runs {}, not the running praetore-mcp {}",
+            entry
+                .get("command")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("?")
+                .shown(),
+            expected.exe.shown()
+        ));
+    }
     let dir = install::flag_once(&parsed.options, "--dir");
     if !dir.is_some_and(|d| same_dir(d, &expected.dir)) {
         return Verdict::OtherWrap(format!(
@@ -699,6 +714,7 @@ mod tests {
 
     fn expected() -> Expected {
         Expected {
+            exe: "/opt/bin/praetore-mcp".to_owned(),
             dir: HOME.to_owned(),
             mode: Mode::Observe,
         }
@@ -747,7 +763,7 @@ mod tests {
         ));
         // No --mode means observe, the default of wrap.
         let no_mode = doc(&format!(
-            r#"{{"command":"praetore-mcp","args":["wrap","--dir","{HOME}","--","srv"]}}"#
+            r#"{{"command":"/opt/bin/praetore-mcp","args":["wrap","--dir","{HOME}","--","srv"]}}"#
         ));
         assert_eq!(classify("fs", &no_mode, &expected()), Verdict::Governed);
         assert_eq!(
@@ -759,6 +775,27 @@ mod tests {
             r#"{{"type":"http","url":"https://x/mcp","command":"praetore-mcp","args":["wrap","--dir","{HOME}","--","srv"]}}"#
         ));
         assert_eq!(classify("fs", &remote, &expected()), Verdict::Raw);
+    }
+
+    #[test]
+    fn classify_needs_the_running_binary() {
+        for command in [
+            "./tools/praetore-mcp",
+            "/p/a/tools/praetore-mcp",
+            "praetore-mcp",
+            "/opt/bin/../bin/praetore-mcp",
+        ] {
+            let entry = doc(&format!(
+                r#"{{"command":"{command}","args":["wrap","--dir","{HOME}","--name","fs","--mode","observe","--","srv"]}}"#
+            ));
+            assert!(
+                matches!(
+                    classify("fs", &entry, &expected()),
+                    Verdict::OtherWrap(why) if why.contains("not the running praetore-mcp")
+                ),
+                "{command}"
+            );
+        }
     }
 
     #[test]

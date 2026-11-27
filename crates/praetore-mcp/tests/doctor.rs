@@ -11,6 +11,13 @@ use std::{
 
 const BIN: &str = env!("CARGO_BIN_EXE_praetore-mcp");
 
+/// The binary under test as `install` writes it: its canonical path, the
+/// only `command` doctor counts as this binary.
+fn bin_json() -> String {
+    let canonical = Path::new(BIN).canonicalize().unwrap();
+    serde_json::to_string(canonical.to_str().unwrap()).unwrap()
+}
+
 struct Fixture {
     _temp: tempfile::TempDir,
     /// HOME: holds `.claude.json` and `.claude/settings.json`.
@@ -67,12 +74,12 @@ impl Fixture {
         self.project.to_str().unwrap()
     }
 
-    /// A `filesystem` entry wrapped for `dir` in `mode` by a binary named
-    /// praetore-mcp (the one under test).
+    /// A `filesystem` entry wrapped for `dir` in `mode` by the binary under
+    /// test.
     fn wrapped(&self, dir: &str, mode: &str) -> String {
         format!(
             r#"{{"command":{},"args":["wrap","--dir",{},"--name","filesystem","--mode","{mode}","--","npx","-y","@modelcontextprotocol/server-filesystem","/tmp"]}}"#,
-            serde_json::to_string(BIN).unwrap(),
+            bin_json(),
             serde_json::to_string(dir).unwrap()
         )
     }
@@ -431,7 +438,7 @@ fn wrapped_entries_without_rules_are_checked_too() {
     let fx = Fixture::new();
     let git = format!(
         r#"{{"command":{},"args":["wrap","--dir",{},"--name","git-renamed","--mode","observe","--","uvx","mcp-server-git"]}}"#,
-        serde_json::to_string(BIN).unwrap(),
+        bin_json(),
         serde_json::to_string(fx.dir_str()).unwrap()
     );
     fx.write_claude_json(
@@ -451,6 +458,48 @@ fn wrapped_entries_without_rules_are_checked_too() {
     assert!(
         stdout.contains("FAIL git: user scope")
             && stdout.contains("wrapped under the name git-renamed"),
+        "{stdout}"
+    );
+}
+
+/// A repository can ship its own file named praetore-mcp. An approved
+/// `.mcp.json` entry that runs it with the right `--dir`, `--name` and
+/// `--mode` is not governed: only the running binary (what `install`
+/// writes) is.
+#[test]
+fn a_project_praetore_mcp_that_is_not_the_running_binary_fails() {
+    let fx = Fixture::new();
+    let tools = fx.project.join("tools");
+    fs::create_dir_all(&tools).unwrap();
+    let fake = tools.join("praetore-mcp");
+    fs::write(&fake, "#!/bin/sh\nexec \"$@\"\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fx.write_claude_json(
+        &project_state(&fx.project, r#"{"enabledMcpjsonServers": ["filesystem"]}"#),
+        "{}",
+    );
+    fx.write_project_mcp(&format!(
+        r#"{{"mcpServers": {{"filesystem": {{"command": "./tools/praetore-mcp", "args": ["wrap", "--dir", {}, "--name", "filesystem", "--mode", "observe", "--", "npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"]}}}}}}"#,
+        serde_json::to_string(fx.dir_str()).unwrap()
+    ));
+    let out = fx.doctor(&[]);
+    let stdout = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(!stdout.contains("OK   filesystem"), "{stdout}");
+    let fail = stdout
+        .lines()
+        .find(|line| line.starts_with("FAIL filesystem: project scope"))
+        .unwrap_or_else(|| panic!("{stdout}"));
+    assert!(
+        fail.contains("runs ./tools/praetore-mcp, not the running praetore-mcp"),
+        "{fail}"
+    );
+    assert!(
+        stdout.contains("summary: 1 server(s): 0 governed, 1 not governed"),
         "{stdout}"
     );
 }

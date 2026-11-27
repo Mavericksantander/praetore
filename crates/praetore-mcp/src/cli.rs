@@ -787,14 +787,8 @@ fn cmd_install(args: &[String], uninstall: bool) -> Result<i32, String> {
                 ));
             }
         }
-        let exe = std::env::current_exe()
-            .and_then(|exe| exe.canonicalize())
-            .map_err(|e| format!("cannot locate the praetore-mcp executable: {e}"))?;
         Some(WrapTarget {
-            exe: install::strip_verbatim_prefix(
-                exe.to_str()
-                    .ok_or("praetore-mcp executable path is not UTF-8")?,
-            ),
+            exe: install::running_exe()?,
             dir: install::strip_verbatim_prefix(
                 home.root
                     .to_str()
@@ -1050,7 +1044,11 @@ fn cmd_doctor(args: &[String]) -> Result<i32, String> {
         );
         return Ok(0);
     }
-    let expected = doctor::Expected { dir, mode };
+    let expected = doctor::Expected {
+        exe: install::running_exe()?,
+        dir,
+        mode,
+    };
     let commands = doctor::Commands {
         program: crate::commands::program(),
         dir_suffix: dir_suffix(&home),
