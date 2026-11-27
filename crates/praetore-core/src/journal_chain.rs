@@ -395,6 +395,13 @@ impl<'k> ChainState<'k> {
             .map(|(_, key)| *key)
     }
 
+    /// Moves to the next `seq`. A chain that would run past `u64::MAX`
+    /// (only reachable through a range anchor) is too large, never a wrap.
+    fn advance(&mut self) -> Result<(), ChainError> {
+        self.seq = self.seq.checked_add(1).ok_or(ChainError::TooLarge)?;
+        Ok(())
+    }
+
     fn next_line(&self) -> Result<u64, ChainError> {
         if (self.seq - self.start) as usize >= MAX_CHAIN_ENTRIES {
             return Err(ChainError::TooLarge);
@@ -429,7 +436,7 @@ impl<'k> ChainState<'k> {
         self.kind = Kind::Database;
         *self.signed_by.entry(record.key_id.clone()).or_default() += 1;
         self.prev = record_link(self.seq, &self.prev, record);
-        self.seq += 1;
+        self.advance()?;
         Ok(())
     }
 
@@ -442,7 +449,7 @@ impl<'k> ChainState<'k> {
         self.kind = Kind::Tenant;
         self.database_head = Some(*reference);
         self.prev = database_head_link(self.seq, &self.prev, reference);
-        self.seq += 1;
+        self.advance()?;
         Ok(())
     }
 
@@ -450,8 +457,13 @@ impl<'k> ChainState<'k> {
     /// of the previous range. Its signature is checked against the pins and
     /// its link is where the range continues; it is not counted.
     fn resume(&mut self, seq: u64, prev: ChainLink, evidence: &Evidence) -> Result<(), ChainError> {
+        // The range after the anchor holds at most `MAX_CHAIN_ENTRIES`
+        // entries, each one `seq` higher: an anchor so close to `u64::MAX`
+        // that the range could not be numbered is malformed, so no later
+        // increment can overflow (`advance` checks it again).
         let start = seq
             .checked_add(1)
+            .filter(|start| start.checked_add(MAX_CHAIN_ENTRIES as u64).is_some())
             .ok_or(ChainError::Malformed { line: seq })?;
         self.seq = seq;
         self.prev = prev;
@@ -520,7 +532,7 @@ impl<'k> ChainState<'k> {
         if let Some(key_id) = &evidence.attester_key_id {
             *self.signed_by.entry(key_id.clone()).or_default() += 1;
         }
-        self.seq += 1;
+        self.advance()?;
         self.kind = Kind::Tenant;
         self.receipts += 1;
         Ok(())
@@ -837,7 +849,8 @@ pub fn verify_journal_range(
     let mut report = verify_lines(rest, state, policy, expected_head, None, None)?;
     report.range = Some(JournalRange {
         anchor,
-        start: entry.seq + 1,
+        // `resume` accepted the anchor, so this cannot overflow.
+        start: entry.seq.saturating_add(1),
     });
     Ok(report)
 }

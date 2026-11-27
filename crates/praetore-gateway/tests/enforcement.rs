@@ -6377,6 +6377,18 @@ mod outcomes {
         }
     }
 
+    /// A key that signed nothing and is no gateway key (execution pin,
+    /// evidence attester), under `key_id`.
+    fn stranger_pin(key_id: &str) -> KeyPin {
+        KeyPin {
+            key_id: key_id.into(),
+            public_key: VerifiedPublicKey::from_bytes(
+                &SigningKey::from_bytes(&[35; 32]).verifying_key().to_bytes(),
+            )
+            .unwrap(),
+        }
+    }
+
     fn execution_pin() -> KeyPin {
         KeyPin {
             key_id: "test-execution-attester-v1".into(),
@@ -6502,14 +6514,27 @@ mod outcomes {
             verify(&text, &journal, &[execution_pin()], &[]),
             Err(OutcomeError::UnknownKey { line: 0 })
         ));
-        let wrong_key = KeyPin {
-            key_id: "test-human-approver-v1".into(),
-            public_key: execution_attester_public_key(),
-        };
+        let wrong_key = stranger_pin("test-human-approver-v1");
         assert!(matches!(
             verify(&text, &journal, &[execution_pin()], &[wrong_key]),
             Err(OutcomeError::InvalidSignature { line: 0 })
         ));
+        // A gateway key (the execution pin, the evidence attester) under an
+        // approver key id is refused before any record is read.
+        for gateway_key in [
+            execution_attester_public_key(),
+            evidence_attesters().remove(0),
+        ] {
+            let as_human = KeyPin {
+                key_id: "test-human-approver-v1".into(),
+                public_key: gateway_key,
+            };
+            assert_eq!(
+                verify(&text, &journal, &[execution_pin()], &[as_human]),
+                Err(OutcomeError::SharedRoleKey)
+            );
+        }
+        assert!(verify(&text, &journal, &[execution_pin()], &[approver_pin()]).is_ok());
         // A decision flipped after signing.
         let mut flipped = owned.clone();
         flipped[0] = flipped[0].replacen("\"outcome\":\"approve\"", "\"outcome\":\"reject\"", 1);
@@ -6597,10 +6622,7 @@ mod outcomes {
     fn a_pin_that_verified_nothing_is_reported() {
         let executed = approved_and_executed();
         let (text, journal) = file(&[&executed]);
-        let spare = KeyPin {
-            key_id: "spare-approver".into(),
-            public_key: execution_attester_public_key(),
-        };
+        let spare = stranger_pin("spare-approver");
         let report = verify(
             &text,
             &journal,

@@ -27,6 +27,8 @@ mod tests_g7;
 mod tests_high_assurance;
 #[cfg(test)]
 mod tests_messages;
+#[cfg(test)]
+mod tests_readme;
 #[cfg(all(test, unix))]
 mod tests_wrapper;
 

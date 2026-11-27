@@ -1838,6 +1838,7 @@ fn conditions_conflict(left: &PolicyCondition, right: &PolicyCondition) -> bool 
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub enum PolicyEffect {
     Allow,
     Deny,

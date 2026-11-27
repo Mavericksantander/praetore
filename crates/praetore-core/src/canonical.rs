@@ -73,10 +73,40 @@ pub fn parse_json_strict(input: &str) -> Result<Value, JsonError> {
     parse_json(input).map_err(|(error, _)| error)
 }
 
+/// Structural limits of one JSON document. [`JsonLimits::DEFAULT`] is what
+/// every signed or hashed value uses; a document that is only a container
+/// of many such values (the delegation document) may declare a larger one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JsonLimits {
+    /// Raw input and decoded value, in bytes.
+    pub bytes: usize,
+    /// Values in the tree.
+    pub nodes: usize,
+    /// Nesting of arrays and objects.
+    pub depth: usize,
+}
+
+impl JsonLimits {
+    pub const DEFAULT: Self = Self {
+        bytes: MAX_JSON_VALUE_BYTES,
+        nodes: MAX_JSON_NODES,
+        depth: MAX_JSON_DEPTH,
+    };
+}
+
+/// [`parse_json_strict`] under `limits` instead of the defaults.
+pub fn parse_json_strict_with(input: &str, limits: &JsonLimits) -> Result<Value, JsonError> {
+    parse_json_with(input, limits).map_err(|(error, _)| error)
+}
+
 /// Returns the typed reason together with the message the string API has
 /// always reported (serde's own text for syntax errors).
 fn parse_json(input: &str) -> Result<Value, (JsonError, String)> {
-    if input.len() > MAX_JSON_VALUE_BYTES {
+    parse_json_with(input, &JsonLimits::DEFAULT)
+}
+
+fn parse_json_with(input: &str, limits: &JsonLimits) -> Result<Value, (JsonError, String)> {
+    if input.len() > limits.bytes {
         let error = JsonError::InputTooLarge;
         return Err((error, error.to_string()));
     }
@@ -98,7 +128,7 @@ fn parse_json(input: &str) -> Result<Value, (JsonError, String)> {
     deserializer
         .end()
         .map_err(|error| syntax_error(error, &rejected))?;
-    validate_json_value(&value).map_err(|error| (error, error.to_string()))?;
+    validate_json_value_with(&value, limits).map_err(|error| (error, error.to_string()))?;
     Ok(value)
 }
 
@@ -230,16 +260,20 @@ pub fn canonicalize_json(input: &str) -> crate::Result<Vec<u8>> {
 }
 
 pub(crate) fn validate_json_value(value: &Value) -> Result<usize, JsonError> {
+    validate_json_value_with(value, &JsonLimits::DEFAULT)
+}
+
+fn validate_json_value_with(value: &Value, limits: &JsonLimits) -> Result<usize, JsonError> {
     let mut pending = vec![(value, 1usize)];
     let mut nodes = 0usize;
     let mut bytes = 0usize;
 
     while let Some((value, depth)) = pending.pop() {
         nodes += 1;
-        if nodes > MAX_JSON_NODES {
+        if nodes > limits.nodes {
             return Err(JsonError::TooManyNodes);
         }
-        if depth > MAX_JSON_DEPTH {
+        if depth > limits.depth {
             return Err(JsonError::TooDeep);
         }
 
@@ -275,7 +309,7 @@ pub(crate) fn validate_json_value(value: &Value) -> Result<usize, JsonError> {
             }
         }
 
-        if bytes > MAX_JSON_VALUE_BYTES {
+        if bytes > limits.bytes {
             return Err(JsonError::ValueTooLarge);
         }
     }

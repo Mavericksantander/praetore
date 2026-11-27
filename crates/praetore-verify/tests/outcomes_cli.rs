@@ -238,13 +238,12 @@ fn a_changed_or_missing_record_or_key_fails_the_whole_file() {
         "OUTCOME_KEY_UNKNOWN"
     );
     let approver: Value = serde_json::from_str(&dir.read("approver-pin-1.json")).unwrap();
-    let execution: Value = serde_json::from_str(&dir.read("execution-pin-1.json")).unwrap();
     dir.write(
         "other-approver.json",
         &serde_json::json!({
             "schema_version": 1,
             "key_id": approver["key_id"],
-            "public_key_hex": execution["public_key_hex"],
+            "public_key_hex": STRANGER_KEY_HEX,
         })
         .to_string(),
     );
@@ -255,6 +254,117 @@ fn a_changed_or_missing_record_or_key_fails_the_whole_file() {
     let mut bare = FULL.to_vec();
     bare[10] = "attester-pin-1.hex";
     assert_eq!(code(&bare), "TRUST_STORE_FAIL");
+}
+
+/// A 32-byte Ed25519 public key that is not any key of the fixture.
+const STRANGER_KEY_HEX: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+
+/// A gateway key (execution pin, evidence attester) pinned as a human role
+/// (approver, delegation root) is refused before any record is read: with
+/// the same key the gateway could approve its own actions.
+#[test]
+fn a_gateway_key_pinned_as_a_human_role_is_refused() {
+    let dir = Dir::new();
+    let code = |args: &[&str]| verify(&dir.0, args).1["code"].as_str().unwrap().to_owned();
+    let execution: Value = serde_json::from_str(&dir.read("execution-pin-1.json")).unwrap();
+    let human_pin = |key_id: &str, public_key_hex: &str| {
+        serde_json::json!({
+            "schema_version": 1,
+            "key_id": key_id,
+            "public_key_hex": public_key_hex,
+        })
+        .to_string()
+    };
+    // The execution key, and the attester key, as the approver.
+    dir.write(
+        "approver-execution.json",
+        &human_pin(
+            "local-approver",
+            execution["public_key_hex"].as_str().unwrap(),
+        ),
+    );
+    dir.write(
+        "approver-attester.json",
+        &human_pin("local-approver", dir.read("attester-pin-1.hex").trim()),
+    );
+    dir.write("empty.jsonl", "");
+    for approver in ["approver-execution.json", "approver-attester.json"] {
+        let mut args = FULL.to_vec();
+        args[10] = approver;
+        assert_eq!(code(&args), "OUTCOME_PIN_SAME_KEY", "{approver}");
+        // Even with no record to verify: the pins are refused first.
+        args[2] = "empty.jsonl";
+        assert_eq!(code(&args), "OUTCOME_PIN_SAME_KEY", "{approver}");
+    }
+    // The execution key as the delegation root.
+    write_delegation_files(&dir);
+    dir.write(
+        "root-pin.json",
+        &human_pin("tenant-root", execution["public_key_hex"].as_str().unwrap()),
+    );
+    assert_eq!(code(&with_delegation_flags()), "OUTCOME_PIN_SAME_KEY");
+    // Text output: the same code, exit 1.
+    let mut args = FULL[..11].to_vec();
+    args[10] = "approver-execution.json";
+    args.extend(["--format", "text"]);
+    let output = Command::new(env!("CARGO_BIN_EXE_praetore-verify"))
+        .args(&args)
+        .current_dir(&dir.0)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stdout).starts_with("ERROR outcomes OUTCOME_PIN_SAME_KEY"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+/// Without --expected-head the journal, and so the outcomes, are not
+/// anchored: --require-anchored fails with the journal command's code after
+/// everything verifies, and passes with the head.
+#[test]
+fn require_anchored_fails_without_an_expected_head_and_passes_with_it() {
+    let (ok, baseline) = verify(&fixture(), &FULL);
+    assert!(ok, "{baseline}");
+    let head = baseline["details"]["head"].as_str().unwrap().to_owned();
+    let mut args = FULL.to_vec();
+    args.push("--require-anchored");
+    let (ok, summary) = verify(&fixture(), &args);
+    assert!(!ok);
+    assert_eq!(summary["code"], "JOURNAL_NOT_ANCHORED", "{summary}");
+    // Text output: the same code, exit 1, and the reason on stderr.
+    let output = Command::new(env!("CARGO_BIN_EXE_praetore-verify"))
+        .args([&FULL[..11], &["--require-anchored", "--format", "text"]].concat())
+        .current_dir(fixture())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stdout).starts_with("ERROR outcomes JOURNAL_NOT_ANCHORED"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("head is not anchored"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // With the head: passes, no warning, the same outcomes.
+    args.extend(["--expected-head", &head]);
+    let (ok, summary) = verify(&fixture(), &args);
+    assert!(ok, "{summary}");
+    assert_eq!(summary["details"]["expected_head_verified"], true);
+    assert_eq!(summary["details"]["warnings"], serde_json::json!([]));
+    assert_eq!(summary["details"]["held"], baseline["details"]["held"]);
+    // Another head fails for the mismatch, not for the anchoring.
+    let other = "c".repeat(64);
+    let mut wrong = FULL.to_vec();
+    wrong.extend(["--require-anchored", "--expected-head", &other]);
+    assert_eq!(
+        verify(&fixture(), &wrong).1["code"],
+        "JOURNAL_HEAD_MISMATCH"
+    );
 }
 
 #[test]
@@ -296,7 +406,7 @@ fn outcomes_usage_errors() {
             "journal.jsonl",
         ],
         [&FULL[..11], &["--policy", "policy.json"]].concat(),
-        [&FULL[..11], &["--require-anchored"]].concat(),
+        [&FULL[..11], &["--require-anchored", "--require-anchored"]].concat(),
         [&FULL[..11], &["--outcomes", "approvals.jsonl"]].concat(),
         // --execution-pin belongs to outcomes and receipt only.
         vec![
@@ -328,8 +438,7 @@ fn fixture_tenant() -> String {
 /// A delegation document with one root for the fixture's tenant, its pin,
 /// and a format 2 policy, written into `dir`.
 fn write_delegation_files(dir: &Dir) {
-    // A 32-byte Ed25519 public key that is not any key of the fixture.
-    let root_hex = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+    let root_hex = STRANGER_KEY_HEX;
     dir.write(
         "delegations.json",
         &serde_json::json!({
