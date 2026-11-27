@@ -179,7 +179,8 @@ pub struct WrapTarget {
     pub mode: crate::gate::Mode,
 }
 
-fn command_line(entry: &JsonValue) -> String {
+/// The entry as one line, `command args...`, escaped for display.
+pub fn command_line(entry: &JsonValue) -> String {
     let mut parts = vec![
         entry
             .get("command")
@@ -222,7 +223,7 @@ fn is_praetore_command(command: &str) -> bool {
 
 /// A `praetore-mcp wrap -- <command>` entry, before checking which binary
 /// and home it points at.
-fn parsed_wrap(entry: &JsonValue) -> Option<WrappedArgs> {
+pub fn parsed_wrap(entry: &JsonValue) -> Option<WrappedArgs> {
     let command = entry.get("command").and_then(JsonValue::as_str)?;
     if !is_praetore_command(command) {
         return None;
@@ -233,7 +234,7 @@ fn parsed_wrap(entry: &JsonValue) -> Option<WrappedArgs> {
 
 /// The single value of `flag` in `options`, or `None` when it is absent or
 /// repeated.
-fn flag_once<'a>(options: &'a [String], flag: &str) -> Option<&'a str> {
+pub fn flag_once<'a>(options: &'a [String], flag: &str) -> Option<&'a str> {
     let mut value = None;
     let mut index = 0;
     while index < options.len() {

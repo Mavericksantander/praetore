@@ -39,6 +39,22 @@
 
 ### Added
 
+- **praetore-mcp: `doctor` checks that the definition Claude Code runs for
+  each governed server is a wrap for this home.** Claude Code keeps a
+  server name in up to four places and runs the whole entry from the
+  highest one: `managed-mcp.json`, local scope, an approved project
+  `.mcp.json`, then user scope. `install` wraps user and project scope
+  only, so a repository whose `.mcp.json` ships a raw `filesystem` shadows
+  the wrapped user-scope `filesystem` as soon as the user approves the
+  project's servers: every tools/call then runs without praetore-mcp,
+  without a receipt, and `verify` passes unchanged. `doctor [--dir DIR]
+  [--project PATH]` resolves the winner for every policy target and every
+  entry wrapped for DIR, prints `OK`, `FAIL` or `WARN` per server with the
+  scope, file and command, and on `FAIL` the `claude mcp remove NAME -s
+  SCOPE` or `install` line that fixes it. Exit 1 for a raw winner, a wrap
+  for another home, mode or name, or a target with no definition; 2 for a
+  file that is not strict JSON. The README section "Known limits of
+  `install`" now points the shadow cases to `doctor`.
 - **praetore-mcp: `install --client claude-code`** (alias `cc`). Wraps the
   stdio servers of `~/.claude.json` (user scope) and `./.mcp.json`
   (project scope): an entry with no `type` or `"type": "stdio"`, a

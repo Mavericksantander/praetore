@@ -8,6 +8,7 @@ pub mod commands;
 pub mod config;
 pub mod coverage;
 pub mod dashboard;
+pub mod doctor;
 pub mod fsutil;
 pub mod gate;
 pub mod install;
