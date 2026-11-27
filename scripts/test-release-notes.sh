@@ -19,6 +19,26 @@ cat > "$work/CHANGELOG.md" <<'MD'
 
 ## 1.1.0
 
+## 1.3.0 - <DATE-OF-THE-TAG>
+
+- placeholder date
+
+## 1.4.0 - 26-11-2026
+
+- day first
+
+## 1.5.0
+
+- no date
+
+## 1.6.0 - 2026-11-26 or later
+
+- text after the date
+
+## 1.7.0 - 2026-13-01
+
+- month 13
+
 ## 1.0.0 (not yet tagged or published)
 
 - old
@@ -48,6 +68,11 @@ check "missing section" fail v9.9.9
 check "tag without v" fail 1.2.0
 check "not a semver tag" fail v1.2
 check "Unreleased is never released" fail vUnreleased
+check "placeholder date" fail v1.3.0
+check "date not YYYY-MM-DD" fail v1.4.0
+check "heading without a date" fail v1.5.0
+check "text after the date" fail v1.6.0
+check "month out of range" fail v1.7.0
 
 if [[ $failures -ne 0 ]]; then
   echo "$failures check(s) failed"
