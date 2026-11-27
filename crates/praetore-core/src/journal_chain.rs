@@ -189,6 +189,11 @@ pub enum ChainError {
     /// A range's anchor (the receipt just before it) does not link to the
     /// expected head of the previous range.
     AnchorMismatch { actual: ChainLink },
+    /// Receipt line `line` is not the bytes the exporter writes for its
+    /// entry (`{"seq":N,"prev":"<hex>","evidence":<canonical evidence>}`):
+    /// the same JSON in another byte form (whitespace, key order, an
+    /// escape).
+    NotCanonical { line: u64 },
 }
 
 impl ChainError {
@@ -199,7 +204,8 @@ impl ChainError {
             | Self::BrokenLink { .. }
             | Self::DuplicateEvidenceId { .. }
             | Self::DuplicateRecordId { .. }
-            | Self::MixedKinds { .. } => "JOURNAL_CHAIN_FAIL",
+            | Self::MixedKinds { .. }
+            | Self::NotCanonical { .. } => "JOURNAL_CHAIN_FAIL",
             Self::Record { .. } => "EVIDENCE_FAIL",
             Self::DatabaseHeadMismatch => "JOURNAL_HEAD_MISMATCH",
             Self::PolicyNotApplicable => "INVALID_REQUEST",
@@ -265,6 +271,11 @@ impl fmt::Display for ChainError {
                 f,
                 "the range's anchor links to {actual}, not to the expected head of the previous \
                  range"
+            ),
+            Self::NotCanonical { line } => write!(
+                f,
+                "entry {line}: not in canonical form (the line is not the bytes written for \
+                 this receipt)"
             ),
             Self::PolicyNotApplicable => write!(
                 f,
@@ -1020,6 +1031,65 @@ mod tests {
             .push(&Evidence::from_json(&value["evidence"].to_string()).unwrap())
             .unwrap();
         assert_eq!(receipts.unused_attesters(), vec![1]);
+    }
+
+    /// A receipt line in another byte form (key order, whitespace, a JSON
+    /// escape in a key) is the same JSON, so its integrity hash, signature
+    /// and link still check. It must fail: the line is not the bytes the
+    /// exporter writes, and readers that look at the text would see other
+    /// bytes than the ones that were verified.
+    #[test]
+    fn a_receipt_line_in_another_byte_form_fails_even_with_the_expected_head() {
+        let head = verify_chain(SET_03_CHAIN, &set_03_pin(), None, None).unwrap();
+        let lines: Vec<&str> = SET_03_CHAIN.lines().collect();
+        let escaped = lines
+            .iter()
+            .position(|line| line.contains("\"praetore.path_check\""))
+            .unwrap();
+        let rewrites = [
+            // Same members, reversed order, spaces after separators.
+            (1, {
+                let value: serde_json::Map<String, serde_json::Value> =
+                    serde_json::from_str(lines[1]).unwrap();
+                let reversed: Vec<String> = value
+                    .iter()
+                    .rev()
+                    .map(|(key, value)| {
+                        format!("{}: {value}", serde_json::Value::from(key.as_str()))
+                    })
+                    .collect();
+                format!("{{{}}}", reversed.join(", "))
+            }),
+            // `.` written as `\u002e` in a key.
+            (
+                escaped,
+                lines[escaped].replacen(
+                    "\"praetore.path_check\"",
+                    "\"praetore\\u002epath_check\"",
+                    1,
+                ),
+            ),
+        ];
+        for (index, rewritten) in rewrites {
+            assert_ne!(rewritten, lines[index]);
+            let value: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
+            let original: serde_json::Value = serde_json::from_str(lines[index]).unwrap();
+            assert_eq!(
+                value, original,
+                "line {index}: the rewrite must be the same JSON"
+            );
+            let mut text = String::new();
+            for (at, line) in lines.iter().enumerate() {
+                text.push_str(if at == index { &rewritten } else { line });
+                text.push('\n');
+            }
+            let error = verify_chain(&text, &set_03_pin(), None, Some(&head.head)).unwrap_err();
+            assert!(
+                matches!(error, ChainError::NotCanonical { line } if line == index as u64),
+                "line {index}: {error}"
+            );
+            assert_eq!(error.code(), "JOURNAL_CHAIN_FAIL");
+        }
     }
 
     #[test]
