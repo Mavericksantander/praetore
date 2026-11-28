@@ -2118,3 +2118,130 @@ fn an_undecided_approval_past_its_expiry_is_expired_in_the_state() {
         assert_eq!(drawer["approval"], "expired", "{expires_at}: drawer");
     }
 }
+
+/// One `wrap` session of `mode` over a home whose only rule denies
+/// `delete_file`: a DENY by rule, a DENY by default deny, and the DENY of a
+/// call the policy does not classify (a `safety*` tool name, refused in both
+/// modes). Returns the lines the wrapped server received.
+fn home_with_denials(mode: &str) -> (tempfile::TempDir, Home, String) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("home");
+    let dir = root.to_str().unwrap();
+    assert!(run(&["init", "--dir", dir], "").status.success());
+    let out = run(
+        &[
+            "policy",
+            "deny",
+            "--id",
+            "deny-delete",
+            "--tool",
+            "delete_file",
+            "--dir",
+            dir,
+        ],
+        "",
+    );
+    assert!(out.status.success(), "{out:?}");
+    let calls = [
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delete_file","arguments":{"path":"/x"}}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"msg":"hi"}}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"safety_stop","arguments":{}}}),
+    ];
+    let input: String = calls.iter().map(|c| format!("{c}\n")).collect();
+    let server = fake_server();
+    let out = run(
+        &[
+            "wrap",
+            "--dir",
+            dir,
+            "--name",
+            "fake",
+            "--mode",
+            mode,
+            "--",
+            server.to_str().unwrap(),
+        ],
+        &input,
+    );
+    assert!(out.status.success(), "{out:?}");
+    (
+        temp,
+        Home::new(root),
+        String::from_utf8(out.stdout).unwrap(),
+    )
+}
+
+/// tool -> `deny_effect` of every receipt `/api/state` lists.
+fn deny_effects(state: &Value) -> BTreeMap<String, Value> {
+    state["receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            assert_eq!(r["decision"], "DENY", "{r}");
+            (
+                r["tool"].as_str().unwrap().to_owned(),
+                r["deny_effect"].clone(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_deny_that_observe_forwarded_is_not_counted_or_shown_as_blocked() {
+    let (_temp, home, replies) = home_with_denials("observe");
+    // The wrapped server answered the two classified calls: they ran.
+    let answered = |id: u64| {
+        replies.lines().any(|line| {
+            let reply: Value = serde_json::from_str(line).unwrap();
+            reply["id"] == id && reply["result"]["isError"] != true
+        })
+    };
+    assert!(answered(2) && answered(3), "{replies}");
+    assert!(!answered(4), "{replies}");
+
+    let state = dashboard::state(&home, None);
+    assert_eq!(state["summary"]["deny"], 3, "{}", state["summary"]);
+    assert_eq!(state["summary"]["blocked"], 1, "{}", state["summary"]);
+    assert_eq!(
+        state["summary"]["deny_not_applied"], 2,
+        "{}",
+        state["summary"]
+    );
+    assert_eq!(
+        deny_effects(&state),
+        BTreeMap::from([
+            ("delete_file".to_owned(), json!("not_applied")),
+            ("echo".to_owned(), json!("not_applied")),
+            ("safety_stop".to_owned(), json!("blocked")),
+        ])
+    );
+}
+
+#[test]
+fn every_deny_in_enforce_is_counted_and_shown_as_blocked() {
+    let (_temp, home, replies) = home_with_denials("enforce");
+    for line in replies.lines() {
+        let reply: Value = serde_json::from_str(line).unwrap();
+        assert!(
+            reply["id"] == 1 || reply["result"]["isError"] == true,
+            "{line}"
+        );
+    }
+    let state = dashboard::state(&home, None);
+    assert_eq!(state["summary"]["deny"], 3, "{}", state["summary"]);
+    assert_eq!(state["summary"]["blocked"], 3, "{}", state["summary"]);
+    assert_eq!(
+        state["summary"]["deny_not_applied"], 0,
+        "{}",
+        state["summary"]
+    );
+    assert!(
+        deny_effects(&state)
+            .values()
+            .all(|effect| effect == "blocked"),
+        "{:?}",
+        deny_effects(&state)
+    );
+}

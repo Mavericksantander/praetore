@@ -16,7 +16,7 @@
 //! dashboard reads them only: it does not write, regenerate or sign one.
 
 use crate::{
-    gate::PATH_CHECK_CONTEXT_KEY,
+    gate::{DenyEffect, PATH_CHECK_CONTEXT_KEY},
     journal,
     receipts::{self, Assurance, Check, ExpectedHeads, LineVerdict, VerifyReport},
     report,
@@ -459,6 +459,8 @@ fn stamps(home: &Home) -> Option<Vec<FileStamp>> {
 /// One journal line, indexed for the filters.
 struct Row {
     decision: Option<&'static str>,
+    /// For a DENY: whether the call was blocked or forwarded.
+    deny_effect: Option<DenyEffect>,
     tool: Option<String>,
     decided_at: Option<OffsetDateTime>,
     enforce: bool,
@@ -511,6 +513,7 @@ impl Snapshot {
                     by_evidence.insert(evidence.evidence_id.to_string(), index);
                     Row {
                         decision: Some(receipts::decision_label(evidence.decision.outcome)),
+                        deny_effect: receipts::deny_effect(evidence),
                         tool: tool_of(evidence).as_str().map(str::to_owned),
                         decided_at: evidence
                             .decided_at
@@ -521,6 +524,7 @@ impl Snapshot {
                 }
                 Err(_) => Row {
                     decision: None,
+                    deny_effect: None,
                     tool: None,
                     decided_at: None,
                     enforce: false,
@@ -543,10 +547,19 @@ impl Snapshot {
                 .filter(|r| r.decision == Some(label))
                 .count()
         };
+        let denied = |effect: DenyEffect| {
+            self.rows
+                .iter()
+                .filter(|r| r.deny_effect == Some(effect))
+                .count()
+        };
         json!({
             "total": self.rows.len(),
             "allow": count("ALLOW"),
+            // Decisions. A DENY is a blocked call only in `blocked`.
             "deny": count("DENY"),
+            "blocked": denied(DenyEffect::Blocked),
+            "deny_not_applied": denied(DenyEffect::NotApplied),
             "require_approval": count("REQUIRE_APPROVAL"),
             "unreadable": self.rows.iter().filter(|r| r.decision.is_none()).count(),
             "enforce_receipts": self.enforce_receipts(),
@@ -1311,6 +1324,8 @@ pub fn receipt_view(line: &LineVerdict, approval_status: &BTreeMap<String, Strin
         "tool": tool_of(evidence),
         "arguments": arguments,
         "decision": receipts::decision_label(outcome),
+        // For a DENY: "blocked" or "not_applied" (observe forwarded it).
+        "deny_effect": receipts::deny_effect(evidence).map(DenyEffect::label),
         "rule": if rules.is_empty() { Value::Null } else { Value::String(rules.join(",")) },
         // Signed with the receipt: which rule, the default deny or an
         // engine guard decided. Absent on receipts older than schema v4.
@@ -1395,6 +1410,7 @@ fn policy_view(home: &Home, enforce_receipts: usize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{APP_JS, header_assurance, header_summary};
+    use crate::gate::{DenyEffect, Mode};
     use crate::receipts::Assurance;
     use serde_json::json;
 
@@ -1414,6 +1430,41 @@ mod tests {
             }
         }
         levels
+    }
+
+    /// The page describes a DENY only through its DENY_EFFECT table, and
+    /// that table has exactly the effects of `DenyEffect`. Only `blocked`
+    /// is drawn as blocked.
+    #[test]
+    fn the_page_knows_every_deny_effect_and_calls_only_blocked_blocked() {
+        let mut labels = Vec::new();
+        for mode in [Mode::Observe, Mode::Enforce] {
+            for unclassified in [false, true] {
+                let effect = DenyEffect::of(mode, unclassified);
+                match effect {
+                    DenyEffect::Blocked | DenyEffect::NotApplied => {}
+                }
+                if !labels.contains(&effect.label()) {
+                    labels.push(effect.label());
+                }
+            }
+        }
+        labels.sort_unstable();
+        let table = APP_JS
+            .split("const DENY_EFFECT = {")
+            .nth(1)
+            .and_then(|rest| rest.split("};").next())
+            .expect("app.js has the DENY_EFFECT table");
+        let keys: Vec<&str> = table
+            .lines()
+            .filter_map(|line| line.trim().split_once(':').map(|(key, _)| key))
+            .collect();
+        assert_eq!(keys, labels, "app.js DENY_EFFECT and gate::DenyEffect");
+        for line in table.lines().filter(|line| !line.trim().is_empty()) {
+            let blocked = line.trim().starts_with("blocked:");
+            assert_eq!(line.contains("\"e_blocked\""), blocked, "{line}");
+            assert_eq!(line.contains("\"l_deny\""), blocked, "{line}");
+        }
     }
 
     #[test]

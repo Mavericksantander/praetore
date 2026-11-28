@@ -1240,6 +1240,8 @@ mod tests {
 
     struct Fixed {
         result: Result<DecisionOutcome, String>,
+        /// `Verdict::unclassified` of every evaluated call.
+        unclassified: bool,
         journal_error: Option<JournalError>,
         calls: Vec<(String, Value)>,
         unparsed: Vec<UnparsedLine>,
@@ -1249,6 +1251,7 @@ mod tests {
         fn new(result: Result<DecisionOutcome, String>) -> Self {
             Self {
                 result,
+                unclassified: false,
                 journal_error: None,
                 calls: Vec::new(),
                 unparsed: Vec::new(),
@@ -1289,7 +1292,7 @@ mod tests {
             self.calls.push((server.into(), params.clone()));
             let outcome = self.result.clone()?;
             Ok(Verdict {
-                unclassified: false,
+                unclassified: self.unclassified,
                 outcome,
                 evidence_id: Uuid::nil(),
                 rule_ids: vec!["rule-x".into()],
@@ -1375,6 +1378,33 @@ mod tests {
         assert_eq!(out.to_server.as_deref(), Some(&raw[..]));
         assert!(out.to_client.is_none());
         assert!(eval.calls.is_empty());
+    }
+
+    /// `DenyEffect::of` is the table the dashboard describes a DENY with.
+    /// What this proxy does with the line is the same table.
+    #[test]
+    fn a_deny_is_blocked_exactly_when_deny_effect_says_so() {
+        use crate::gate::DenyEffect;
+        for mode in [Mode::Observe, Mode::Enforce] {
+            for unclassified in [false, true] {
+                let mut eval = Fixed::new(Ok(DecisionOutcome::Deny));
+                eval.unclassified = unclassified;
+                let out = handle_client_line(CALL, mode, "fs", &mut eval);
+                let effect = match (out.to_server.as_deref(), out.to_client.is_some()) {
+                    (None, true) => DenyEffect::Blocked,
+                    (Some(forwarded), false) => {
+                        assert_eq!(forwarded, CALL);
+                        DenyEffect::NotApplied
+                    }
+                    other => panic!("{mode:?} unclassified={unclassified}: {other:?}"),
+                };
+                assert_eq!(
+                    effect,
+                    DenyEffect::of(mode, unclassified),
+                    "{mode:?} unclassified={unclassified}"
+                );
+            }
+        }
     }
 
     #[test]

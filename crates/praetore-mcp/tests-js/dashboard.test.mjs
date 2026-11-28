@@ -673,9 +673,10 @@ function chips(p) {
 
 test("the session chip shows OK, UNANCHORED or FAIL from verify's assurance, never 'passed'", async () => {
   const base = fixture("sessions");
-  // A report from before the level existed: "passed" alone may have had no
-  // heads, so it is not OK.
-  assert.equal(base.reports.items[0].header.verify.assurance, undefined);
+  // The fixture's reports were written with no head given. The cases below
+  // set the level, or take it out for a report from before it existed:
+  // "passed" alone may have had no heads, so it is not OK.
+  assert.equal(base.reports.items[0].header.verify.assurance, "UNANCHORED");
   assert.equal(base.reports.items[0].header.verify.result, "passed");
   const U = "UNANCHORED", warn = "chip warn";
   const unanchored = { es: "verify UNANCHORED · faltan heads, no es OK", en: "verify UNANCHORED · heads missing, not OK",
@@ -989,4 +990,80 @@ test("the integrity checks list says when one use per approval does not hold", a
     for (const w of words) assert.ok(text.includes(w), `${code}: ${w}\n${text}`);
     assert.ok(!/single use|uso único/.test(text), `${code}: ${text}`);
   }
+});
+
+// What the page writes for each effect a DENY can have, per language.
+const DENY_WORDS = {
+  es: { blocked: "Bloqueadas", sub: (n) => `+ ${n} denegadas en observe, no bloqueadas`, hudBlocked: "BLOQUEADA",
+    hudRan: "DENEGADA · NO BLOQUEADA", tagBlocked: "Bloqueada", tagRan: "Denegada · no bloqueada", note: "observe: registrada, no aplicada" },
+  en: { blocked: "Blocked", sub: (n) => `+ ${n} denied in observe, not blocked`, hudBlocked: "BLOCKED",
+    hudRan: "DENIED · NOT BLOCKED", tagBlocked: "Blocked", tagRan: "Denied · not blocked", note: "observe: recorded, not applied" },
+  pt: { blocked: "Bloqueadas", sub: (n) => `+ ${n} negadas em observe, não bloqueadas`, hudBlocked: "BLOQUEADA",
+    hudRan: "NEGADA · NÃO BLOQUEADA", tagBlocked: "Bloqueada", tagRan: "Negada · não bloqueada", note: "observe: registrada, não aplicada" },
+};
+
+async function pageIn(lang, state) {
+  const p = page();
+  p.run(`localStorage.setItem("praetore-mcp-dashboard-lang", ${JSON.stringify(lang)})`);
+  await p.start(state);
+  assert.equal(p.run("document.documentElement.lang"), lang);
+  return p;
+}
+
+const count = (text, part) => text.split(part).length - 1;
+
+test("a DENY that observe forwarded is never counted, drawn or listed as blocked", async () => {
+  const state = fixture("observe");
+  // The real session: two DENYs the wrapped server ran, and the DENY of a
+  // call the policy does not classify, which observe refused.
+  assert.deepEqual(state.recent.map((r) => [r.tool, r.mode, r.decision, r.deny_effect]), [
+    ["safety_stop", "observe", "DENY", "blocked"],
+    ["echo", "observe", "DENY", "not_applied"],
+    ["delete_file", "observe", "DENY", "not_applied"],
+  ]);
+  assert.deepEqual([state.summary.deny, state.summary.blocked, state.summary.deny_not_applied], [3, 1, 2]);
+  for (const [lang, w] of Object.entries(DENY_WORDS)) {
+    const p = await pageIn(lang, state);
+    const home = p.text("view-home");
+    assert.ok(home.includes(`${w.blocked}1${w.sub(2)}`), `${lang}: ${home}`);
+    const texts = drawn(p, "hud").map((t) => t.text);
+    assert.equal(texts.filter((t) => t === w.hudBlocked).length, 1, `${lang}: ${texts.join("\n")}`);
+    assert.equal(texts.filter((t) => t === w.hudRan).length, 2, `${lang}: ${texts.join("\n")}`);
+    // The observe note comes first on its line, so clipping cannot cut it,
+    // and it is not written on the DENY observe did apply.
+    assert.equal(texts.filter((t) => t.startsWith(w.note)).length, 2, `${lang}: ${texts.join("\n")}`);
+    assert.equal(texts.filter((t) => t.includes(w.note)).length, 2, `${lang}: ${texts.join("\n")}`);
+    p.byId.get("live-list").listeners.get("click")[0]();
+    const list = p.text("hud-list");
+    assert.equal(count(list, w.tagRan), 2, `${lang}: ${list}`);
+    assert.equal(count(list, w.tagBlocked), 1, `${lang}: ${list}`);
+  }
+});
+
+test("in enforce every DENY is blocked and the home has no observe line", async () => {
+  const state = fixture("healthy");
+  assert.ok(state.recent.every((r) => r.mode === "enforce"));
+  assert.deepEqual(state.recent.filter((r) => r.decision === "DENY").map((r) => r.deny_effect), ["blocked", "blocked"]);
+  assert.deepEqual([state.summary.deny, state.summary.blocked, state.summary.deny_not_applied], [2, 2, 0]);
+  for (const [lang, w] of Object.entries(DENY_WORDS)) {
+    const p = await pageIn(lang, state);
+    const home = p.text("view-home");
+    assert.ok(home.includes(`${w.blocked}2`), `${lang}: ${home}`);
+    assert.ok(!home.includes("observe"), `${lang}: ${home}`);
+    const texts = drawn(p, "hud").map((t) => t.text);
+    assert.equal(texts.filter((t) => t === w.hudBlocked).length, 2, `${lang}: ${texts.join("\n")}`);
+    assert.equal(texts.filter((t) => t === w.hudRan).length, 0, `${lang}: ${texts.join("\n")}`);
+  }
+});
+
+test("a DENY whose effect the receipt does not say is shown as the decision, not as blocked", async () => {
+  const state = fixture("healthy");
+  for (const r of state.recent) if (r.decision === "DENY") r.deny_effect = null;
+  const p = await pageIn("es", state);
+  const texts = drawn(p, "hud").map((t) => t.text);
+  assert.equal(texts.filter((t) => t === "DENEGADA").length, 2, texts.join("\n"));
+  assert.equal(texts.filter((t) => t === "BLOQUEADA").length, 0, texts.join("\n"));
+  p.byId.get("live-list").listeners.get("click")[0]();
+  assert.equal(count(p.text("hud-list"), "Denegada"), 2, p.text("hud-list"));
+  assert.equal(count(p.text("hud-list"), "Bloqueada"), 0, p.text("hud-list"));
 });

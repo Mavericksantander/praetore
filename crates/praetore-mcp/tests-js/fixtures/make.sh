@@ -59,9 +59,27 @@ dump() {
   wait "$pid" 2>/dev/null || true
 }
 
+# A home whose only rule denies delete_file, after one observe session: a
+# DENY by rule and a DENY by default deny, both forwarded (the wrapped
+# server ran them), and the DENY of a call the policy does not classify,
+# which observe refuses too.
+make_observe_home() {
+  dir=$WORK/observe
+  "$BIN" init --dir "$dir" >/dev/null
+  "$BIN" policy deny --dir "$dir" --id deny-delete --tool delete_file >/dev/null
+  {
+    echo "$init_line"
+    call 1 delete_file '{"path":"/srv/data/report.txt"}'
+    call 2 echo '{"msg":"one"}'
+    call 3 safety_stop '{}'
+  } | "$BIN" wrap --dir "$dir" --name fake --mode observe -- "$FAKE" >/dev/null 2>&1
+}
+
 make_home healthy
 make_home cut
 make_home unreadable
+make_observe_home
+dump observe
 
 # Cut: the third receipt removed, so the fourth (an ALLOW) no longer
 # follows it.
@@ -84,6 +102,9 @@ dump healthy pending
 # Sessions: the same home after `report --last`, which writes a new pair
 # next to the report of the last session (two close reports, one with a
 # regeneration grouped under it).
-"$BIN" report --dir "$WORK/healthy" --last >/dev/null
+# No head is given, so the report says UNANCHORED and `report` exits 3.
+status=0
+"$BIN" report --dir "$WORK/healthy" --last >/dev/null || status=$?
+[ "$status" -eq 3 ] || { echo "report --last: exit $status, expected 3" >&2; exit 1; }
 dump healthy sessions
-echo "wrote $OUT/{healthy,healthy-allow,pending,sessions,cut,unreadable}.json"
+echo "wrote $OUT/{healthy,healthy-allow,pending,sessions,cut,unreadable,observe}.json"
