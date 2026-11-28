@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Fixed
+
+- **praetore-mcp dashboard: a DENY that observe forwarded is no longer
+  shown as blocked.** The home counted every DENY receipt under "Blocked"
+  and the live view labeled each one BLOCKED, also in observe mode, where
+  the wrapped server ran the call. `/api/state` now says what the proxy
+  did with each DENY (`deny_effect`: `blocked` or `not_applied`) and the
+  summary carries `blocked` and `deny_not_applied` next to `deny`. The
+  home counts only `blocked` and adds a line for the DENYs observe did not
+  apply; the live view writes "DENIED · NOT BLOCKED" for those. A DENY of
+  a call the policy does not classify is still shown as blocked in observe,
+  because observe refuses it. The decision counters of the Chain view and
+  the decision filter now say "Denied", not "Blocked": they count
+  decisions in both modes.
+
 ## 0.3.7 - 2026-11-26
 
 ### Added

@@ -5,7 +5,7 @@
 use crate::journal::{self, Chain, ChainLine, Position};
 use crate::shown::Show;
 use crate::{
-    gate::MODE_CONTEXT_KEY,
+    gate::{self, DenyEffect, MODE_CONTEXT_KEY, Mode},
     store::{self, AUDIENCE, Home},
 };
 use praetore_core::{DecisionOutcome, Evidence, TrustedAuthorityIssuer, VerifiedPublicKey};
@@ -43,6 +43,22 @@ pub fn mode_of(evidence: &Evidence) -> Option<&str> {
         .context
         .get(MODE_CONTEXT_KEY)
         .and_then(|v| v.as_str())
+}
+
+/// What the proxy did with the call of a DENY receipt, from what the
+/// receipt signs: its decision, what decided it and `praetore.mode`. `None`
+/// for a receipt that is not a DENY, and for a DENY whose mode is neither
+/// `observe` nor `enforce` unless the call was unclassified (refused in both
+/// modes): such a receipt does not say what happened to the call.
+pub fn deny_effect(evidence: &Evidence) -> Option<DenyEffect> {
+    if evidence.decision.outcome != DecisionOutcome::Deny {
+        return None;
+    }
+    let unclassified = gate::is_unclassified(evidence);
+    match mode_of(evidence).and_then(Mode::parse) {
+        Some(mode) => Some(DenyEffect::of(mode, unclassified)),
+        None => unclassified.then_some(DenyEffect::Blocked),
+    }
 }
 
 pub fn decision_label(outcome: DecisionOutcome) -> &'static str {

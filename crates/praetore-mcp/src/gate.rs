@@ -69,6 +69,38 @@ impl Mode {
     }
 }
 
+/// What the proxy does with a call whose signed decision is DENY. The proxy
+/// test `a_deny_is_blocked_exactly_when_deny_effect_says_so` holds
+/// `proxy::handle_client_line` to this table, and the dashboard describes a
+/// DENY receipt only through it, so the page cannot call "blocked" a call
+/// the proxy forwarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenyEffect {
+    /// Not forwarded: the wrapped server never saw the call.
+    Blocked,
+    /// Forwarded: observe mode recorded the decision and did not apply it.
+    NotApplied,
+}
+
+impl DenyEffect {
+    /// `unclassified` is [`Verdict::unclassified`]: a call whose action type
+    /// the policy does not declare is refused in both modes (G7).
+    pub fn of(mode: Mode, unclassified: bool) -> Self {
+        match (unclassified, mode) {
+            (true, Mode::Observe | Mode::Enforce) | (false, Mode::Enforce) => Self::Blocked,
+            (false, Mode::Observe) => Self::NotApplied,
+        }
+    }
+
+    /// The word `/api/state` serves for this effect.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Blocked => "blocked",
+            Self::NotApplied => "not_applied",
+        }
+    }
+}
+
 /// Result of a successful evaluation.
 #[derive(Debug, Clone)]
 pub struct Verdict {
@@ -1338,14 +1370,20 @@ impl Evaluator for Gate {
     }
 }
 
+/// True for the signed DENY of a call whose action type the policy does not
+/// declare (engine guard `unclassified_action`).
+pub fn is_unclassified(evidence: &Evidence) -> bool {
+    evidence.decision.outcome == DecisionOutcome::Deny
+        && evidence.decision.decided_by()
+            == Some(&praetore_core::DecidedBy::engine_guard(
+                praetore_core::UNCLASSIFIED_ACTION_GUARD,
+            ))
+}
+
 pub fn verdict_from(evidence: &Evidence, journaled: Result<PathBuf, JournalError>) -> Verdict {
     let outcome = evidence.decision.outcome;
     Verdict {
-        unclassified: outcome == DecisionOutcome::Deny
-            && evidence.decision.decided_by()
-                == Some(&praetore_core::DecidedBy::engine_guard(
-                    praetore_core::UNCLASSIFIED_ACTION_GUARD,
-                )),
+        unclassified: is_unclassified(evidence),
         outcome,
         evidence_id: evidence.evidence_id,
         rule_ids: evidence

@@ -38,6 +38,7 @@ const I18N = {
     m_visual: "Visual", m_list: "Lista", m_diagram: "Diagrama",
     h_agent: "Agente", h_server: "Servidor", h_mode: "Modo", h_verify: "verify",
     h_allow: "Permitidas", h_deny: "Bloqueadas", h_pending: "Pendientes", h_pending_sub: "aviso sin firma",
+    h_deny_sub: (n) => `+ ${n} denegadas en observe, no bloqueadas`,
     h_verify_ok: (n) => `OK · ${n} recibos verificados`, h_verify_err: "verify no pudo correr",
     h_mode_mixed: (e, o) => `enforce y observe (${e} enforce, ${o} observe)`,
     h_empty: "Todavía no hay recibos. Aparecen cuando un cliente MCP llama a una herramienta a través de praetore-mcp wrap.",
@@ -47,6 +48,7 @@ const I18N = {
     l_cap_empty: "Esperando la primera llamada a una herramienta.",
     l_more: (n) => `${n} decisiones anteriores en la cadena →`,
     l_allow: "PERMITIDA", l_deny: "BLOQUEADA", l_ask: "PIDIÓ APROBACIÓN",
+    l_deny_ran: "DENEGADA · NO BLOQUEADA", l_deny_only: "DENEGADA",
     l_default_deny: "default deny: ninguna regla lo permite", l_rule: (id) => `regla ${id}`, l_guard: (g) => `comprobación del motor: ${g}`,
     l_observe: "observe: registrada, no aplicada",
     l_unverified: "verify falla", l_reason_more: "la razón sigue en el detalle del recibo: haz clic en la fila", h_server_note: "de los 40 recibos más recientes", c_receipt: "recibo",
@@ -85,13 +87,14 @@ const I18N = {
     cta_pending: (n) => n === 1 ? "Una acción espera tu decisión." : `${n} acciones esperan tu decisión.`,
     cta_sub: "Tu agente está en pausa hasta que la apruebes o la rechaces desde una terminal.",
     review: "Revisar",
-    k_total: "Decisiones", k_allow: "Permitidas", k_deny: "Bloqueadas", k_ask: "Pidieron aprobación",
+    k_total: "Decisiones", k_allow: "Permitidas", k_deny: "Denegadas", k_ask: "Pidieron aprobación",
     pct: (p) => `${p}% del total`, k_total_foot: (n) => `${n} en modo enforce`,
     chart_title: "Actividad", chart_hours: "Últimas 24 horas, por hora", chart_days: "Últimos 14 días, por día",
     recent: "Actividad reciente", see_all: "Ver todo →",
     tools_title: "Herramientas más usadas", tools_sub: "Llamadas por herramienta",
     empty_recent: "Todavía no hay actividad.",
-    d_ALLOW: "Permitida", d_DENY: "Bloqueada", d_REQUIRE_APPROVAL: "Pidió aprobación",
+    d_ALLOW: "Permitida", d_DENY: "Denegada", d_REQUIRE_APPROVAL: "Pidió aprobación",
+    e_blocked: "Bloqueada", e_not_applied: "Denegada · no bloqueada",
     ap_pending: "Esperando decisión", ap_expired: "Vencida", ap_held: "Retenida (sin decisión)", ap_approve: "Aprobada",
     ap_reject: "Rechazada", ap_executed: "Ejecutada tras aprobación", ap_would: "En enforce pediría aprobación",
     pend_none_t: "Nada pendiente.", pend_none_d: "No hay acciones esperando aprobación.",
@@ -207,7 +210,8 @@ const I18N = {
     sub_chain: "The receipts in order, joined by their hash link",
     m_visual: "Visual", m_list: "List", m_diagram: "Diagram",
     h_agent: "Agent", h_server: "Server", h_mode: "Mode", h_verify: "verify",
-    h_allow: "Allowed", h_deny: "Denied", h_pending: "Pending", h_pending_sub: "notice not signed",
+    h_allow: "Allowed", h_deny: "Blocked", h_pending: "Pending", h_pending_sub: "notice not signed",
+    h_deny_sub: (n) => `+ ${n} denied in observe, not blocked`,
     h_verify_ok: (n) => `OK · ${n} receipts verified`, h_verify_err: "verify could not run",
     h_mode_mixed: (e, o) => `enforce and observe (${e} enforce, ${o} observe)`,
     h_empty: "No receipts yet. They appear when an MCP client calls a tool through praetore-mcp wrap.",
@@ -216,7 +220,8 @@ const I18N = {
     l_cap_quiet: (when) => `No decisions in the last 15 minutes. The last one was ${when}.`,
     l_cap_empty: "Waiting for the first tool call.",
     l_more: (n) => `${n} earlier decisions in the chain →`,
-    l_allow: "ALLOWED", l_deny: "DENIED", l_ask: "ASKED FOR APPROVAL",
+    l_allow: "ALLOWED", l_deny: "BLOCKED", l_ask: "ASKED FOR APPROVAL",
+    l_deny_ran: "DENIED · NOT BLOCKED", l_deny_only: "DENIED",
     l_default_deny: "default deny: no rule allows it", l_rule: (id) => `rule ${id}`, l_guard: (g) => `engine check: ${g}`,
     l_observe: "observe: recorded, not applied",
     l_unverified: "verify fails", l_reason_more: "the reason continues in the receipt detail: click the row", h_server_note: "from the 40 most recent receipts", c_receipt: "receipt",
@@ -255,13 +260,14 @@ const I18N = {
     cta_pending: (n) => n === 1 ? "One action is waiting for you." : `${n} actions are waiting for you.`,
     cta_sub: "Your agent is paused until you approve or reject it from a terminal.",
     review: "Review",
-    k_total: "Decisions", k_allow: "Allowed", k_deny: "Blocked", k_ask: "Asked for approval",
+    k_total: "Decisions", k_allow: "Allowed", k_deny: "Denied", k_ask: "Asked for approval",
     pct: (p) => `${p}% of total`, k_total_foot: (n) => `${n} in enforce mode`,
     chart_title: "Activity", chart_hours: "Last 24 hours, by hour", chart_days: "Last 14 days, by day",
     recent: "Recent activity", see_all: "View all →",
     tools_title: "Most used tools", tools_sub: "Calls per tool",
     empty_recent: "No activity yet.",
-    d_ALLOW: "Allowed", d_DENY: "Blocked", d_REQUIRE_APPROVAL: "Asked for approval",
+    d_ALLOW: "Allowed", d_DENY: "Denied", d_REQUIRE_APPROVAL: "Asked for approval",
+    e_blocked: "Blocked", e_not_applied: "Denied · not blocked",
     ap_pending: "Waiting for decision", ap_expired: "Expired", ap_held: "Held (no decision)", ap_approve: "Approved",
     ap_reject: "Rejected", ap_executed: "Executed after approval", ap_would: "Enforce would ask",
     pend_none_t: "Nothing pending.", pend_none_d: "No actions are waiting for approval.",
@@ -378,6 +384,7 @@ const I18N = {
     m_visual: "Visual", m_list: "Lista", m_diagram: "Diagrama",
     h_agent: "Agente", h_server: "Servidor", h_mode: "Modo", h_verify: "verify",
     h_allow: "Permitidas", h_deny: "Bloqueadas", h_pending: "Pendentes", h_pending_sub: "aviso sem assinatura",
+    h_deny_sub: (n) => `+ ${n} negadas em observe, não bloqueadas`,
     h_verify_ok: (n) => `OK · ${n} recibos verificados`, h_verify_err: "o verify não pôde rodar",
     h_mode_mixed: (e, o) => `enforce e observe (${e} enforce, ${o} observe)`,
     h_empty: "Ainda não há recibos. Eles aparecem quando um cliente MCP chama uma ferramenta através de praetore-mcp wrap.",
@@ -387,6 +394,7 @@ const I18N = {
     l_cap_empty: "Esperando a primeira chamada a uma ferramenta.",
     l_more: (n) => `${n} decisões anteriores na cadeia →`,
     l_allow: "PERMITIDA", l_deny: "BLOQUEADA", l_ask: "PEDIU APROVAÇÃO",
+    l_deny_ran: "NEGADA · NÃO BLOQUEADA", l_deny_only: "NEGADA",
     l_default_deny: "default deny: nenhuma regra a permite", l_rule: (id) => `regra ${id}`, l_guard: (g) => `verificação do motor: ${g}`,
     l_observe: "observe: registrada, não aplicada",
     l_unverified: "verify falha", l_reason_more: "o motivo continua no detalhe do recibo: clique na linha", h_server_note: "dos 40 recibos mais recentes", c_receipt: "recibo",
@@ -425,13 +433,14 @@ const I18N = {
     cta_pending: (n) => n === 1 ? "Uma ação aguarda sua decisão." : `${n} ações aguardam sua decisão.`,
     cta_sub: "Seu agente está em pausa até você aprovar ou rejeitar em um terminal.",
     review: "Revisar",
-    k_total: "Decisões", k_allow: "Permitidas", k_deny: "Bloqueadas", k_ask: "Pediram aprovação",
+    k_total: "Decisões", k_allow: "Permitidas", k_deny: "Negadas", k_ask: "Pediram aprovação",
     pct: (p) => `${p}% do total`, k_total_foot: (n) => `${n} em modo enforce`,
     chart_title: "Atividade", chart_hours: "Últimas 24 horas, por hora", chart_days: "Últimos 14 dias, por dia",
     recent: "Atividade recente", see_all: "Ver tudo →",
     tools_title: "Ferramentas mais usadas", tools_sub: "Chamadas por ferramenta",
     empty_recent: "Ainda não há atividade.",
-    d_ALLOW: "Permitida", d_DENY: "Bloqueada", d_REQUIRE_APPROVAL: "Pediu aprovação",
+    d_ALLOW: "Permitida", d_DENY: "Negada", d_REQUIRE_APPROVAL: "Pediu aprovação",
+    e_blocked: "Bloqueada", e_not_applied: "Negada · não bloqueada",
     ap_pending: "Aguardando decisão", ap_expired: "Vencida", ap_held: "Retida (sem decisão)", ap_approve: "Aprovada",
     ap_reject: "Rejeitada", ap_executed: "Executada após aprovação", ap_would: "Em enforce pediria aprovação",
     pend_none_t: "Nada pendente.", pend_none_d: "Não há ações aguardando aprovação.",
@@ -654,8 +663,28 @@ function decisionClass(decision) {
   return decision === "ALLOW" ? "ok" : decision === "DENY" ? "bad" : "warn";
 }
 
-function decisionTag(decision) {
-  return el("span", { class: `tag ${decisionClass(decision)}` }, t(`d_${decision}`));
+// What the proxy did with the call of a DENY receipt: `deny_effect` of
+// /api/state, the labels of gate::DenyEffect (a Rust test holds this table
+// to that enum). "Blocked" is said only of `blocked`. A DENY with no effect
+// (a mode the receipt does not name) is shown as the decision alone.
+const DENY_EFFECT = {
+  blocked: { cls: "bad", tag: "e_blocked", hud: "l_deny" },
+  not_applied: { cls: "warn", tag: "e_not_applied", hud: "l_deny_ran" },
+};
+
+function denyEffect(r) {
+  return typeof r.deny_effect === "string" && Object.hasOwn(DENY_EFFECT, r.deny_effect) ? DENY_EFFECT[r.deny_effect] : null;
+}
+
+// True only for a DENY the proxy did not forward.
+function denyBlocked(r) {
+  return denyEffect(r) === DENY_EFFECT.blocked;
+}
+
+function decisionTag(r) {
+  const effect = r.decision === "DENY" ? denyEffect(r) : null;
+  if (effect) return el("span", { class: `tag ${effect.cls}` }, t(effect.tag));
+  return el("span", { class: `tag ${decisionClass(r.decision)}` }, t(`d_${r.decision}`));
 }
 
 function basename(path) {
@@ -1030,7 +1059,7 @@ function renderHome() {
     el("div", {}, el("dt", {}, t("h_verify")), el("dd", {}, verifyLine)));
   const numbers = el("dl", { class: "home-numbers" },
     stat(t("h_allow"), "var(--allow)", String(s.allow)),
-    stat(t("h_deny"), "var(--deny)", String(s.deny)),
+    stat(t("h_deny"), "var(--deny)", String(s.blocked), s.deny_not_applied > 0 ? t("h_deny_sub", s.deny_not_applied) : null),
     stat(t("h_pending"), "var(--ask)", String(pending().length), t("h_pending_sub")));
   root.append(el("div", { class: "home" },
     ident, numbers,
@@ -1164,7 +1193,7 @@ function drawHud(now) {
       ctx.textAlign = "right";
       ctx.font = `10px ${c.mono}`;
       ctx.fillStyle = color;
-      const label = r.decision === "ALLOW" ? t("l_allow") : r.decision === "DENY" ? t("l_deny") : t("l_ask");
+      const label = r.decision === "ALLOW" ? t("l_allow") : r.decision === "DENY" ? t((denyEffect(r) || { hud: "l_deny_only" }).hud) : t("l_ask");
       ctx.fillText(label, boxX + boxW - 10, y + 17);
       if (row.cut) {
         // verify failed for this receipt: say so in the box, and write
@@ -1199,9 +1228,9 @@ function drawHud(now) {
     if (outcome > 0 && r.decision !== "ALLOW") {
       const wallH = 40 * outcome;
       if (r.decision === "DENY") {
-        // Observe mode records a DENY that was not applied: the wall is
-        // only outlined.
-        if (observe) {
+        // A DENY that was not applied (observe forwarded the call): the
+        // wall is only outlined.
+        if (!denyBlocked(r)) {
           ctx.strokeStyle = rgba(c.wall, 0.8);
           ctx.setLineDash([3, 3]);
           ctx.strokeRect(wallX - 3, mid - wallH / 2, 6, wallH);
@@ -1225,7 +1254,9 @@ function drawHud(now) {
         ctx.fillStyle = r.decision === "DENY" ? c.wall : c.ask;
         const room = wallX - spineX - 30;
         let text = r.decision === "DENY" ? wallText(r) : row.pending ? t("l_pending") : (approvalLabel(r.approval) || { text: wallText(r) }).text;
-        if (observe) text = `${text} · ${t("l_observe")}`;
+        // First, so that clipping the line never cuts it. Not on a DENY
+        // observe did apply (a call the policy does not classify).
+        if (r.decision === "DENY" ? r.deny_effect === "not_applied" : observe) text = `${t("l_observe")} · ${text}`;
         ctx.fillText(clipText(ctx, text, room), wallX - 12, mid - 6);
       }
     }
@@ -1299,7 +1330,7 @@ function hudList() {
         el("div", { class: "why-line mono" }, r.decision === "ALLOW" ? "" : wallText(r)),
         waiting ? el("div", { class: "unsigned" }, t("l_pending")) : null,
         cut ? el("div", { class: "bad-text mono" }, `✕ ${t("l_unverified")}: ${cut}`) : null),
-      outcome ? el("span", { class: `tag ${outcome.cls}` }, outcome.text) : decisionTag(r.decision),
+      outcome ? el("span", { class: `tag ${outcome.cls}` }, outcome.text) : decisionTag(r),
       hudTime(r)), () => openDrawer(r), r.evidence_id));
   }
   if (!list.children.length) list.append(el("li", { class: "muted" }, t("empty_recent")));
@@ -1494,7 +1525,7 @@ function drawChain() {
     ctx.stroke();
     ctx.setLineDash([]);
     if (r.decision === "DENY") {
-      if (r.mode === "observe") {
+      if (!denyBlocked(r)) {
         ctx.strokeStyle = c.wall;
         ctx.strokeRect(branchX, y - 9, 4, 18);
       } else {
@@ -1865,7 +1896,7 @@ function renderTable() {
         el("td", { class: "cell-action" }, el("strong", {}, toolLabel(r.tool)),
           el("div", { class: "target mono", title: target.full }, target.full || target.short || "-")),
         el("td", {}, r.server ?? "-"),
-        el("td", {}, decisionTag(r.decision), label ? el("div", { class: "muted", style: "font-size:12px;margin-top:4px" }, label.text) : null),
+        el("td", {}, decisionTag(r), label ? el("div", { class: "muted", style: "font-size:12px;margin-top:4px" }, label.text) : null),
         el("td", { class: "mono" }, whyShort(r)),
         el("td", {}, el("span", { class: `check-icon ${r.verified ? "ok" : "bad"}`, title: r.verified ? t("st_ok") : t("st_fail") },
           r.verified ? "✓" : "✕")));
@@ -1945,7 +1976,7 @@ function renderDrawer() {
   scrim.hidden = false;
   const target = targetOf(r.arguments);
   document.getElementById("drawer-title").replaceChildren(
-    r.parse_error ? el("span", { class: "tag bad" }, t("unreadable")) : decisionTag(r.decision),
+    r.parse_error ? el("span", { class: "tag bad" }, t("unreadable")) : decisionTag(r),
     el("h2", {}, r.parse_error ? t("unreadable") : toolLabel(r.tool)),
     el("div", { class: "target" }, target.full || `${r.location.file}:${r.location.line}`));
 
@@ -1986,7 +2017,7 @@ function drawerSummary(body, r) {
   const label = approvalLabel(r.approval);
   const cut = breakReason(r);
   const rows = kv([
-    [t("f_decision"), decisionTag(r.decision)],
+    [t("f_decision"), decisionTag(r)],
     [t("why"), whyBlock(r)],
     [t("f_server"), r.server],
     [t("f_tool"), toolLabel(r.tool)],

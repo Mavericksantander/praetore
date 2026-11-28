@@ -156,6 +156,7 @@ const RECEIPT_KEYS: &[&str] = &[
     "decided_at",
     "decided_by",
     "decision",
+    "deny_effect",
     "evidence_id",
     "location",
     "mode",
